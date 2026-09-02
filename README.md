@@ -4,7 +4,6 @@ SafetyMind 是面向**化工、石油、电力等流程工业**的安全生产�
 
 平台基于 [EchoMind](https://github.com/Biscuit-AI531/EchoMind) 多 Agent 架构改造：将通用客服 Agent 替换为三类安全生产专家 Agent，并内置安全生产处置规范 Skills，支持按关键词动态注入和运行时热加载。
 
-> 说明：代码源自 EchoMind，内部服务名、容器名、网络名与部分环境变量仍沿用 `echomind`（见下文命令）。如需彻底改名，可全局替换 `docker-compose.yml`、`.env` 与代码中的 `echomind` / `ECHOMIND_` 前缀。
 
 ## 核心链路
 
