@@ -1,6 +1,6 @@
-# EchoMind 完整使用指南
+# SafetyMind 完整使用指南
 
-本文档说明 EchoMind 的部署、启动、API 调用、知识库使用、ChromaDB 数据查看、监控评测和常见排障。
+本文档说明 SafetyMind 的部署、启动、API 调用、知识库使用、ChromaDB 数据查看、监控评测和常见排障。
 
 EchoMind 是一个企业级智能客服系统，核心链路为：
 
