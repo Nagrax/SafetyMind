@@ -1,9 +1,4 @@
-"""
-EchoMind 智能客服系统 — FastAPI 入口
 
-启动时打印小熊饼干图案。
-所有核心组件在 lifespan 中初始化，通过环境变量配置。
-"""
 import asyncio
 import logging
 import os
@@ -36,8 +31,8 @@ logger = logging.getLogger(__name__)
 BANNER = r"""
     ʕ•ᴥ•ʔ  ʕ•ᴥ•ʔ  ʕ•ᴥ•ʔ
    ╔══════════════════════╗
-   ║   EchoMind  v2.0     ║
-   ║   智能客服 AI 系统    ║
+   ║   SafetyMindv2.0     ║
+   ║   智能安全 AI 系统    ║
    ╚══════════════════════╝
     ʕ•ᴥ•ʔ  ʕ•ᴥ•ʔ  ʕ•ᴥ•ʔ
 """
