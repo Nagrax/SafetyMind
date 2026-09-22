@@ -41,3 +41,6 @@ wiki/
 
 # Node
 frontend/node_modules/
+
+# Windows 快捷方式
+*.lnk
