@@ -50,29 +50,10 @@
           <div class="messages" ref="messageList">
             <article v-for="item in messages" :key="item.id" :class="['message', item.role]">
               <div class="message-meta">
-                <span>{{ item.role === 'user' ? '你' : currentBackend.label + ' 安全 Agent' }}</span>
+                <span>{{ item.role === 'user' ? '你' : 'SafetyMind 安全 Agent' }}</span>
                 <small v-if="item.meta">{{ item.meta }}</small>
               </div>
               <p>{{ item.content }}</p>
-              <div v-if="item.trace" class="message-trace">
-                <div class="trace-head">
-                  <span>工具调用</span>
-                  <small v-if="item.trace.requestId">#{{ item.trace.requestId }}</small>
-                </div>
-                <div v-if="item.trace.toolCalls?.length" class="trace-calls">
-                  <details v-for="(call, index) in item.trace.toolCalls" :key="`${item.id}-${index}`" open>
-                    <summary>
-                      <strong>{{ call.tool_name || 'unknown_tool' }}</strong>
-                      <span>{{ call.success ? '成功' : '失败' }}</span>
-                    </summary>
-                    <pre>{{ formatJson(call.input || {}) }}</pre>
-                  </details>
-                </div>
-                <div v-else class="trace-empty-block">
-                  <p>本次请求已生成 trace，但没有可展示的工具输入。</p>
-                  <p v-if="item.trace.toolsUsed?.length" class="trace-note">已调用：{{ item.trace.toolsUsed.join(' · ') }}</p>
-                </div>
-              </div>
             </article>
 
             <div v-if="messages.length === 0" class="empty-state">
@@ -133,9 +114,9 @@
                 <span class="status-copy" :class="healthOk ? 'success' : 'muted'">{{ healthLabel }}</span>
               </div>
 
-              <div class="backend-tabs">
-                <button :class="{ active: settings.backend === 'java' }" @click="switchBackend('java')">Java</button>
-                <button :class="{ active: settings.backend === 'python' }" @click="switchBackend('python')">Python</button>
+              <div class="connection-endpoint">
+                <span>接口地址</span>
+                <code>{{ currentBackend.baseUrl }}</code>
               </div>
 
               <label>
@@ -174,20 +155,6 @@
                   <div><dt>升级处置</dt><dd :class="lastResponse.escalated ? 'danger' : 'muted'">{{ lastResponse.escalated ? '是' : '否' }}</dd></div>
                 </dl>
                 <p v-if="lastResponse.routingReason" class="routing-reason">{{ lastResponse.routingReason }}</p>
-                <div v-if="lastTrace?.trace" class="trace-call-list">
-                  <div class="trace-call-title">工具调用</div>
-                  <div v-for="(call, index) in lastTrace.trace.toolCalls" :key="`${call.tool_use_id || index}`" class="trace-call-item">
-                    <div class="trace-call-meta">
-                      <strong>{{ call.tool_name || 'unknown_tool' }}</strong>
-                      <span>{{ call.latency_ms || 0 }} ms</span>
-                    </div>
-                    <pre>{{ formatJson(call.input || {}) }}</pre>
-                  </div>
-                  <div v-if="!lastTrace.trace.toolCalls?.length" class="trace-empty-block">
-                    <p>这次 trace 没有记录到工具输入。</p>
-                    <p v-if="lastTrace.trace.toolsUsed?.length" class="trace-note">已调用：{{ lastTrace.trace.toolsUsed.join(' · ') }}</p>
-                  </div>
-                </div>
               </div>
               <p v-else class="side-empty">发送消息后，这里会显示安全 Agent 路由、风险意图和耗时。</p>
             </section>
@@ -321,7 +288,6 @@ import {
   requestKnowledgeStats,
   requestMonitor,
   requestSearch,
-  requestToolTrace,
   requestSkills,
   runEvaluation as requestEvaluation,
   saveSettings,
@@ -346,7 +312,6 @@ const sidebarRef = ref(null)
 const monitorData = ref({ agent_stats: {}, tool_stats: {}, active_alerts: [], suggestions: [] })
 const skillsData = ref({ count: 0, skills: [], errors: [] })
 const lastResponse = ref(null)
-const lastTrace = ref(null)
 const evalData = ref(null)
 const toast = ref('')
 let toastTimer
@@ -386,18 +351,6 @@ function updateSidebarHeight() {
   sidebar.style.setProperty('--sidebar-height', `${height}px`)
 }
 
-function switchBackend(type) {
-  settings.backend = type
-  persist()
-  healthOk.value = false
-  healthLabel.value = '未检查'
-  messages.value = []
-  searchResults.value = []
-  lastResponse.value = null
-  lastTrace.value = null
-  refreshConsole()
-}
-
 async function refreshConsole() {
   await Promise.allSettled([checkHealth(), loadStats(), loadMonitor(), loadSkills()])
 }
@@ -412,24 +365,6 @@ async function checkHealth() {
     healthOk.value = false
     healthLabel.value = '不可用'
     statusText.value = error.message
-
-    // When the saved backend is stale, try the other configured service once.
-    const fallback = settings.backend === 'python' ? 'java' : 'python'
-    if (settings.backend !== fallback) {
-      try {
-        const fallbackData = await requestHealth(fallback, settings)
-        if (fallbackData.status === 'ok') {
-          settings.backend = fallback
-          persist()
-          healthOk.value = true
-          healthLabel.value = fallbackData.status
-          statusText.value = JSON.stringify(fallbackData, null, 2)
-          await Promise.allSettled([loadStats(), loadMonitor(), loadSkills()])
-        }
-      } catch {
-        // Keep the original error visible when both services are unavailable.
-      }
-    }
   }
 }
 
@@ -482,9 +417,8 @@ async function sendMessage() {
       persist()
     }
     lastResponse.value = response
-    lastTrace.value = await loadToolTrace(response.requestId)
     const meta = [response.intent, response.primaryAgent || response.agentType, response.knowledgeUsed ? 'RAG' : '', response.escalated ? '升级处置' : ''].filter(Boolean).join(' · ')
-    messages.value.push({ id: createMessageId(), role: 'assistant', content: response.response, meta, trace: lastTrace.value?.trace || null })
+    messages.value.push({ id: createMessageId(), role: 'assistant', content: response.response, meta })
     await loadMonitor()
   } catch (error) {
     messages.value.push({ id: createMessageId(), role: 'assistant', content: error.message, meta: '请求失败' })
@@ -500,7 +434,6 @@ function usePrompt(prompt) { draft.value = prompt }
 function clearConversation() {
   messages.value = []
   lastResponse.value = null
-  lastTrace.value = null
   settings.conversationId = ''
   persist()
 }
@@ -557,25 +490,9 @@ async function runEvaluation() {
   } finally { busy.value = false }
 }
 
-async function loadToolTrace(requestId) {
-  try {
-    return await requestToolTrace(settings.backend, settings, requestId)
-  } catch {
-    return null
-  }
-}
-
 function formatPercent(value) {
   const number = Number(value || 0)
   return `${(number <= 1 ? number * 100 : number).toFixed(1)}%`
-}
-
-function formatJson(value) {
-  try {
-    return JSON.stringify(value ?? {}, null, 2)
-  } catch {
-    return String(value ?? '')
-  }
 }
 
 function createMessageId() {

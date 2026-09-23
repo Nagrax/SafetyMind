@@ -587,7 +587,7 @@ from fastapi.staticfiles import StaticFiles
 from fastapi.routing import APIRoute
 
 for _route in list(app.routes):
-    if isinstance(_route, APIRoute):
+    if isinstance(_route, APIRoute) and not _route.path.startswith("/api/python"):
         app.router.routes.append(APIRoute(
             f"/api/python{_route.path}",
             _route.endpoint,
@@ -596,6 +596,25 @@ for _route in list(app.routes):
             name=f"frontend_alias_{_route.name}",
             include_in_schema=False,
         ))
+
+
+# Swagger 文档不在上面的 API 路由里（FastAPI 以独立形式挂载），单独补别名，
+# 供前端"API 文档"按钮（{baseUrl}/docs）在桌面/Web/开发三种模式下都可用。
+from fastapi.openapi.docs import get_swagger_ui_html
+
+
+@app.get("/api/python/docs", include_in_schema=False, tags=["Docs"])
+async def api_docs_alias():
+    return get_swagger_ui_html(
+        openapi_url="/api/python/openapi.json",
+        title=f"{app.title} — API 文档",
+    )
+
+
+@app.get("/api/python/openapi.json", include_in_schema=False, tags=["Docs"])
+async def api_openapi_alias():
+    return app.openapi()
+
 
 _FRONTEND_DIST = pathlib.Path(_ROOT) / "frontend" / "dist"
 if _FRONTEND_DIST.is_dir():
