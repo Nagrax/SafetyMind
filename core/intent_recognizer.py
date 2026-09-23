@@ -24,6 +24,7 @@ from typing import Any, Dict, List, Optional
 from anthropic import AsyncAnthropic
 
 from core.llm_utils import extract_text_content
+from core.local_embedding import ngram_vector
 
 logger = logging.getLogger(__name__)
 
@@ -524,22 +525,8 @@ class IntentRecognizer:
 
     @staticmethod
     def _local_embedding(text: str, dims: int = 256) -> List[float]:
-        """稳定的字符 n-gram 哈希向量，用于无远端 Embedding 时的语义近似匹配。"""
-        normalized = text.lower().strip()
-        vec = [0.0] * dims
-        tokens = set()
-        for n in (1, 2, 3):
-            if len(normalized) >= n:
-                tokens.update(normalized[i:i + n] for i in range(len(normalized) - n + 1))
-        if not tokens:
-            tokens.add(normalized)
-
-        for token in tokens:
-            digest = hashlib.md5(token.encode("utf-8")).digest()
-            idx = int.from_bytes(digest[:4], "big") % dims
-            sign = 1.0 if digest[4] % 2 == 0 else -1.0
-            vec[idx] += sign
-        return vec
+        """本地字符 n-gram 哈希向量（与 ChromaDB 嵌入式模式共用 core/local_embedding）。"""
+        return ngram_vector(text, dims)
 
     def _urgency(self, message: str, intent: IntentCategory) -> UrgencyLevel:
         msg = message.lower()

@@ -1,11 +1,5 @@
 @echo off
 chcp 65001 >nul
 cd /d "%~dp0"
-if not exist .venv (
-  python -m venv .venv
-  call .venv\Scripts\activate.bat
-  pip install -r requirements.txt
-) else (
-  call .venv\Scripts\activate.bat
-)
+rem desktop.pyw 自带自举逻辑：首次双击自动建 venv、装依赖并弹窗提示进度
 python desktop.pyw

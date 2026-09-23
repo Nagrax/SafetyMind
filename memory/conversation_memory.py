@@ -150,6 +150,7 @@ class MemoryManager:
         self._redis_local = False
 
         # ChromaDB：优先连接独立服务（docker compose 模式），连不上则降级为本地嵌入式
+        self._use_chroma_server = True
         try:
             # HttpClient 默认也会初始化 ChromaDB telemetry；显式关闭避免 posthog 兼容性错误日志。
             chroma = chromadb.HttpClient(
@@ -165,11 +166,18 @@ class MemoryManager:
                 path=chroma_path,
                 settings=chromadb.Settings(anonymized_telemetry=False),
             )
+            self._use_chroma_server = False
+
+        # 嵌入式（桌面）模式用本地 n-gram 向量，避免嵌入模型 CDN 下载；服务器模式由服务端嵌入
+        embedding_function = None
+        if not self._use_chroma_server:
+            from core.local_embedding import LocalEmbeddingFunction
+            embedding_function = LocalEmbeddingFunction()
 
         # 情景记忆：存储历史对话片段
-        self._episodic = chroma.get_or_create_collection("episodic")
+        self._episodic = chroma.get_or_create_collection("episodic", embedding_function=embedding_function)
         # 用户画像：存储提炼出的偏好和实体
-        self._profile  = chroma.get_or_create_collection("user_profile")
+        self._profile  = chroma.get_or_create_collection("user_profile", embedding_function=embedding_function)
 
     # ── Redis 访问（失败自动降级进程内存储）────────────────────────────────────
 
