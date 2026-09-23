@@ -181,29 +181,35 @@ button { cursor: pointer; }
 }
 
 .docs-link {
+  border: none;
+  background: transparent;
   color: var(--text-2);
   font-size: 13px;
   font-weight: 600;
-  text-decoration: none;
   padding: 6px 10px;
   border-radius: 8px;
   transition: color 0.15s ease, background 0.15s ease;
 }
 
-.docs-link:hover { color: var(--accent); background: var(--accent-weak); }
+.docs-link:hover:not(:disabled) { color: var(--accent); background: var(--accent-weak); }
 
-.avatar-button {
-  width: 34px;
-  height: 34px;
-  border-radius: 50%;
-  border: 1px solid var(--border-strong);
+.user-pill {
+  display: inline-flex;
+  align-items: center;
+  max-width: 140px;
+  padding: 5px 12px;
+  border: 1px solid var(--border);
+  border-radius: 999px;
   background: var(--bg-soft);
   color: var(--text-2);
-  font-weight: 700;
-  font-size: 13px;
+  font-size: 12px;
+  font-weight: 600;
+  font-family: var(--mono);
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  cursor: default;
 }
-
-.avatar-button:hover { border-color: var(--accent); color: var(--accent); }
 
 /* ── Toast ────────────────────────────────────────────── */
 

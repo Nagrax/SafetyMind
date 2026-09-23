@@ -13,12 +13,14 @@
       </nav>
 
       <div class="topbar-tools">
-        <span class="environment-pill">
+        <span class="environment-pill" :title="healthOk ? '后端健康检查通过' : '后端不可达，请确认服务已启动'">
           <i :class="healthOk ? 'online' : 'offline'"></i>
-          {{ currentBackend.label }}
+          {{ healthOk ? 'API 在线' : 'API 离线' }}
         </span>
-        <a class="docs-link" :href="docsUrl" target="_blank" rel="noreferrer">API 文档</a>
-        <button class="avatar-button" title="当前用户">{{ userInitial }}</button>
+        <button class="docs-link" title="在浏览器中打开 Swagger 接口文档" @click="openDocs">API 文档</button>
+        <span class="user-pill" :title="'当前用户 ID（在连接配置中修改）：' + (settings.userId || 'anonymous')">
+          {{ settings.userId || 'anonymous' }}
+        </span>
       </div>
     </header>
 
@@ -320,7 +322,17 @@ let sidebarObserver
 
 const currentBackend = computed(() => backendMeta(settings.backend, settings))
 const docsUrl = computed(() => `${currentBackend.value.baseUrl}/docs`)
-const userInitial = computed(() => (settings.userId || 'U').slice(0, 1).toUpperCase())
+
+function openDocs() {
+  const url = docsUrl.value
+  // 桌面端（pywebview）不处理 target=_blank，走桥接用系统浏览器打开；
+  // 普通浏览器环境直接开新标签页。
+  if (window.pywebview?.api?.open_external) {
+    window.pywebview.api.open_external(url)
+  } else {
+    window.open(url, '_blank', 'noopener')
+  }
+}
 const activeAlerts = computed(() => monitorData.value.active_alerts || [])
 const agentCount = computed(() => Object.keys(monitorData.value.agent_stats || {}).length)
 const totalRequests = computed(() => Object.values(monitorData.value.agent_stats || {}).reduce((sum, item) => sum + Number(item.total || 0), 0))
