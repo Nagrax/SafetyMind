@@ -125,6 +125,8 @@ def _pick_port() -> int:
 
 
 def main() -> None:
+    import webbrowser
+
     import uvicorn
     import webview
 
@@ -144,13 +146,18 @@ def main() -> None:
         except Exception:
             time.sleep(0.2)
 
-    webview.create_window(
+    def open_external(url: str) -> None:
+        """供前端调用：pywebview 不处理 target=_blank，外部链接走系统浏览器。"""
+        webbrowser.open(url)
+
+    window = webview.create_window(
         "SafetyMind 安全生产智能协同平台",
         f"http://127.0.0.1:{port}",
         width=1280,
         height=820,
         min_size=(960, 640),
     )
+    window.expose(open_external)
     webview.start()
     # 窗口关闭后主线程退出，daemon 线程里的服务随之结束
 
