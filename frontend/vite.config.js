@@ -10,11 +10,6 @@ export default defineConfig({
         target: process.env.VITE_PYTHON_API_URL || 'http://localhost:8000',
         changeOrigin: true,
         rewrite: (path) => path.replace(/^\/api\/python/, '')
-      },
-      '/api/java': {
-        target: process.env.VITE_JAVA_API_URL || 'http://localhost:8080',
-        changeOrigin: true,
-        rewrite: (path) => path.replace(/^\/api\/java/, '')
       }
     }
   }
