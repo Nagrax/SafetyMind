@@ -211,7 +211,7 @@ class MCPToolManager:
             reranked = False
             if rerank_top_k > 0 and tool.supports_rerank and isinstance(data, list):
                 query = params.get("query", "")
-                data, reranked = await self._rerank(query, data, rerank_top_k), True
+                data, reranked = await self._rerank(query, data, rerank_top_k)
 
             # 写缓存：缓存最终返回结果，避免下次命中未重排的原始结果。
             if tool.cache_ttl > 0:
@@ -346,21 +346,21 @@ class MCPToolManager:
         if not merged:
             return ToolResult(success=False, data=[], tool_name=tool_name, error="所有子查询均无结果")
 
-        # 4. 重排：用 LLM 对合并结果按相关性打分，取 Top-K
-        reranked = await self._rerank(query, merged, top_k)
-        return ToolResult(success=True, data=reranked, tool_name=tool_name, reranked=True)
+        # 4. 重排：用 LLM 对合并结果按相关性打分，取 Top-K（失败降级为原序，如实标注）
+        reranked_items, rerank_ok = await self._rerank(query, merged, top_k)
+        return ToolResult(success=True, data=reranked_items, tool_name=tool_name, reranked=rerank_ok)
 
     # ── 结果重排（解决召回不好）──────────────────────────────────────────────
 
-    async def _rerank(self, query: str, items: List[Any], top_k: int) -> List[Any]:
+    async def _rerank(self, query: str, items: List[Any], top_k: int) -> tuple[List[Any], bool]:
         """
-        用 LLM 对召回结果重新打分排序。
+        用 LLM 对召回结果重新打分排序，返回 (排序结果, 是否真的经过 LLM 重排)。
 
         解决问题：向量检索的相似度分数不等于"对用户有用"，
         LLM 能理解语义相关性，重排后 Top-K 质量显著提升。
         """
         if len(items) <= top_k:
-            return items
+            return items, False
 
         # 将结果序列化为文本供 LLM 评分
         items_text = "\n".join(f"{i}. {json.dumps(item, ensure_ascii=False)[:200]}"
@@ -383,10 +383,10 @@ class MCPToolManager:
             s, e = raw.find("["), raw.rfind("]") + 1
             order: List[int] = json.loads(raw[s:e])
             reranked = [items[i] for i in order if 0 <= i < len(items)]
-            return reranked[:top_k]
+            return reranked[:top_k], True
         except Exception as ex:
             logger.warning(f"重排失败，返回原始顺序: {ex}")
-            return items[:top_k]
+            return items[:top_k], False
 
     # ── 缓存 ──────────────────────────────────────────────────────────────────
 

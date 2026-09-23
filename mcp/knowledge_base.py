@@ -50,6 +50,7 @@ class KnowledgeBase:
         chroma_path: str = "./data/chroma",
     ):
         # 优先连接独立 ChromaDB 服务（服务端内置 embedding 模型，客户端无需下载）
+        self._use_server = False
         try:
             # HttpClient 默认也会初始化 ChromaDB telemetry；显式关闭避免 posthog 兼容性错误日志。
             self._client = chromadb.HttpClient(
@@ -58,6 +59,7 @@ class KnowledgeBase:
                 settings=chromadb.Settings(anonymized_telemetry=False),
             )
             self._client.heartbeat()
+            self._use_server = True
             logger.info(f"知识库 ChromaDB 已连接: {chroma_host}:{chroma_port}")
         except Exception:
             logger.info(f"知识库 ChromaDB 服务不可用，使用本地模式: {chroma_path}")
@@ -66,15 +68,24 @@ class KnowledgeBase:
                 settings=chromadb.Settings(anonymized_telemetry=False),
             )
 
+        # 服务器模式由服务端模型负责嵌入；嵌入式（桌面）模式改用本地 n-gram 向量：
+        # all-MiniLM 是英文模型且需从 CDN 下载 ~80MB，对中文法规语义有限、链路脆弱。
+        embedding_function = None
+        if not self._use_server:
+            from core.local_embedding import LocalEmbeddingFunction
+            embedding_function = LocalEmbeddingFunction()
+
         # 子块集合：检索入口
         self._collection = self._client.get_or_create_collection(
             name=self.COLLECTION_NAME,
             metadata={"description": "SafetyMind RAG 知识库（子块）"},
+            embedding_function=embedding_function,
         )
-        # 父块集合：整篇文档，命中子块后取回完整上下文
+        # 父块集合：整篇文档，命中子块后取回完整上下文（仅为批量 get 的载体，不参与检索）
         self._parents = self._client.get_or_create_collection(
             name=self.PARENT_COLLECTION_NAME,
             metadata={"description": "SafetyMind RAG 知识库（父块·整篇）"},
+            embedding_function=embedding_function,
         )
 
         # 如果知识库为空，导入默认文档（安全生产法规与制度）
