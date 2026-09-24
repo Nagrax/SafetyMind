@@ -297,7 +297,10 @@ import {
 } from './lib/backends'
 
 const settings = reactive(createInitialSettings())
-const activeView = ref('chat')
+// 支持 ?view=chat|knowledge|evaluation 深链接（书签/截图/外链直达指定页）
+const VIEWS = ['chat', 'knowledge', 'evaluation']
+const initialView = new URLSearchParams(window.location.search).get('view')
+const activeView = ref(VIEWS.includes(initialView) ? initialView : 'chat')
 const messages = ref([])
 const draft = ref('')
 const busy = ref(false)

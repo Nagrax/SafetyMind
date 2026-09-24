@@ -31,6 +31,16 @@
 
 Vue 3 前端（`frontend/`）提供对话、技能查看/热加载、知识库统计、检索演示、评测面板、监控面板，预构建产物随仓库分发，无需 Node 环境即可运行。
 
+<p align="center">
+  <img src="docs/screenshots/overview.png" width="82%" alt="SafetyMind 对话页：快捷安全场景、路由信息与运行状态侧栏" />
+</p>
+
+<p align="center">
+  <img src="docs/screenshots/knowledge.png" width="82%" alt="SafetyMind 知识库页：父子召回检索结果、文档导入与已加载 Skills" />
+</p>
+
+上图分别为**对话页**（快捷安全场景一键试用，右侧栏实时显示主 Agent、意图、置信度、路由原因与运行状态）与**知识库页**（检索演示走改写→并行召回→重排全链路，支持文档/文件导入与 Skills 热加载）。页面支持 `?view=chat|knowledge|evaluation` 深链接直达。
+
 ## 运行时链路
 
 ```mermaid
