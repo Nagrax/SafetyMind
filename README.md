@@ -75,6 +75,8 @@ flowchart TB
     W --> P["后台异步更新人员安全画像"]
 ```
 
+> 上图为默认配置（三路融合）。启用 `SAFETYMIND_BGE=1` 后，意图阶段由本地语义原型分类器级联替代（95.3%/96.4%，置信度达阈直出、跳过 LLM 调用），其余链路不变。
+
 ## 快速开始
 
 ```bash
@@ -145,6 +147,12 @@ docker compose up -d    # 首次启动会导入 7 篇默认安全知识库文档
 | `CHROMA_HOST/PORT` | localhost:8001 | 向量库（不可用时嵌入式降级） |
 | `PROMETHEUS_PORT` | 关闭 | 指标独立端口 |
 | `EVAL_BASELINE_PATH` | `./data/eval/baseline.json` | 回归基线 |
+| `SAFETYMIND_BGE` | 关闭 | `1` 启用 bge 语义原型分类器级联（意图本地直出） |
+| `SAFETYMIND_BGE_LARGE` | 关闭 | `1` 叠加 bge-large 集成（准确率 +0.5pp） |
+| `SAFETYMIND_BGE_TAU` | `0.8` | 级联直出置信度阈值 |
+| `SAFETYMIND_LAYA` | 关闭 | `1` 启用 Laya 判别式路由备选引擎 |
+| `SAFETYMIND_EMBEDDING` | `auto` | RAG/记忆嵌入：`auto`（bge 可用即用，缺失回退 n-gram）/ `bge` / `ngram` |
+| `SAFETYMIND_MEMORY_SNAPSHOT` | `data/memory_snapshot.json` | 桌面模式记忆快照路径 |
 
 ## 项目结构
 
@@ -162,6 +170,8 @@ SafetyMind/
 ├── skills/                  # 3 篇安全处置 SOP（SKILL.md，热加载）
 ├── frontend/                # Vue 3 前端（src + 预构建 dist）
 ├── config/                  # Nginx / Prometheus
+├── benchmarks/intent/       # 意图基准（2453 条数据集 + 复现脚本 + 盲测工具包）
+├── docs/BENCHMARK.md        # 基准完整报告（方法/主结果/负结果/延迟）
 └── docker-compose.yml       # 生产编排
 ```
 
