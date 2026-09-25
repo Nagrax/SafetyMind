@@ -19,6 +19,7 @@
 import asyncio
 import json
 import logging
+import os
 import time
 import uuid
 from dataclasses import dataclass, field
@@ -306,6 +307,37 @@ class AgentOrchestrator:
 
     # ── 主入口 ────────────────────────────────────────────────────────────────
 
+    # CRITICAL 紧急事态的模板化应急响应（零 LLM 依赖）：
+    # 紧急情况的秒级确定性响应优于生成式回答（更快、无幻觉、端点故障时在线）。
+    # 内容为通用应急要点，现场处置以本单位应急预案和应急指挥指令为准。
+    CRITICAL_TEMPLATES = {
+        IntentCategory.EMERGENCY_RESPONSE: (
+            """【紧急事态·立即行动】您的上报已自动触发应急响应，请按顺序执行：
+1. 自身防护：佩戴防护用品，严禁贸然进入危险区域；
+2. 疏散隔离：组织无关人员向上风向撤离，设置警戒线；
+3. 控制源头：在确保自身安全的前提下切断泄漏源/电源/火源；
+4. 呼叫求援：立即拨打本单位应急电话及 119/120，说明地点、物质、伤亡情况；
+5. 现场引导：等候专业处置力量，提供您掌握的信息。
+【已自动完成】升级流程已触发，应急指挥将收到本条上报（时间/内容已留痕）。
+重要提示：以上为通用应急要点，现场处置以本单位应急预案和应急指挥指令为准。"""
+        ),
+        IntentCategory.INCIDENT_REPORT: (
+            """【事故上报·立即行动】您的上报已自动触发升级流程：
+1. 抢救伤员、保护现场，防止事故扩大；
+2. 立即拨打本单位应急电话及 120（如有人员伤亡），并按规定时限上报；
+3. 保留现场证据（照片/位置/时间/涉事设备与物质）；
+4. 配合调查，不瞒报、不谎报、不迟报。
+【已自动完成】本条上报已留痕，安全值班人员将收到通知。"""
+        ),
+    }
+    CRITICAL_GENERIC = (
+        """【紧急事态·已触发升级】您的上报属于紧急安全事项：
+1. 立即撤离危险区域并组织人员疏散；
+2. 拨打本单位应急电话及 119/120；
+3. 本条上报已留痕，应急指挥将收到通知。
+重要提示：现场处置以本单位应急预案和应急指挥指令为准。"""
+    )
+
     async def run(self, req: Request) -> OrchestratorResult:
         """
         处理一次请求的完整流程：
@@ -333,6 +365,26 @@ class AgentOrchestrator:
                 primary_agent=AgentType.GENERAL,
                 routing_reason="低置信度 OTHER 意图，先澄清用户需求",
                 routing_confidence=req.intent_confidence,
+            )
+
+        # CRITICAL 紧急事态：模板化应急响应（零 LLM 依赖）。
+        # 设计依据：紧急情况的秒级确定性响应优于生成式回答（更快、无幻觉、
+        # 端点故障时安全关键路径在线）；SAFETYMIND_CRITICAL_TEMPLATE=0 可关闭。
+        if (os.getenv("SAFETYMIND_CRITICAL_TEMPLATE", "1") == "1"
+                and req.urgency == UrgencyLevel.CRITICAL):
+            template = self.CRITICAL_TEMPLATES.get(req.intent, self.CRITICAL_GENERIC)
+            logger.warning(f"请求 {req.request_id} CRITICAL 紧急事态，模板化响应（零 LLM 依赖）")
+            return OrchestratorResult(
+                request_id=req.request_id,
+                response=template,
+                agent_type=AgentType.ESCALATION,
+                intent=req.intent,
+                escalated=True,
+                latency_ms=(time.monotonic() - t0) * 1000,
+                agent_types=[AgentType.ESCALATION],
+                primary_agent=AgentType.ESCALATION,
+                routing_reason="CRITICAL 紧急事态，模板化应急响应（零 LLM 依赖）",
+                routing_confidence=1.0,
             )
 
         # 复杂问题自动并行协作，例如同一句同时涉及设备报警和作业票办理。
