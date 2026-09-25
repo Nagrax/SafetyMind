@@ -48,3 +48,9 @@ frontend/node_modules/
 # 本地剖析与模型缓存（不入库）
 _profile_chroma/
 hf_cache/
+
+# 真实业务数据与本地向量索引（不入公共仓库）
+data/knowledge_seed/
+data/vector_store/
+data/chroma*
+*.xlsx
