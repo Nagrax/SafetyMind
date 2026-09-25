@@ -44,3 +44,7 @@ frontend/node_modules/
 
 # Windows 快捷方式
 *.lnk
+
+# 本地剖析与模型缓存（不入库）
+_profile_chroma/
+hf_cache/

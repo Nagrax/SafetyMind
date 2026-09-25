@@ -1,0 +1,2540 @@
+{
+ "meta": {
+  "version": "v4-expansion",
+  "date": "2026-09-25",
+  "design": "v3 保持不动；新增条目全部 split=test2（干净考卷：生成后从未参与任何选择）；与 bank(模板+HAND1-4) Jaccard>0.8 重叠已剔除",
+  "n_new": 417,
+  "n_dropped": 22,
+  "n_bank_overlap_removed": 0,
+  "tiers": {
+   "paraphrase": 111,
+   "canonical": 306
+  },
+  "per_class": {
+   "chemical_safety": 41,
+   "emergency_response": 58,
+   "equipment_alarm": 94,
+   "equipment_maintenance": 50,
+   "escalation": 6,
+   "feedback": 6,
+   "general_consult": 8,
+   "greeting": 6,
+   "hazard_inspection": 8,
+   "hazard_report": 78,
+   "incident_report": 6,
+   "inspection_audit": 7,
+   "occupational_health": 7,
+   "other": 6,
+   "ppe_inquiry": 7,
+   "regulation_query": 6,
+   "safety_document": 6,
+   "training_cert": 5,
+   "work_permit": 12
+  },
+  "warning": "同为 GLM 自标注，未人工抽检"
+ },
+ "new_items": [
+  {
+   "text": "政府部门联合看和专项检查的区别是什么呗？",
+   "label": "inspection_audit",
+   "tier": "paraphrase",
+   "split": "test2"
+  },
+  {
+   "text": "氯气少量渗漏但气味刺鼻，要不要启动应急响应？",
+   "label": "emergency_response",
+   "tier": "canonical",
+   "split": "test2"
+  },
+  {
+   "text": "迎检时被问到答不上来的问题该怎么应对？",
+   "label": "inspection_audit",
+   "tier": "canonical",
+   "split": "test2"
+  },
+  {
+   "text": "检查中发现调节阀的接地线断开，上报隐患的时限要求是什么？",
+   "label": "hazard_report",
+   "tier": "canonical",
+   "split": "test2"
+  },
+  {
+   "text": "储罐检修后试运期间温度超高报警，这时的处置和正常运行有什么不同？",
+   "label": "equipment_alarm",
+   "tier": "canonical",
+   "split": "test2"
+  },
+  {
+   "text": "检查中发现换热器的接地线断开，上报隐患的时限要求是什么？",
+   "label": "hazard_report",
+   "tier": "canonical",
+   "split": "test2"
+  },
+  {
+   "text": "员工自查发现的接地扁铁锈断，走隐患报还是整改单？",
+   "label": "hazard_report",
+   "tier": "paraphrase",
+   "split": "test2"
+  },
+  {
+   "text": "氯气装卸区的防静电措施有哪些？",
+   "label": "chemical_safety",
+   "tier": "canonical",
+   "split": "test2"
+  },
+  {
+   "text": "硫酸的包装类别和储存场所等级咋对应？",
+   "label": "chemical_safety",
+   "tier": "paraphrase",
+   "split": "test2"
+  },
+  {
+   "text": "换热器润滑保养的油品型号和加注周期咋确定呢？",
+   "label": "equipment_maintenance",
+   "tier": "paraphrase",
+   "split": "test2"
+  },
+  {
+   "text": ".配电室人员疏散集合点的设置和引导怎么做？",
+   "label": "emergency_response",
+   "tier": "canonical",
+   "split": "test2"
+  },
+  {
+   "text": "皮带输送机检修后试运期间温度超高报警，这时的处置和正常运行有啥不同呗？",
+   "label": "equipment_alarm",
+   "tier": "paraphrase",
+   "split": "test2"
+  },
+  {
+   "text": ".泵房人员疏散集合点的设置和引导咋做呢？",
+   "label": "emergency_response",
+   "tier": "paraphrase",
+   "split": "test2"
+  },
+  {
+   "text": "回答得很细，辛苦了",
+   "label": "feedback",
+   "tier": "canonical",
+   "split": "test2"
+  },
+  {
+   "text": "现场发现反应釜安全附件失效，隐患一单怎么填？",
+   "label": "hazard_report",
+   "tier": "paraphrase",
+   "split": "test2"
+  },
+  {
+   "text": "装置停车大修时引风机的检验委托和验收流程咋走？",
+   "label": "equipment_maintenance",
+   "tier": "paraphrase",
+   "split": "test2"
+  },
+  {
+   "text": ".仓库人员疏散集合点的设置和引导怎么做？",
+   "label": "emergency_response",
+   "tier": "canonical",
+   "split": "test2"
+  },
+  {
+   "text": "换热器检修后试运期间温度骤升报警，这时的处置和正常运行有什么不同？",
+   "label": "equipment_alarm",
+   "tier": "canonical",
+   "split": "test2"
+  },
+  {
+   "text": "甲苯储罐底部阀门泄漏，现场警戒和处置怎么安排？",
+   "label": "emergency_response",
+   "tier": "canonical",
+   "split": "test2"
+  },
+  {
+   "text": "帮我算下这道方程",
+   "label": "other",
+   "tier": "canonical",
+   "split": "test2"
+  },
+  {
+   "text": "换热器停车后的复位报警一直闪，怎么消掉？",
+   "label": "equipment_alarm",
+   "tier": "canonical",
+   "split": "test2"
+  },
+  {
+   "text": "看中发现换热器的保温层破损，上报隐患的时限要求是什么啊？",
+   "label": "hazard_report",
+   "tier": "paraphrase",
+   "split": "test2"
+  },
+  {
+   "text": ".中控室人员疏散集合点的设置和引导咋做？",
+   "label": "emergency_response",
+   "tier": "paraphrase",
+   "split": "test2"
+  },
+  {
+   "text": "安全操作规程和工艺技术规程为什么要分开？",
+   "label": "safety_document",
+   "tier": "canonical",
+   "split": "test2"
+  },
+  {
+   "text": "夜班时有毒气体报警仪误报频发，怎么排查是仪表问题还是真超限？",
+   "label": "equipment_alarm",
+   "tier": "canonical",
+   "split": "test2"
+  },
+  {
+   "text": "操作规程与工艺卡片的区别和联系是什么？",
+   "label": "safety_document",
+   "tier": "canonical",
+   "split": "test2"
+  },
+  {
+   "text": "附近哪家面馆好吃",
+   "label": "other",
+   "tier": "canonical",
+   "split": "test2"
+  },
+  {
+   "text": "中控室收到配电柜温度二值报警，远程处置和现场处置怎么分工？",
+   "label": "equipment_alarm",
+   "tier": "canonical",
+   "split": "test2"
+  },
+  {
+   "text": "泵房堆放了杂物占用了疏散通道，我要上报这个隐患",
+   "label": "hazard_report",
+   "tier": "canonical",
+   "split": "test2"
+  },
+  {
+   "text": "引风机振动值超限报警联锁动作，操作工的应急操作卡步骤是什么？",
+   "label": "equipment_alarm",
+   "tier": "canonical",
+   "split": "test2"
+  },
+  {
+   "text": "配电柜检修后试运期间压力超高报警，这时的处置和正常运行有什么不同？",
+   "label": "equipment_alarm",
+   "tier": "canonical",
+   "split": "test2"
+  },
+  {
+   "text": "检查中发现皮带输送机的保温层破损，上报隐患的时限要求是什么？",
+   "label": "hazard_report",
+   "tier": "canonical",
+   "split": "test2"
+  },
+  {
+   "text": "压缩机停车后的复位报警一直闪，咋消掉？",
+   "label": "equipment_alarm",
+   "tier": "paraphrase",
+   "split": "test2"
+  },
+  {
+   "text": ".配电室人员疏散集合点的设置和引导咋做呢？",
+   "label": "emergency_response",
+   "tier": "paraphrase",
+   "split": "test2"
+  },
+  {
+   "text": "发现管廊的灭火器箱被上锁，这个隐患怎么报？",
+   "label": "hazard_report",
+   "tier": "canonical",
+   "split": "test2"
+  },
+  {
+   "text": "安全阀检修后试运期间压差异常报警，这时的处置和正常运行有啥不同呗？",
+   "label": "equipment_alarm",
+   "tier": "paraphrase",
+   "split": "test2"
+  },
+  {
+   "text": "缺氧环境能不能用过滤式防毒面具？",
+   "label": "ppe_inquiry",
+   "tier": "canonical",
+   "split": "test2"
+  },
+  {
+   "text": "储罐停车后的复位报警一直闪，怎么消掉？",
+   "label": "equipment_alarm",
+   "tier": "canonical",
+   "split": "test2"
+  },
+  {
+   "text": "编制现场处置方案的步骤是什么？",
+   "label": "safety_document",
+   "tier": "canonical",
+   "split": "test2"
+  },
+  {
+   "text": "烧碱少量渗漏但气味刺鼻，要不要启动应急响应？",
+   "label": "emergency_response",
+   "tier": "canonical",
+   "split": "test2"
+  },
+  {
+   "text": "装置停车大修时输送管线的检验委托和验收流程怎么走？",
+   "label": "equipment_maintenance",
+   "tier": "canonical",
+   "split": "test2"
+  },
+  {
+   "text": "现场发现引风机安全附件失效，隐患上报单怎么填？",
+   "label": "hazard_report",
+   "tier": "canonical",
+   "split": "test2"
+  },
+  {
+   "text": "双氧水的包装类别和储存场所等级怎么对应？",
+   "label": "chemical_safety",
+   "tier": "canonical",
+   "split": "test2"
+  },
+  {
+   "text": "氯气的包装类别和储存场所等级怎么对应？",
+   "label": "chemical_safety",
+   "tier": "canonical",
+   "split": "test2"
+  },
+  {
+   "text": "这事得有人拍板",
+   "label": "escalation",
+   "tier": "canonical",
+   "split": "test2"
+  },
+  {
+   "text": "法兰停车后的复位报警一直闪，怎么消掉？",
+   "label": "equipment_alarm",
+   "tier": "canonical",
+   "split": "test2"
+  },
+  {
+   "text": "天然气的包装类别和储存场所等级怎么对应？",
+   "label": "chemical_safety",
+   "tier": "canonical",
+   "split": "test2"
+  },
+  {
+   "text": ".污水处理站人员疏散集合点的设置和引导怎么做？",
+   "label": "emergency_response",
+   "tier": "canonical",
+   "split": "test2"
+  },
+  {
+   "text": "员工自查发现的接地扁铁锈断，走隐患上报还是整改单？",
+   "label": "hazard_report",
+   "tier": "canonical",
+   "split": "test2"
+  },
+  {
+   "text": "吊装作业票与工艺处置票的关系是什么？",
+   "label": "work_permit",
+   "tier": "canonical",
+   "split": "test2"
+  },
+  {
+   "text": "突发碱液喷溅造成人员灼伤，现场应急救护咋做呀？",
+   "label": "emergency_response",
+   "tier": "paraphrase",
+   "split": "test2"
+  },
+  {
+   "text": "发现中控室的灭火器箱被上锁，这个隐患怎么报？",
+   "label": "hazard_report",
+   "tier": "canonical",
+   "split": "test2"
+  },
+  {
+   "text": "甲苯少量渗漏但气味刺鼻，要不要启动应急响应？",
+   "label": "emergency_response",
+   "tier": "canonical",
+   "split": "test2"
+  },
+  {
+   "text": "防护用品的发放标准和领用记录咋管理？",
+   "label": "ppe_inquiry",
+   "tier": "paraphrase",
+   "split": "test2"
+  },
+  {
+   "text": "又见面啦",
+   "label": "greeting",
+   "tier": "canonical",
+   "split": "test2"
+  },
+  {
+   "text": "硫酸储罐底部阀门泄漏，现场警戒和处置怎么安排？",
+   "label": "emergency_response",
+   "tier": "canonical",
+   "split": "test2"
+  },
+  {
+   "text": "泵房堆放了杂物占用了疏散通道，我要一这个隐患",
+   "label": "hazard_report",
+   "tier": "paraphrase",
+   "split": "test2"
+  },
+  {
+   "text": "标准化评审的要素分工和资料准备咋分工？",
+   "label": "inspection_audit",
+   "tier": "paraphrase",
+   "split": "test2"
+  },
+  {
+   "text": "职业病危害现状评价多久做一次？",
+   "label": "occupational_health",
+   "tier": "canonical",
+   "split": "test2"
+  },
+  {
+   "text": ".装卸区人员疏散集合点的设置和引导怎么做？",
+   "label": "emergency_response",
+   "tier": "canonical",
+   "split": "test2"
+  },
+  {
+   "text": "现场发现皮带输送机安全附件失效，隐患上报单怎么填？",
+   "label": "hazard_report",
+   "tier": "canonical",
+   "split": "test2"
+  },
+  {
+   "text": "天然气的燃烧爆炸危险特性和储存禁忌是什么？",
+   "label": "chemical_safety",
+   "tier": "canonical",
+   "split": "test2"
+  },
+  {
+   "text": "特种作业操作证与特种设备作业人员证有什么区别？",
+   "label": "training_cert",
+   "tier": "canonical",
+   "split": "test2"
+  },
+  {
+   "text": "安全管理制度的执行情况怎么检查和考核？",
+   "label": "safety_document",
+   "tier": "canonical",
+   "split": "test2"
+  },
+  {
+   "text": "输送管线停车后的复位报警一直闪，咋消掉？",
+   "label": "equipment_alarm",
+   "tier": "paraphrase",
+   "split": "test2"
+  },
+  {
+   "text": "甲苯的燃烧爆炸危险特性和储存禁忌是什么？",
+   "label": "chemical_safety",
+   "tier": "canonical",
+   "split": "test2"
+  },
+  {
+   "text": "中控室收到输送管线温度二值报警，远程处置和现场处置咋分工呗？",
+   "label": "equipment_alarm",
+   "tier": "paraphrase",
+   "split": "test2"
+  },
+  {
+   "text": "储罐温度超高报警联锁动作，操作工的应急操作卡步骤是什么？",
+   "label": "equipment_alarm",
+   "tier": "canonical",
+   "split": "test2"
+  },
+  {
+   "text": "液氨少量渗漏但气味刺鼻，要不要启动应急响应？",
+   "label": "emergency_response",
+   "tier": "canonical",
+   "split": "test2"
+  },
+  {
+   "text": "车间堆放了杂物占用了疏散通道，我要上报这个隐患",
+   "label": "hazard_report",
+   "tier": "canonical",
+   "split": "test2"
+  },
+  {
+   "text": "皮带输送机振动值超限报警联锁动作，操作工的应急操作卡步骤是什么？",
+   "label": "equipment_alarm",
+   "tier": "canonical",
+   "split": "test2"
+  },
+  {
+   "text": "甲醇储罐底部阀门泄漏，现场警戒和处置咋安排？",
+   "label": "emergency_response",
+   "tier": "paraphrase",
+   "split": "test2"
+  },
+  {
+   "text": "把负责人电话给我",
+   "label": "escalation",
+   "tier": "canonical",
+   "split": "test2"
+  },
+  {
+   "text": "中控室收到反应釜温度二值报警，远程处置和现场处置怎么分工？",
+   "label": "equipment_alarm",
+   "tier": "canonical",
+   "split": "test2"
+  },
+  {
+   "text": "来打卡",
+   "label": "greeting",
+   "tier": "canonical",
+   "split": "test2"
+  },
+  {
+   "text": "备件国产化替代要注意什么？",
+   "label": "equipment_maintenance",
+   "tier": "canonical",
+   "split": "test2"
+  },
+  {
+   "text": "吊装作业票与工艺处置票的关系是啥？",
+   "label": "work_permit",
+   "tier": "paraphrase",
+   "split": "test2"
+  },
+  {
+   "text": "安全确认制的心理学依据是什么？",
+   "label": "general_consult",
+   "tier": "canonical",
+   "split": "test2"
+  },
+  {
+   "text": "检查中发现换热器的保温层破损，上报隐患的时限要求是什么？",
+   "label": "hazard_report",
+   "tier": "canonical",
+   "split": "test2"
+  },
+  {
+   "text": "学到了学到了",
+   "label": "feedback",
+   "tier": "canonical",
+   "split": "test2"
+  },
+  {
+   "text": "轻伤事故和重伤事故的上报层级差别是什么？",
+   "label": "incident_report",
+   "tier": "canonical",
+   "split": "test2"
+  },
+  {
+   "text": "车间堆放了杂物占用了疏散通道，我要声这个隐患",
+   "label": "hazard_report",
+   "tier": "paraphrase",
+   "split": "test2"
+  },
+  {
+   "text": "锅炉房发生硫酸中毒事故，先救人还是先关阀？",
+   "label": "emergency_response",
+   "tier": "canonical",
+   "split": "test2"
+  },
+  {
+   "text": "引风机停车后的复位报警一直闪，怎么消掉？",
+   "label": "equipment_alarm",
+   "tier": "canonical",
+   "split": "test2"
+  },
+  {
+   "text": "液氨的燃烧爆炸危险特性和储存禁忌是什么？",
+   "label": "chemical_safety",
+   "tier": "canonical",
+   "split": "test2"
+  },
+  {
+   "text": "夜班时压力表误报频发，怎么排查是仪表问题还是真超限？",
+   "label": "equipment_alarm",
+   "tier": "canonical",
+   "split": "test2"
+  },
+  {
+   "text": "中控室收到法兰温度二值报警，远程处置和现场处置怎么分工？",
+   "label": "equipment_alarm",
+   "tier": "canonical",
+   "split": "test2"
+  },
+  {
+   "text": "装置停车大修时安全阀的检验委托和验收流程怎么走？",
+   "label": "equipment_maintenance",
+   "tier": "canonical",
+   "split": "test2"
+  },
+  {
+   "text": "乙醇的包装类别和储存场所等级怎么对应？",
+   "label": "chemical_safety",
+   "tier": "canonical",
+   "split": "test2"
+  },
+  {
+   "text": "中控室收到换热器温度二值报警，远程处置和现场处置咋分工呀？",
+   "label": "equipment_alarm",
+   "tier": "paraphrase",
+   "split": "test2"
+  },
+  {
+   "text": "发现污水处理站的灭火器箱被上锁，这个隐患咋报？",
+   "label": "hazard_report",
+   "tier": "paraphrase",
+   "split": "test2"
+  },
+  {
+   "text": "夜班时液位计误报频发，怎么排查是仪表问题还是真超限？",
+   "label": "equipment_alarm",
+   "tier": "canonical",
+   "split": "test2"
+  },
+  {
+   "text": "皮带输送机润滑保养的油品型号和加注周期咋确定？",
+   "label": "equipment_maintenance",
+   "tier": "paraphrase",
+   "split": "test2"
+  },
+  {
+   "text": "中控室收到储罐温度二值报警，远程处置和现场处置咋分工呀？",
+   "label": "equipment_alarm",
+   "tier": "paraphrase",
+   "split": "test2"
+  },
+  {
+   "text": "配电柜润滑脂加注周期表谁维护？",
+   "label": "equipment_maintenance",
+   "tier": "canonical",
+   "split": "test2"
+  },
+  {
+   "text": "企业安全生产费用的提取比例是哪个文件定的？",
+   "label": "regulation_query",
+   "tier": "canonical",
+   "split": "test2"
+  },
+  {
+   "text": "双氧水的燃烧爆炸危险特性和储存禁忌是啥呢？",
+   "label": "chemical_safety",
+   "tier": "paraphrase",
+   "split": "test2"
+  },
+  {
+   "text": "安全生产许可证条例的有效期和延期规定在哪一条？",
+   "label": "regulation_query",
+   "tier": "canonical",
+   "split": "test2"
+  },
+  {
+   "text": "检查中发现输送管线的呼吸阀堵塞，上报隐患的时限要求是啥啊？",
+   "label": "hazard_report",
+   "tier": "paraphrase",
+   "split": "test2"
+  },
+  {
+   "text": "引风机润滑保养的油品型号和加注周期怎么确定？",
+   "label": "equipment_maintenance",
+   "tier": "canonical",
+   "split": "test2"
+  },
+  {
+   "text": "换热器检修后试运期间温度骤升报警，这时的处置和正常运行有啥不同？",
+   "label": "equipment_alarm",
+   "tier": "paraphrase",
+   "split": "test2"
+  },
+  {
+   "text": "现场发现换热器安全附件失效，隐患上报单怎么填？",
+   "label": "hazard_report",
+   "tier": "canonical",
+   "split": "test2"
+  },
+  {
+   "text": "这事儿要见安环部长",
+   "label": "escalation",
+   "tier": "canonical",
+   "split": "test2"
+  },
+  {
+   "text": "发现仓库的灭火器箱被上锁，这个隐患怎么报？",
+   "label": "hazard_report",
+   "tier": "canonical",
+   "split": "test2"
+  },
+  {
+   "text": "一起危化品泄漏未遂事件，按什么标准界定是否属于事故上报？",
+   "label": "incident_report",
+   "tier": "canonical",
+   "split": "test2"
+  },
+  {
+   "text": "皮带输送机润滑脂加注周期表谁维护？",
+   "label": "equipment_maintenance",
+   "tier": "canonical",
+   "split": "test2"
+  },
+  {
+   "text": "中控室收到换热器温度二值报警，远程处置和现场处置怎么分工？",
+   "label": "equipment_alarm",
+   "tier": "canonical",
+   "split": "test2"
+  },
+  {
+   "text": "硫化氢装卸区的防静电措施有哪些？",
+   "label": "chemical_safety",
+   "tier": "canonical",
+   "split": "test2"
+  },
+  {
+   "text": "安全边际和安全余量是一回事吗？",
+   "label": "general_consult",
+   "tier": "canonical",
+   "split": "test2"
+  },
+  {
+   "text": "同一作业面同时需要动火票和受限空间票怎么办理？",
+   "label": "work_permit",
+   "tier": "canonical",
+   "split": "test2"
+  },
+  {
+   "text": "我不跟机器人说了",
+   "label": "escalation",
+   "tier": "canonical",
+   "split": "test2"
+  },
+  {
+   "text": "危险化学品登记管理办法里对登记时限的规定在哪一条？",
+   "label": "regulation_query",
+   "tier": "canonical",
+   "split": "test2"
+  },
+  {
+   "text": "管廊发生乙醇中毒事故，先救人还是先关阀？",
+   "label": "emergency_response",
+   "tier": "canonical",
+   "split": "test2"
+  },
+  {
+   "text": "反应釜检修后试运期间液位异常报警，这时的处置和正常运行有啥不同呢？",
+   "label": "equipment_alarm",
+   "tier": "paraphrase",
+   "split": "test2"
+  },
+  {
+   "text": "事故快报、续报和处理报告的时限分别是什么？",
+   "label": "incident_report",
+   "tier": "canonical",
+   "split": "test2"
+  },
+  {
+   "text": "储罐润滑保养的油品型号和加注周期怎么确定？",
+   "label": "equipment_maintenance",
+   "tier": "canonical",
+   "split": "test2"
+  },
+  {
+   "text": "员工自查发现的呼吸阀堵塞，走隐患上报还是整改单？",
+   "label": "hazard_report",
+   "tier": "canonical",
+   "split": "test2"
+  },
+  {
+   "text": "离心泵压差异常报警联锁动作，操作工的应急操作卡步骤是什么？",
+   "label": "equipment_alarm",
+   "tier": "canonical",
+   "split": "test2"
+  },
+  {
+   "text": "调节阀润滑保养的油品型号和加注周期咋确定？",
+   "label": "equipment_maintenance",
+   "tier": "paraphrase",
+   "split": "test2"
+  },
+  {
+   "text": "罐区堆放了杂物占用了疏散通道，我要上报这个隐患",
+   "label": "hazard_report",
+   "tier": "canonical",
+   "split": "test2"
+  },
+  {
+   "text": "作业票延期最多能延几次，手续是什么？",
+   "label": "work_permit",
+   "tier": "canonical",
+   "split": "test2"
+  },
+  {
+   "text": "天然气装卸区的防静电措施有哪些？",
+   "label": "chemical_safety",
+   "tier": "canonical",
+   "split": "test2"
+  },
+  {
+   "text": "反应釜润滑脂加注周期表谁维护？",
+   "label": "equipment_maintenance",
+   "tier": "canonical",
+   "split": "test2"
+  },
+  {
+   "text": "装卸区发生氯气中毒事故，先救人还是先关阀？",
+   "label": "emergency_response",
+   "tier": "canonical",
+   "split": "test2"
+  },
+  {
+   "text": "输送管线检修后试运期间温度骤升报警，这时的处置和正常运行有啥不同呢？",
+   "label": "equipment_alarm",
+   "tier": "paraphrase",
+   "split": "test2"
+  },
+  {
+   "text": "烧碱的燃烧爆炸危险特性和储存禁忌是什么？",
+   "label": "chemical_safety",
+   "tier": "canonical",
+   "split": "test2"
+  },
+  {
+   "text": "下午好啊朋友们",
+   "label": "greeting",
+   "tier": "canonical",
+   "split": "test2"
+  },
+  {
+   "text": "仓库发生天然气中毒事故，先救人还是先关阀？",
+   "label": "emergency_response",
+   "tier": "canonical",
+   "split": "test2"
+  },
+  {
+   "text": "反应釜检修后试运期间液位异常报警，这时的处置和正常运行有什么不同？",
+   "label": "equipment_alarm",
+   "tier": "canonical",
+   "split": "test2"
+  },
+  {
+   "text": "怎么注册公司",
+   "label": "other",
+   "tier": "canonical",
+   "split": "test2"
+  },
+  {
+   "text": "离心泵检修后试运期间压差异常报警，这时的处置和正常运行有什么不同？",
+   "label": "equipment_alarm",
+   "tier": "canonical",
+   "split": "test2"
+  },
+  {
+   "text": "换热器润滑保养的油品型号和加注周期怎么确定？",
+   "label": "equipment_maintenance",
+   "tier": "canonical",
+   "split": "test2"
+  },
+  {
+   "text": "检查中发现法兰的保温层破损，报隐患的时限要求是什么？",
+   "label": "hazard_report",
+   "tier": "paraphrase",
+   "split": "test2"
+  },
+  {
+   "text": "调节阀振动值超限报警联锁动作，操作工的应急操作卡步骤是什么？",
+   "label": "equipment_alarm",
+   "tier": "canonical",
+   "split": "test2"
+  },
+  {
+   "text": "安全阀润滑保养的油品型号和加注周期咋确定啊？",
+   "label": "equipment_maintenance",
+   "tier": "paraphrase",
+   "split": "test2"
+  },
+  {
+   "text": "硫化氢的包装类别和储存场所等级咋对应？",
+   "label": "chemical_safety",
+   "tier": "paraphrase",
+   "split": "test2"
+  },
+  {
+   "text": "离心泵压差异常报警联锁动作，操作工的应急操作卡步骤是啥？",
+   "label": "equipment_alarm",
+   "tier": "paraphrase",
+   "split": "test2"
+  },
+  {
+   "text": "现场发现储罐安全附件失效，隐患上报单怎么填？",
+   "label": "hazard_report",
+   "tier": "canonical",
+   "split": "test2"
+  },
+  {
+   "text": "发现装卸区的灭火器箱被上锁，这个隐患咋报呢？",
+   "label": "hazard_report",
+   "tier": "paraphrase",
+   "split": "test2"
+  },
+  {
+   "text": "夏季高温季节隐患排查要增加哪些检查项？",
+   "label": "hazard_inspection",
+   "tier": "canonical",
+   "split": "test2"
+  },
+  {
+   "text": "现场发现皮带输送机安全附件失效，隐患说单怎么填？",
+   "label": "hazard_report",
+   "tier": "paraphrase",
+   "split": "test2"
+  },
+  {
+   "text": "班组长年度安全培训的重点内容是什么？",
+   "label": "training_cert",
+   "tier": "canonical",
+   "split": "test2"
+  },
+  {
+   "text": "检查中发现引风机的保温层破损，上报隐患的时限要求是什么？",
+   "label": "hazard_report",
+   "tier": "canonical",
+   "split": "test2"
+  },
+  {
+   "text": "检查中发现换热器的呼吸阀堵塞，上报隐患的时限要求是什么？",
+   "label": "hazard_report",
+   "tier": "canonical",
+   "split": "test2"
+  },
+  {
+   "text": "皮带输送机停车后的复位报警一直闪，怎么消掉？",
+   "label": "equipment_alarm",
+   "tier": "canonical",
+   "split": "test2"
+  },
+  {
+   "text": "动火作业票与工艺处置票的关系是啥？",
+   "label": "work_permit",
+   "tier": "paraphrase",
+   "split": "test2"
+  },
+  {
+   "text": "压缩机润滑脂加注周期表谁维护？",
+   "label": "equipment_maintenance",
+   "tier": "canonical",
+   "split": "test2"
+  },
+  {
+   "text": "装置停车大修时换热器的检验委托和验收流程咋走呀？",
+   "label": "equipment_maintenance",
+   "tier": "paraphrase",
+   "split": "test2"
+  },
+  {
+   "text": "乙醇的燃烧爆炸危险特性和储存禁忌是什么？",
+   "label": "chemical_safety",
+   "tier": "canonical",
+   "split": "test2"
+  },
+  {
+   "text": "乙醇装卸区的防静电措施有哪些？",
+   "label": "chemical_safety",
+   "tier": "canonical",
+   "split": "test2"
+  },
+  {
+   "text": "发现泵房的灭火器箱被上锁，这个隐患怎么报？",
+   "label": "hazard_report",
+   "tier": "canonical",
+   "split": "test2"
+  },
+  {
+   "text": "防护用品的发放标准和领用记录怎么管理？",
+   "label": "ppe_inquiry",
+   "tier": "canonical",
+   "split": "test2"
+  },
+  {
+   "text": "危化品库房温湿度监控的法规要求是什么？",
+   "label": "chemical_safety",
+   "tier": "canonical",
+   "split": "test2"
+  },
+  {
+   "text": "事故树分析法和事件树分析法咋选？",
+   "label": "general_consult",
+   "tier": "paraphrase",
+   "split": "test2"
+  },
+  {
+   "text": "烧碱储罐底部阀门泄漏，现场警戒和处置怎么安排？",
+   "label": "emergency_response",
+   "tier": "canonical",
+   "split": "test2"
+  },
+  {
+   "text": "双氧水储罐底部阀门泄漏，现场警戒和处置怎么安排？",
+   "label": "emergency_response",
+   "tier": "canonical",
+   "split": "test2"
+  },
+  {
+   "text": "作业票审批人不在现场能否代签，有什么规定？",
+   "label": "work_permit",
+   "tier": "canonical",
+   "split": "test2"
+  },
+  {
+   "text": "装置停车大修时皮带输送机的检验委托和验收流程怎么走？",
+   "label": "equipment_maintenance",
+   "tier": "canonical",
+   "split": "test2"
+  },
+  {
+   "text": "输送管线压差异常报警联锁动作，操作工的应急操作卡步骤是啥？",
+   "label": "equipment_alarm",
+   "tier": "paraphrase",
+   "split": "test2"
+  },
+  {
+   "text": "烧碱的包装类别和储存场所等级怎么对应？",
+   "label": "chemical_safety",
+   "tier": "canonical",
+   "split": "test2"
+  },
+  {
+   "text": "发现锅炉房的灭火器箱被上锁，这个隐患怎么报？",
+   "label": "hazard_report",
+   "tier": "canonical",
+   "split": "test2"
+  },
+  {
+   "text": "双氧水储罐底部阀门泄漏，现场警戒和处置咋安排呀？",
+   "label": "emergency_response",
+   "tier": "paraphrase",
+   "split": "test2"
+  },
+  {
+   "text": "天气预报说明天下雨吗",
+   "label": "other",
+   "tier": "canonical",
+   "split": "test2"
+  },
+  {
+   "text": "压缩机温度骤升报警联锁动作，操作工的应急操作卡步骤是什么？",
+   "label": "equipment_alarm",
+   "tier": "canonical",
+   "split": "test2"
+  },
+  {
+   "text": "乙醇储罐底部阀门泄漏，现场警戒和处置怎么安排？",
+   "label": "emergency_response",
+   "tier": "canonical",
+   "split": "test2"
+  },
+  {
+   "text": "中控室收到离心泵温度二值报警，远程处置和现场处置怎么分工？",
+   "label": "equipment_alarm",
+   "tier": "canonical",
+   "split": "test2"
+  },
+  {
+   "text": "天然气的燃烧爆炸危险特性和储存禁忌是啥呀？",
+   "label": "chemical_safety",
+   "tier": "paraphrase",
+   "split": "test2"
+  },
+  {
+   "text": "电焊面罩和护目镜在什么场景下替换使用？",
+   "label": "ppe_inquiry",
+   "tier": "canonical",
+   "split": "test2"
+  },
+  {
+   "text": "离心泵润滑脂加注周期表谁维护？",
+   "label": "equipment_maintenance",
+   "tier": "canonical",
+   "split": "test2"
+  },
+  {
+   "text": "政府部门联合检查和专项检查的区别是什么？",
+   "label": "inspection_audit",
+   "tier": "canonical",
+   "split": "test2"
+  },
+  {
+   "text": "压缩机检修后试运期间压力超高报警，这时的处置和正常运行有啥不同？",
+   "label": "equipment_alarm",
+   "tier": "paraphrase",
+   "split": "test2"
+  },
+  {
+   "text": "检查中发现引风机的呼吸阀堵塞，下隐患的时限要求是什么呢？",
+   "label": "hazard_report",
+   "tier": "paraphrase",
+   "split": "test2"
+  },
+  {
+   "text": "检查中发现调节阀的接地线断开，报隐患的时限要求是什么呢？",
+   "label": "hazard_report",
+   "tier": "paraphrase",
+   "split": "test2"
+  },
+  {
+   "text": "突发蒸汽烫伤造成人员灼伤，现场应急救护咋做呀？",
+   "label": "emergency_response",
+   "tier": "paraphrase",
+   "split": "test2"
+  },
+  {
+   "text": "调节阀停车后的复位报警一直闪，咋消掉？",
+   "label": "equipment_alarm",
+   "tier": "paraphrase",
+   "split": "test2"
+  },
+  {
+   "text": "皮带输送机压差异常报警联锁动作，操作工的应急操作卡步骤是什么？",
+   "label": "equipment_alarm",
+   "tier": "canonical",
+   "split": "test2"
+  },
+  {
+   "text": "晚上还没休息呢",
+   "label": "greeting",
+   "tier": "canonical",
+   "split": "test2"
+  },
+  {
+   "text": "装置停车大修时皮带输送机的检验委托和验收流程咋走呗？",
+   "label": "equipment_maintenance",
+   "tier": "paraphrase",
+   "split": "test2"
+  },
+  {
+   "text": "压缩机检修后试运期间压力超高报警，这时的处置和正常运行有什么不同？",
+   "label": "equipment_alarm",
+   "tier": "canonical",
+   "split": "test2"
+  },
+  {
+   "text": "液氨的包装类别和储存场所等级怎么对应？",
+   "label": "chemical_safety",
+   "tier": "canonical",
+   "split": "test2"
+  },
+  {
+   "text": "发现罐区的灭火器箱被上锁，这个隐患怎么报？",
+   "label": "hazard_report",
+   "tier": "canonical",
+   "split": "test2"
+  },
+  {
+   "text": "四新培训的考核要求是什么？",
+   "label": "training_cert",
+   "tier": "canonical",
+   "split": "test2"
+  },
+  {
+   "text": "现场发现离心泵安全附件失效，隐患上报单怎么填？",
+   "label": "hazard_report",
+   "tier": "canonical",
+   "split": "test2"
+  },
+  {
+   "text": "装置停车大修时引风机的检验委托和验收流程怎么走？",
+   "label": "equipment_maintenance",
+   "tier": "canonical",
+   "split": "test2"
+  },
+  {
+   "text": "检查中发现法兰的保温层破损，上报隐患的时限要求是什么？",
+   "label": "hazard_report",
+   "tier": "canonical",
+   "split": "test2"
+  },
+  {
+   "text": "操作规程与工艺卡片的区别和联系是啥？",
+   "label": "safety_document",
+   "tier": "paraphrase",
+   "split": "test2"
+  },
+  {
+   "text": "装置停车大修时法兰的检验委托和验收流程怎么走？",
+   "label": "equipment_maintenance",
+   "tier": "canonical",
+   "split": "test2"
+  },
+  {
+   "text": "现场发现输送管线安全附件失效，隐患上报单怎么填？",
+   "label": "hazard_report",
+   "tier": "canonical",
+   "split": "test2"
+  },
+  {
+   "text": "多谢多谢",
+   "label": "feedback",
+   "tier": "canonical",
+   "split": "test2"
+  },
+  {
+   "text": "发现装卸区的灭火器箱被上锁，这个隐患怎么报？",
+   "label": "hazard_report",
+   "tier": "canonical",
+   "split": "test2"
+  },
+  {
+   "text": "危化品库堆放了杂物占用了疏散通道，我要上报这个隐患",
+   "label": "hazard_report",
+   "tier": "canonical",
+   "split": "test2"
+  },
+  {
+   "text": "中控室收到安全阀温度二值报警，远程处置和现场处置怎么分工？",
+   "label": "equipment_alarm",
+   "tier": "canonical",
+   "split": "test2"
+  },
+  {
+   "text": "乙醇少量渗漏但气味刺鼻，要不要启动应急响应？",
+   "label": "emergency_response",
+   "tier": "canonical",
+   "split": "test2"
+  },
+  {
+   "text": "法兰振动值超限报警联锁动作，操作工的应急操作卡步骤是啥？",
+   "label": "equipment_alarm",
+   "tier": "paraphrase",
+   "split": "test2"
+  },
+  {
+   "text": "液氨储罐底部阀门泄漏，现场警戒和处置怎么安排？",
+   "label": "emergency_response",
+   "tier": "canonical",
+   "split": "test2"
+  },
+  {
+   "text": "离心泵停车后的复位报警一直闪，怎么消掉？",
+   "label": "equipment_alarm",
+   "tier": "canonical",
+   "split": "test2"
+  },
+  {
+   "text": "职业健康体检机构的选择有什么要求？",
+   "label": "occupational_health",
+   "tier": "canonical",
+   "split": "test2"
+  },
+  {
+   "text": "现场发现输送管线安全附件失效，隐患声单怎么填？",
+   "label": "hazard_report",
+   "tier": "paraphrase",
+   "split": "test2"
+  },
+  {
+   "text": "液氨的燃烧爆炸危险特性和储存禁忌是啥？",
+   "label": "chemical_safety",
+   "tier": "paraphrase",
+   "split": "test2"
+  },
+  {
+   "text": "烧碱装卸区的防静电措施有哪些？",
+   "label": "chemical_safety",
+   "tier": "canonical",
+   "split": "test2"
+  },
+  {
+   "text": "皮带输送机检修后试运期间振动值超限报警，这时的处置和正常运行有什么不同？",
+   "label": "equipment_alarm",
+   "tier": "canonical",
+   "split": "test2"
+  },
+  {
+   "text": "硫化氢储罐底部阀门泄漏，现场警戒和处置怎么安排？",
+   "label": "emergency_response",
+   "tier": "canonical",
+   "split": "test2"
+  },
+  {
+   "text": "安全阀检修后试运期间压差异常报警，这时的处置和正常运行有什么不同？",
+   "label": "equipment_alarm",
+   "tier": "canonical",
+   "split": "test2"
+  },
+  {
+   "text": "硫酸装卸区的防静电措施有哪些？",
+   "label": "chemical_safety",
+   "tier": "canonical",
+   "split": "test2"
+  },
+  {
+   "text": "给力，就这么干",
+   "label": "feedback",
+   "tier": "canonical",
+   "split": "test2"
+  },
+  {
+   "text": ".泵房人员疏散集合点的设置和引导怎么做？",
+   "label": "emergency_response",
+   "tier": "canonical",
+   "split": "test2"
+  },
+  {
+   "text": "换热器润滑脂加注周期表谁维护？",
+   "label": "equipment_maintenance",
+   "tier": "canonical",
+   "split": "test2"
+  },
+  {
+   "text": "装置停车大修时离心泵的检验委托和验收流程怎么走？",
+   "label": "equipment_maintenance",
+   "tier": "canonical",
+   "split": "test2"
+  },
+  {
+   "text": "装卸区堆放了杂物占用了疏散通道，我要一这个隐患",
+   "label": "hazard_report",
+   "tier": "paraphrase",
+   "split": "test2"
+  },
+  {
+   "text": "管廊堆放了杂物占用了疏散通道，我要上报这个隐患",
+   "label": "hazard_report",
+   "tier": "canonical",
+   "split": "test2"
+  },
+  {
+   "text": "安全阀润滑脂加注周期表谁维护？",
+   "label": "equipment_maintenance",
+   "tier": "canonical",
+   "split": "test2"
+  },
+  {
+   "text": "配电柜停车后的复位报警一直闪，怎么消掉？",
+   "label": "equipment_alarm",
+   "tier": "canonical",
+   "split": "test2"
+  },
+  {
+   "text": "中控室收到压缩机温度二值报警，远程处置和现场处置怎么分工？",
+   "label": "equipment_alarm",
+   "tier": "canonical",
+   "split": "test2"
+  },
+  {
+   "text": "配电柜压差异常报警联锁动作，操作工的应急操作卡步骤是什么？",
+   "label": "equipment_alarm",
+   "tier": "canonical",
+   "split": "test2"
+  },
+  {
+   "text": "引风机振动值超限报警联锁动作，操作工的应急操作卡步骤是啥？",
+   "label": "equipment_alarm",
+   "tier": "paraphrase",
+   "split": "test2"
+  },
+  {
+   "text": "装置停车大修时调节阀的检验委托和验收流程怎么走？",
+   "label": "equipment_maintenance",
+   "tier": "canonical",
+   "split": "test2"
+  },
+  {
+   "text": "中控室收到皮带输送机温度二值报警，远程处置和现场处置怎么分工？",
+   "label": "equipment_alarm",
+   "tier": "canonical",
+   "split": "test2"
+  },
+  {
+   "text": "新修改的安全生产法对处罚幅度是怎么调整的？",
+   "label": "regulation_query",
+   "tier": "canonical",
+   "split": "test2"
+  },
+  {
+   "text": ".罐区人员疏散集合点的设置和引导怎么做？",
+   "label": "emergency_response",
+   "tier": "canonical",
+   "split": "test2"
+  },
+  {
+   "text": "调节阀润滑保养的油品型号和加注周期怎么确定？",
+   "label": "equipment_maintenance",
+   "tier": "canonical",
+   "split": "test2"
+  },
+  {
+   "text": "厂区内发生车辆伤害事故，事故报告包括哪些要素？",
+   "label": "incident_report",
+   "tier": "canonical",
+   "split": "test2"
+  },
+  {
+   "text": "液氨装卸区的防静电措施有哪些？",
+   "label": "chemical_safety",
+   "tier": "canonical",
+   "split": "test2"
+  },
+  {
+   "text": "罐顶作业平台堆放了杂物占用了疏散通道，我要下这个隐患啊",
+   "label": "hazard_report",
+   "tier": "paraphrase",
+   "split": "test2"
+  },
+  {
+   "text": ".中控室人员疏散集合点的设置和引导怎么做？",
+   "label": "emergency_response",
+   "tier": "canonical",
+   "split": "test2"
+  },
+  {
+   "text": "仓库堆放了杂物占用了疏散通道，我要声这个隐患",
+   "label": "hazard_report",
+   "tier": "paraphrase",
+   "split": "test2"
+  },
+  {
+   "text": "发现罐顶作业平台的灭火器箱被上锁，这个隐患怎么报？",
+   "label": "hazard_report",
+   "tier": "canonical",
+   "split": "test2"
+  },
+  {
+   "text": "发现车间的灭火器箱被上锁，这个隐患怎么报？",
+   "label": "hazard_report",
+   "tier": "canonical",
+   "split": "test2"
+  },
+  {
+   "text": ".装卸区人员疏散集合点的设置和引导咋做？",
+   "label": "emergency_response",
+   "tier": "paraphrase",
+   "split": "test2"
+  },
+  {
+   "text": "安全生产标准化换证评审需要提前准备什么？",
+   "label": "inspection_audit",
+   "tier": "canonical",
+   "split": "test2"
+  },
+  {
+   "text": "车间发生氯气中毒事故，先救人还是先关阀？",
+   "label": "emergency_response",
+   "tier": "canonical",
+   "split": "test2"
+  },
+  {
+   "text": "突发蒸汽烫伤造成人员灼伤，现场应急救护怎么做？",
+   "label": "emergency_response",
+   "tier": "canonical",
+   "split": "test2"
+  },
+  {
+   "text": ".锅炉房人员疏散集合点的设置和引导怎么做？",
+   "label": "emergency_response",
+   "tier": "canonical",
+   "split": "test2"
+  },
+  {
+   "text": "女职工特殊时期接触职业危害有什么规定？",
+   "label": "occupational_health",
+   "tier": "canonical",
+   "split": "test2"
+  },
+  {
+   "text": "罐顶作业平台发生双氧水中毒事故，先救人还是先关阀？",
+   "label": "emergency_response",
+   "tier": "canonical",
+   "split": "test2"
+  },
+  {
+   "text": "危化品泄漏应急物资的配备清单依据什么标准？",
+   "label": "chemical_safety",
+   "tier": "canonical",
+   "split": "test2"
+  },
+  {
+   "text": "盐酸的包装类别和储存场所等级咋对应？",
+   "label": "chemical_safety",
+   "tier": "paraphrase",
+   "split": "test2"
+  },
+  {
+   "text": "夜班时可燃气体探测器误报频发，咋排查是仪表问题还是真超限？",
+   "label": "equipment_alarm",
+   "tier": "paraphrase",
+   "split": "test2"
+  },
+  {
+   "text": "现场发现安全阀安全附件失效，隐患上报单怎么填？",
+   "label": "hazard_report",
+   "tier": "canonical",
+   "split": "test2"
+  },
+  {
+   "text": "配电室发生甲醇中毒事故，先救人还是先关阀？",
+   "label": "emergency_response",
+   "tier": "canonical",
+   "split": "test2"
+  },
+  {
+   "text": "法兰润滑保养的油品型号和加注周期怎么确定？",
+   "label": "equipment_maintenance",
+   "tier": "canonical",
+   "split": "test2"
+  },
+  {
+   "text": "涉及承包商的事故报主体是谁呢？",
+   "label": "incident_report",
+   "tier": "paraphrase",
+   "split": "test2"
+  },
+  {
+   "text": "检查中发现反应釜的接地线断开，上报隐患的时限要求是什么？",
+   "label": "hazard_report",
+   "tier": "canonical",
+   "split": "test2"
+  },
+  {
+   "text": "查中发现安全阀的防腐层脱落，上报隐患的时限要求是什么呀？",
+   "label": "hazard_report",
+   "tier": "paraphrase",
+   "split": "test2"
+  },
+  {
+   "text": "压缩机检修后试运期间温度超高报警，这时的处置和正常运行有啥不同啊？",
+   "label": "equipment_alarm",
+   "tier": "paraphrase",
+   "split": "test2"
+  },
+  {
+   "text": "硫化氢的包装类别和储存场所等级怎么对应？",
+   "label": "chemical_safety",
+   "tier": "canonical",
+   "split": "test2"
+  },
+  {
+   "text": "高处作业票与工艺处置票的关系是啥呗？",
+   "label": "work_permit",
+   "tier": "paraphrase",
+   "split": "test2"
+  },
+  {
+   "text": "发现污水处理站的灭火器箱被上锁，这个隐患怎么报？",
+   "label": "hazard_report",
+   "tier": "canonical",
+   "split": "test2"
+  },
+  {
+   "text": "危化品泄漏应急物资的配备清单依据啥标准？",
+   "label": "chemical_safety",
+   "tier": "paraphrase",
+   "split": "test2"
+  },
+  {
+   "text": "硫化氢的燃烧爆炸危险特性和储存禁忌是什么？",
+   "label": "chemical_safety",
+   "tier": "canonical",
+   "split": "test2"
+  },
+  {
+   "text": "职业健康检查结果异常的复核流程是什么？",
+   "label": "occupational_health",
+   "tier": "canonical",
+   "split": "test2"
+  },
+  {
+   "text": "装置停车大修时储罐的检验委托和验收流程咋走？",
+   "label": "equipment_maintenance",
+   "tier": "paraphrase",
+   "split": "test2"
+  },
+  {
+   "text": "引风机润滑脂加注周期表谁维护？",
+   "label": "equipment_maintenance",
+   "tier": "canonical",
+   "split": "test2"
+  },
+  {
+   "text": "推荐个下饭剧",
+   "label": "other",
+   "tier": "canonical",
+   "split": "test2"
+  },
+  {
+   "text": "皮带输送机检修后试运期间压力超高报警，这时的处置和正常运行有啥不同呗？",
+   "label": "equipment_alarm",
+   "tier": "paraphrase",
+   "split": "test2"
+  },
+  {
+   "text": "装置停车大修时换热器的检验委托和验收流程怎么走？",
+   "label": "equipment_maintenance",
+   "tier": "canonical",
+   "split": "test2"
+  },
+  {
+   "text": "值班室的老师傅好",
+   "label": "greeting",
+   "tier": "canonical",
+   "split": "test2"
+  },
+  {
+   "text": "员工自查发现的防腐层脱落，走隐患上报还是整改单？",
+   "label": "hazard_report",
+   "tier": "canonical",
+   "split": "test2"
+  },
+  {
+   "text": "高处作业票与工艺处置票的关系是什么？",
+   "label": "work_permit",
+   "tier": "canonical",
+   "split": "test2"
+  },
+  {
+   "text": "职业危害因素日常监测和定期检测有啥区别？",
+   "label": "occupational_health",
+   "tier": "paraphrase",
+   "split": "test2"
+  },
+  {
+   "text": "安全阀停车后的复位报警一直闪，怎么消掉？",
+   "label": "equipment_alarm",
+   "tier": "canonical",
+   "split": "test2"
+  },
+  {
+   "text": "双氧水装卸区的防静电措施有哪些？",
+   "label": "chemical_safety",
+   "tier": "canonical",
+   "split": "test2"
+  },
+  {
+   "text": "法兰润滑脂加注周期表谁维护？",
+   "label": "equipment_maintenance",
+   "tier": "canonical",
+   "split": "test2"
+  },
+  {
+   "text": "法兰振动值超限报警联锁动作，操作工的应急操作卡步骤是什么？",
+   "label": "equipment_alarm",
+   "tier": "canonical",
+   "split": "test2"
+  },
+  {
+   "text": "涉及承包商的事故上报主体是谁？",
+   "label": "incident_report",
+   "tier": "canonical",
+   "split": "test2"
+  },
+  {
+   "text": "隐患排查治理台账和整改回复单咋对应？",
+   "label": "hazard_inspection",
+   "tier": "paraphrase",
+   "split": "test2"
+  },
+  {
+   "text": "职业危害因素日常监测和定期检测有什么区别？",
+   "label": "occupational_health",
+   "tier": "canonical",
+   "split": "test2"
+  },
+  {
+   "text": "装置停车大修时配电柜的检验委托和验收流程怎么走？",
+   "label": "equipment_maintenance",
+   "tier": "canonical",
+   "split": "test2"
+  },
+  {
+   "text": "现场发现压缩机安全附件失效，隐患上报单怎么填？",
+   "label": "hazard_report",
+   "tier": "canonical",
+   "split": "test2"
+  },
+  {
+   "text": "配电柜液位异常报警联锁动作，操作工的应急操作卡步骤是什么？",
+   "label": "equipment_alarm",
+   "tier": "canonical",
+   "split": "test2"
+  },
+  {
+   "text": "输送管线停车后的复位报警一直闪，怎么消掉？",
+   "label": "equipment_alarm",
+   "tier": "canonical",
+   "split": "test2"
+  },
+  {
+   "text": "罐区堆放了杂物占用了疏散通道，我要报这个隐患呢",
+   "label": "hazard_report",
+   "tier": "paraphrase",
+   "split": "test2"
+  },
+  {
+   "text": "夜班时可燃气体探测器误报频发，怎么排查是仪表问题还是真超限？",
+   "label": "equipment_alarm",
+   "tier": "canonical",
+   "split": "test2"
+  },
+  {
+   "text": "仓库发生甲醇中毒事故，先救人还是先关阀？",
+   "label": "emergency_response",
+   "tier": "canonical",
+   "split": "test2"
+  },
+  {
+   "text": "压缩机检修后试运期间压差异常报警，这时的处置和正常运行有什么不同？",
+   "label": "equipment_alarm",
+   "tier": "canonical",
+   "split": "test2"
+  },
+  {
+   "text": "仓库发生双氧水中毒事故，先救人还是先关阀？",
+   "label": "emergency_response",
+   "tier": "canonical",
+   "split": "test2"
+  },
+  {
+   "text": "现场发现调节阀安全附件失效，隐患上报单怎么填？",
+   "label": "hazard_report",
+   "tier": "canonical",
+   "split": "test2"
+  },
+  {
+   "text": "本质安全化设计包括哪几个方面？",
+   "label": "general_consult",
+   "tier": "canonical",
+   "split": "test2"
+  },
+  {
+   "text": "甲苯的包装类别和储存场所等级咋对应？",
+   "label": "chemical_safety",
+   "tier": "paraphrase",
+   "split": "test2"
+  },
+  {
+   "text": "检查中发现输送管线的呼吸阀堵塞，上报隐患的时限要求是什么？",
+   "label": "hazard_report",
+   "tier": "canonical",
+   "split": "test2"
+  },
+  {
+   "text": ".管廊人员疏散集合点的设置和引导怎么做？",
+   "label": "emergency_response",
+   "tier": "canonical",
+   "split": "test2"
+  },
+  {
+   "text": "烧碱的包装类别和储存场所等级咋对应？",
+   "label": "chemical_safety",
+   "tier": "paraphrase",
+   "split": "test2"
+  },
+  {
+   "text": "压缩机压差异常报警联锁动作，操作工的应急操作卡步骤是啥？",
+   "label": "equipment_alarm",
+   "tier": "paraphrase",
+   "split": "test2"
+  },
+  {
+   "text": ".锅炉房人员疏散集合点的设置和引导咋做呗？",
+   "label": "emergency_response",
+   "tier": "paraphrase",
+   "split": "test2"
+  },
+  {
+   "text": "输送管线压差异常报警联锁动作，操作工的应急操作卡步骤是什么？",
+   "label": "equipment_alarm",
+   "tier": "canonical",
+   "split": "test2"
+  },
+  {
+   "text": "突发碱液喷溅造成人员灼伤，现场应急救护怎么做？",
+   "label": "emergency_response",
+   "tier": "canonical",
+   "split": "test2"
+  },
+  {
+   "text": "硫化氢的燃烧爆炸危险特性和储存禁忌是啥？",
+   "label": "chemical_safety",
+   "tier": "paraphrase",
+   "split": "test2"
+  },
+  {
+   "text": "现场发现安全阀安全附件失效，隐患上报单咋填？",
+   "label": "hazard_report",
+   "tier": "paraphrase",
+   "split": "test2"
+  },
+  {
+   "text": "引风机停车后的复位报警一直闪，咋消掉呗？",
+   "label": "equipment_alarm",
+   "tier": "paraphrase",
+   "split": "test2"
+  },
+  {
+   "text": "调节阀压力超高报警联锁动作，操作工的应急操作卡步骤是什么？",
+   "label": "equipment_alarm",
+   "tier": "canonical",
+   "split": "test2"
+  },
+  {
+   "text": "防静电服和普通工装的使用场景怎么区分？",
+   "label": "ppe_inquiry",
+   "tier": "canonical",
+   "split": "test2"
+  },
+  {
+   "text": "解决了我一大疑问",
+   "label": "feedback",
+   "tier": "canonical",
+   "split": "test2"
+  },
+  {
+   "text": "隐患排查中发现的重复性问题怎么分析根源？",
+   "label": "hazard_inspection",
+   "tier": "canonical",
+   "split": "test2"
+  },
+  {
+   "text": "皮带输送机检修后试运期间压力超高报警，这时的处置和正常运行有什么不同？",
+   "label": "equipment_alarm",
+   "tier": "canonical",
+   "split": "test2"
+  },
+  {
+   "text": "输送管线检修后试运期间温度骤升报警，这时的处置和正常运行有什么不同？",
+   "label": "equipment_alarm",
+   "tier": "canonical",
+   "split": "test2"
+  },
+  {
+   "text": "检查中发现法兰的接地线断开，上报隐患的时限要求是什么？",
+   "label": "hazard_report",
+   "tier": "canonical",
+   "split": "test2"
+  },
+  {
+   "text": "中控室堆放了杂物占用了疏散通道，我要上报这个隐患",
+   "label": "hazard_report",
+   "tier": "canonical",
+   "split": "test2"
+  },
+  {
+   "text": "标准化评审的要素分工和资料准备怎么分工？",
+   "label": "inspection_audit",
+   "tier": "canonical",
+   "split": "test2"
+  },
+  {
+   "text": "事故树分析法和事件树分析法怎么选？",
+   "label": "general_consult",
+   "tier": "canonical",
+   "split": "test2"
+  },
+  {
+   "text": "中控室收到引风机温度二值报警，远程处置和现场处置怎么分工？",
+   "label": "equipment_alarm",
+   "tier": "canonical",
+   "split": "test2"
+  },
+  {
+   "text": "调节阀停车后的复位报警一直闪，怎么消掉？",
+   "label": "equipment_alarm",
+   "tier": "canonical",
+   "split": "test2"
+  },
+  {
+   "text": "法兰温度骤升报警联锁动作，操作工的应急操作卡步骤是啥啊？",
+   "label": "equipment_alarm",
+   "tier": "paraphrase",
+   "split": "test2"
+  },
+  {
+   "text": "装置停车大修时调节阀的检验委托和验收流程咋走？",
+   "label": "equipment_maintenance",
+   "tier": "paraphrase",
+   "split": "test2"
+  },
+  {
+   "text": "员工自查发现的防腐层脱落，走隐患报还是整改单呢？",
+   "label": "hazard_report",
+   "tier": "paraphrase",
+   "split": "test2"
+  },
+  {
+   "text": "甲苯的包装类别和储存场所等级怎么对应？",
+   "label": "chemical_safety",
+   "tier": "canonical",
+   "split": "test2"
+  },
+  {
+   "text": "配电柜润滑保养的油品型号和加注周期怎么确定？",
+   "label": "equipment_maintenance",
+   "tier": "canonical",
+   "split": "test2"
+  },
+  {
+   "text": "乙醇的燃烧爆炸危险特性和储存禁忌是啥呢？",
+   "label": "chemical_safety",
+   "tier": "paraphrase",
+   "split": "test2"
+  },
+  {
+   "text": "备件紧急采购和检修计划怎么衔接？",
+   "label": "equipment_maintenance",
+   "tier": "canonical",
+   "split": "test2"
+  },
+  {
+   "text": "外部审核发现的不符合项怎么闭环？",
+   "label": "inspection_audit",
+   "tier": "canonical",
+   "split": "test2"
+  },
+  {
+   "text": "车间发生双氧水中毒事故，先救人还是先关阀？",
+   "label": "emergency_response",
+   "tier": "canonical",
+   "split": "test2"
+  },
+  {
+   "text": "昨夜世界杯比分",
+   "label": "other",
+   "tier": "canonical",
+   "split": "test2"
+  },
+  {
+   "text": "动火作业票与工艺处置票的关系是什么？",
+   "label": "work_permit",
+   "tier": "canonical",
+   "split": "test2"
+  },
+  {
+   "text": "反应釜停车后的复位报警一直闪，咋消掉呗？",
+   "label": "equipment_alarm",
+   "tier": "paraphrase",
+   "split": "test2"
+  },
+  {
+   "text": "员工自查发现的保温层破损，走隐患上报还是整改单？",
+   "label": "hazard_report",
+   "tier": "canonical",
+   "split": "test2"
+  },
+  {
+   "text": "现场发现配电柜安全附件失效，隐患上报单怎么填？",
+   "label": "hazard_report",
+   "tier": "canonical",
+   "split": "test2"
+  },
+  {
+   "text": "仓库堆放了杂物占用了疏散通道，我要上报这个隐患",
+   "label": "hazard_report",
+   "tier": "canonical",
+   "split": "test2"
+  },
+  {
+   "text": "压缩机停车后的复位报警一直闪，怎么消掉？",
+   "label": "equipment_alarm",
+   "tier": "canonical",
+   "split": "test2"
+  },
+  {
+   "text": "压缩机压差异常报警联锁动作，操作工的应急操作卡步骤是什么？",
+   "label": "equipment_alarm",
+   "tier": "canonical",
+   "split": "test2"
+  },
+  {
+   "text": "这个思路可以，感谢",
+   "label": "feedback",
+   "tier": "canonical",
+   "split": "test2"
+  },
+  {
+   "text": "中控室收到调节阀温度二值报警，远程处置和现场处置怎么分工？",
+   "label": "equipment_alarm",
+   "tier": "canonical",
+   "split": "test2"
+  },
+  {
+   "text": "安全培训学时不够有什么后果，怎么补齐？",
+   "label": "training_cert",
+   "tier": "canonical",
+   "split": "test2"
+  },
+  {
+   "text": "夏季高温季节隐患排查要增加哪些查项？",
+   "label": "hazard_inspection",
+   "tier": "paraphrase",
+   "split": "test2"
+  },
+  {
+   "text": "反应釜检修后试运期间温度超高报警，这时的处置和正常运行有啥不同呗？",
+   "label": "equipment_alarm",
+   "tier": "paraphrase",
+   "split": "test2"
+  },
+  {
+   "text": "海因里希法则和瑞士奶酪模型有什么区别？",
+   "label": "general_consult",
+   "tier": "canonical",
+   "split": "test2"
+  },
+  {
+   "text": "罐区发生天然气中毒事故，先救人还是先关阀？",
+   "label": "emergency_response",
+   "tier": "canonical",
+   "split": "test2"
+  },
+  {
+   "text": "受限空间作业票与工艺处置票的关系是什么？",
+   "label": "work_permit",
+   "tier": "canonical",
+   "split": "test2"
+  },
+  {
+   "text": "检查中发现配电柜的接地线断开，上报隐患的时限要求是什么？",
+   "label": "hazard_report",
+   "tier": "canonical",
+   "split": "test2"
+  },
+  {
+   "text": "节假日复工后的第一轮排查怎么组织？",
+   "label": "hazard_inspection",
+   "tier": "canonical",
+   "split": "test2"
+  },
+  {
+   "text": "反应釜振动值超限报警联锁动作，操作工的应急操作卡步骤是啥？",
+   "label": "equipment_alarm",
+   "tier": "paraphrase",
+   "split": "test2"
+  },
+  {
+   "text": "反应釜振动值超限报警联锁动作，操作工的应急操作卡步骤是什么？",
+   "label": "equipment_alarm",
+   "tier": "canonical",
+   "split": "test2"
+  },
+  {
+   "text": "配电室堆放了杂物占用了疏散通道，我要声这个隐患呗",
+   "label": "hazard_report",
+   "tier": "paraphrase",
+   "split": "test2"
+  },
+  {
+   "text": "隐患排查治理台账和整改回复单怎么对应？",
+   "label": "hazard_inspection",
+   "tier": "canonical",
+   "split": "test2"
+  },
+  {
+   "text": "皮带输送机润滑保养的油品型号和加注周期怎么确定？",
+   "label": "equipment_maintenance",
+   "tier": "canonical",
+   "split": "test2"
+  },
+  {
+   "text": "双氧水少量渗漏但气味刺鼻，要不要启动应急响应？",
+   "label": "emergency_response",
+   "tier": "canonical",
+   "split": "test2"
+  },
+  {
+   "text": "承包商作业区域的隐患排查由谁负责？",
+   "label": "hazard_inspection",
+   "tier": "canonical",
+   "split": "test2"
+  },
+  {
+   "text": "海因里希法则和瑞士奶酪模型有啥区别？",
+   "label": "general_consult",
+   "tier": "paraphrase",
+   "split": "test2"
+  },
+  {
+   "text": "夜班时有毒气体报警仪误报频发，咋排查是仪表问题还是真超限？",
+   "label": "equipment_alarm",
+   "tier": "paraphrase",
+   "split": "test2"
+  },
+  {
+   "text": "制度的年度符合性评审怎么开展？",
+   "label": "safety_document",
+   "tier": "canonical",
+   "split": "test2"
+  },
+  {
+   "text": "检查中发现安全阀的防腐层脱落，上报隐患的时限要求是什么？",
+   "label": "hazard_report",
+   "tier": "canonical",
+   "split": "test2"
+  },
+  {
+   "text": "系统给不了答案，叫专业的人",
+   "label": "escalation",
+   "tier": "canonical",
+   "split": "test2"
+  },
+  {
+   "text": "输送管线润滑保养的油品型号和加注周期怎么确定？",
+   "label": "equipment_maintenance",
+   "tier": "canonical",
+   "split": "test2"
+  },
+  {
+   "text": "检查中发现输送管线的保温层破损，上报隐患的时限要求是什么？",
+   "label": "hazard_report",
+   "tier": "canonical",
+   "split": "test2"
+  },
+  {
+   "text": "有限空间作业的呼吸防护装备怎么配置？",
+   "label": "ppe_inquiry",
+   "tier": "canonical",
+   "split": "test2"
+  },
+  {
+   "text": "为什么说隐患整改要实行五定原则？",
+   "label": "general_consult",
+   "tier": "canonical",
+   "split": "test2"
+  },
+  {
+   "text": "隐患排查发现重大隐患时的上报和监控措施是什么？",
+   "label": "hazard_inspection",
+   "tier": "canonical",
+   "split": "test2"
+  },
+  {
+   "text": "配电室发生苯中毒事故，先救人还是先关阀？",
+   "label": "emergency_response",
+   "tier": "canonical",
+   "split": "test2"
+  },
+  {
+   "text": "硫化氢少量渗漏但气味刺鼻，要不要启动应急响应？",
+   "label": "emergency_response",
+   "tier": "canonical",
+   "split": "test2"
+  },
+  {
+   "text": "安全生产培训考核管理办法的文号是什么？",
+   "label": "regulation_query",
+   "tier": "canonical",
+   "split": "test2"
+  },
+  {
+   "text": "女职工特殊时期接触职业危害有啥规定？",
+   "label": "occupational_health",
+   "tier": "paraphrase",
+   "split": "test2"
+  },
+  {
+   "text": "离心泵润滑保养的油品型号和加注周期怎么确定？",
+   "label": "equipment_maintenance",
+   "tier": "canonical",
+   "split": "test2"
+  },
+  {
+   "text": "皮带输送机振动值超限报警联锁动作，操作工的应急操作卡步骤是啥啊？",
+   "label": "equipment_alarm",
+   "tier": "paraphrase",
+   "split": "test2"
+  },
+  {
+   "text": ".罐顶作业平台人员疏散集合点的设置和引导怎么做？",
+   "label": "emergency_response",
+   "tier": "canonical",
+   "split": "test2"
+  },
+  {
+   "text": "危化品库发生双氧水中毒事故，先救人还是先关阀？",
+   "label": "emergency_response",
+   "tier": "canonical",
+   "split": "test2"
+  },
+  {
+   "text": ".危化品库人员疏散集合点的设置和引导怎么做？",
+   "label": "emergency_response",
+   "tier": "canonical",
+   "split": "test2"
+  },
+  {
+   "text": "安全阀润滑保养的油品型号和加注周期怎么确定？",
+   "label": "equipment_maintenance",
+   "tier": "canonical",
+   "split": "test2"
+  },
+  {
+   "text": "装置停车大修时反应釜的检验委托和验收流程怎么走？",
+   "label": "equipment_maintenance",
+   "tier": "canonical",
+   "split": "test2"
+  },
+  {
+   "text": "管廊发生硫化氢中毒事故，先救人还是先关阀？",
+   "label": "emergency_response",
+   "tier": "canonical",
+   "split": "test2"
+  },
+  {
+   "text": "劳务派遣工的安全培训由谁负责？",
+   "label": "training_cert",
+   "tier": "canonical",
+   "split": "test2"
+  },
+  {
+   "text": "早班好",
+   "label": "greeting",
+   "tier": "canonical",
+   "split": "test2"
+  },
+  {
+   "text": "罐顶作业平台堆放了杂物占用了疏散通道，我要上报这个隐患",
+   "label": "hazard_report",
+   "tier": "canonical",
+   "split": "test2"
+  },
+  {
+   "text": "中控室堆放了杂物占用了疏散通道，我要声这个隐患",
+   "label": "hazard_report",
+   "tier": "paraphrase",
+   "split": "test2"
+  },
+  {
+   "text": "中控室发生烧碱中毒事故，先救人还是先关阀？",
+   "label": "emergency_response",
+   "tier": "canonical",
+   "split": "test2"
+  },
+  {
+   "text": "有限空间作业的呼吸防护装备咋配置？",
+   "label": "ppe_inquiry",
+   "tier": "paraphrase",
+   "split": "test2"
+  },
+  {
+   "text": "现场发现法兰安全附件失效，隐患上报单怎么填？",
+   "label": "hazard_report",
+   "tier": "canonical",
+   "split": "test2"
+  },
+  {
+   "text": "突发酸液飞溅造成人员灼伤，现场应急救护怎么做？",
+   "label": "emergency_response",
+   "tier": "canonical",
+   "split": "test2"
+  },
+  {
+   "text": "盐酸的燃烧爆炸危险特性和储存禁忌是什么？",
+   "label": "chemical_safety",
+   "tier": "canonical",
+   "split": "test2"
+  },
+  {
+   "text": "压缩机温度骤升报警联锁动作，操作工的应急操作卡步骤是啥？",
+   "label": "equipment_alarm",
+   "tier": "paraphrase",
+   "split": "test2"
+  },
+  {
+   "text": "配电室堆放了杂物占用了疏散通道，我要上报这个隐患",
+   "label": "hazard_report",
+   "tier": "canonical",
+   "split": "test2"
+  },
+  {
+   "text": "检查中发现配电柜的防腐层脱落，上报隐患的时限要求是什么？",
+   "label": "hazard_report",
+   "tier": "canonical",
+   "split": "test2"
+  },
+  {
+   "text": "双氧水的燃烧爆炸危险特性和储存禁忌是什么？",
+   "label": "chemical_safety",
+   "tier": "canonical",
+   "split": "test2"
+  },
+  {
+   "text": "中控室收到配电柜温度二值报警，远程处置和现场处置咋分工呀？",
+   "label": "equipment_alarm",
+   "tier": "paraphrase",
+   "split": "test2"
+  },
+  {
+   "text": "反应釜润滑保养的油品型号和加注周期怎么确定？",
+   "label": "equipment_maintenance",
+   "tier": "canonical",
+   "split": "test2"
+  },
+  {
+   "text": "中控室收到储罐温度二值报警，远程处置和现场处置怎么分工？",
+   "label": "equipment_alarm",
+   "tier": "canonical",
+   "split": "test2"
+  },
+  {
+   "text": "中控室收到输送管线温度二值报警，远程处置和现场处置怎么分工？",
+   "label": "equipment_alarm",
+   "tier": "canonical",
+   "split": "test2"
+  },
+  {
+   "text": "甲苯储罐底部阀门泄漏，现场警戒和处置咋安排啊？",
+   "label": "emergency_response",
+   "tier": "paraphrase",
+   "split": "test2"
+  },
+  {
+   "text": "检查中发现反应釜的防腐层脱落，上报隐患的时限要求是啥？",
+   "label": "hazard_report",
+   "tier": "paraphrase",
+   "split": "test2"
+  },
+  {
+   "text": ".车间人员疏散集合点的设置和引导怎么做？",
+   "label": "emergency_response",
+   "tier": "canonical",
+   "split": "test2"
+  },
+  {
+   "text": "转人工，马上",
+   "label": "escalation",
+   "tier": "canonical",
+   "split": "test2"
+  },
+  {
+   "text": "硫酸少量渗漏但气味刺鼻，要不要启动应急响应？",
+   "label": "emergency_response",
+   "tier": "canonical",
+   "split": "test2"
+  },
+  {
+   "text": "苯的燃烧爆炸危险特性和储存禁忌是啥？",
+   "label": "chemical_safety",
+   "tier": "paraphrase",
+   "split": "test2"
+  },
+  {
+   "text": "储罐液位异常报警联锁动作，操作工的应急操作卡步骤是啥？",
+   "label": "equipment_alarm",
+   "tier": "paraphrase",
+   "split": "test2"
+  },
+  {
+   "text": "现场发现反应釜安全附件失效，隐患上报单怎么填？",
+   "label": "hazard_report",
+   "tier": "canonical",
+   "split": "test2"
+  },
+  {
+   "text": "中控室发生氯气中毒事故，先救人还是先关阀？",
+   "label": "emergency_response",
+   "tier": "canonical",
+   "split": "test2"
+  },
+  {
+   "text": "离心泵检修后试运期间液位异常报警，这时的处置和正常运行有什么不同？",
+   "label": "equipment_alarm",
+   "tier": "canonical",
+   "split": "test2"
+  },
+  {
+   "text": "调节阀润滑脂加注周期表谁维护？",
+   "label": "equipment_maintenance",
+   "tier": "canonical",
+   "split": "test2"
+  },
+  {
+   "text": "反应釜停车后的复位报警一直闪，怎么消掉？",
+   "label": "equipment_alarm",
+   "tier": "canonical",
+   "split": "test2"
+  },
+  {
+   "text": "压缩机润滑保养的油品型号和加注周期咋确定？",
+   "label": "equipment_maintenance",
+   "tier": "paraphrase",
+   "split": "test2"
+  },
+  {
+   "text": "新修改的安全生产法对处罚幅度是咋调整的？",
+   "label": "regulation_query",
+   "tier": "paraphrase",
+   "split": "test2"
+  },
+  {
+   "text": "配电柜检修后试运期间温度骤升报警，这时的处置和正常运行有啥不同？",
+   "label": "equipment_alarm",
+   "tier": "paraphrase",
+   "split": "test2"
+  },
+  {
+   "text": "检查中发现引风机的呼吸阀堵塞，上报隐患的时限要求是什么？",
+   "label": "hazard_report",
+   "tier": "canonical",
+   "split": "test2"
+  },
+  {
+   "text": "受限空间作业中断后再进入要不要重新办票？",
+   "label": "work_permit",
+   "tier": "canonical",
+   "split": "test2"
+  },
+  {
+   "text": "离心泵检修后试运期间压差异常报警，这时的处置和正常运行有啥不同？",
+   "label": "equipment_alarm",
+   "tier": "paraphrase",
+   "split": "test2"
+  },
+  {
+   "text": "发现危化品库的灭火器箱被上锁，这个隐患怎么报？",
+   "label": "hazard_report",
+   "tier": "canonical",
+   "split": "test2"
+  },
+  {
+   "text": "氯气的包装类别和储存场所等级咋对应呢？",
+   "label": "chemical_safety",
+   "tier": "paraphrase",
+   "split": "test2"
+  },
+  {
+   "text": "调节阀振动值超限报警联锁动作，操作工的应急操作卡步骤是啥呀？",
+   "label": "equipment_alarm",
+   "tier": "paraphrase",
+   "split": "test2"
+  },
+  {
+   "text": "储罐液位异常报警联锁动作，操作工的应急操作卡步骤是什么？",
+   "label": "equipment_alarm",
+   "tier": "canonical",
+   "split": "test2"
+  },
+  {
+   "text": "硫化氢储罐底部阀门泄漏，现场警戒和处置咋安排呗？",
+   "label": "emergency_response",
+   "tier": "paraphrase",
+   "split": "test2"
+  },
+  {
+   "text": "压缩机润滑保养的油品型号和加注周期怎么确定？",
+   "label": "equipment_maintenance",
+   "tier": "canonical",
+   "split": "test2"
+  },
+  {
+   "text": "装置停车大修时储罐的检验委托和验收流程怎么走？",
+   "label": "equipment_maintenance",
+   "tier": "canonical",
+   "split": "test2"
+  },
+  {
+   "text": "员工自查发现的接地线断开，走隐患上报还是整改单？",
+   "label": "hazard_report",
+   "tier": "canonical",
+   "split": "test2"
+  },
+  {
+   "text": "安全阀停车后的复位报警一直闪，咋消掉呢？",
+   "label": "equipment_alarm",
+   "tier": "paraphrase",
+   "split": "test2"
+  },
+  {
+   "text": "输送管线润滑脂加注周期表谁维护？",
+   "label": "equipment_maintenance",
+   "tier": "canonical",
+   "split": "test2"
+  },
+  {
+   "text": "储罐润滑脂加注周期表谁维护？",
+   "label": "equipment_maintenance",
+   "tier": "canonical",
+   "split": "test2"
+  },
+  {
+   "text": "发现配电室的灭火器箱被上锁，这个隐患怎么报？",
+   "label": "hazard_report",
+   "tier": "canonical",
+   "split": "test2"
+  },
+  {
+   "text": "夜班时温度传感器误报频发，怎么排查是仪表问题还是真超限？",
+   "label": "equipment_alarm",
+   "tier": "canonical",
+   "split": "test2"
+  },
+  {
+   "text": "法兰温度骤升报警联锁动作，操作工的应急操作卡步骤是什么？",
+   "label": "equipment_alarm",
+   "tier": "canonical",
+   "split": "test2"
+  },
+  {
+   "text": "装置停车大修时反应釜的检验委托和验收流程咋走呗？",
+   "label": "equipment_maintenance",
+   "tier": "paraphrase",
+   "split": "test2"
+  },
+  {
+   "text": "装置停车大修时压缩机的检验委托和验收流程怎么走？",
+   "label": "equipment_maintenance",
+   "tier": "canonical",
+   "split": "test2"
+  },
+  {
+   "text": "硫酸的包装类别和储存场所等级怎么对应？",
+   "label": "chemical_safety",
+   "tier": "canonical",
+   "split": "test2"
+  },
+  {
+   "text": "皮带输送机检修后试运期间温度超高报警，这时的处置和正常运行有什么不同？",
+   "label": "equipment_alarm",
+   "tier": "canonical",
+   "split": "test2"
+  },
+  {
+   "text": "天然气储罐底部阀门泄漏，现场警戒和处置怎么安排？",
+   "label": "emergency_response",
+   "tier": "canonical",
+   "split": "test2"
+  },
+  {
+   "text": "装置停车大修时安全阀的检验委托和验收流程咋走呢？",
+   "label": "equipment_maintenance",
+   "tier": "paraphrase",
+   "split": "test2"
+  },
+  {
+   "text": "配电柜检修后试运期间温度骤升报警，这时的处置和正常运行有什么不同？",
+   "label": "equipment_alarm",
+   "tier": "canonical",
+   "split": "test2"
+  },
+  {
+   "text": "污水处理站堆放了杂物占用了疏散通道，我要上报这个隐患",
+   "label": "hazard_report",
+   "tier": "canonical",
+   "split": "test2"
+  },
+  {
+   "text": "检查中发现反应釜的防腐层脱落，上报隐患的时限要求是什么？",
+   "label": "hazard_report",
+   "tier": "canonical",
+   "split": "test2"
+  },
+  {
+   "text": "作业票审批人不在现场能否代签，有啥规定？",
+   "label": "work_permit",
+   "tier": "paraphrase",
+   "split": "test2"
+  },
+  {
+   "text": "夜班时温度传感器误报频发，咋排查是仪表问题还是真超限？",
+   "label": "equipment_alarm",
+   "tier": "paraphrase",
+   "split": "test2"
+  },
+  {
+   "text": "苯装卸区的防静电措施有哪些？",
+   "label": "chemical_safety",
+   "tier": "canonical",
+   "split": "test2"
+  }
+ ]
+}

@@ -264,6 +264,22 @@ class IntentRecognizer:
         self._cache: Dict[str, IntentResult] = {}
         self.cache_hits   = 0
         self.cache_misses = 0
+        # 本地判别式前置（可选；默认关闭零侵入）：
+        #   SAFETYMIND_BGE=1  → BGE 原型分类器（SOTA: test 92.6%），优先
+        #   SAFETYMIND_LAYA=1 → Laya 判别式路由（test 55.2%），BGE 未启用时的备选
+        self._bge = None
+        self._laya = None
+        try:
+            from core.intent_bge import BGEProtoClassifier
+            self._bge = BGEProtoClassifier.from_env()
+        except Exception:
+            self._bge = None
+        if self._bge is None:
+            try:
+                from core.laya_recognizer import LayaFuser
+                self._laya = LayaFuser.from_env()
+            except Exception:
+                self._laya = None
 
     # ── 公开接口 ──────────────────────────────────────────────────────────────
 
@@ -284,6 +300,34 @@ class IntentRecognizer:
         self.cache_misses += 1
 
         t0 = time.monotonic()
+
+        # 本地判别式前置级联（BGE 优先，Laya 备选）：融合置信度达阈直接返回，跳过 LLM；
+        # 未达阈则继续走下方三路融合。升级硬规则（后果词表）在 _urgency 中独立生效，不受影响。
+        local_res = None
+        if self._bge is not None:
+            local_res = await self._bge.try_recognize(message, pattern_fn=self._pattern_recognize)
+        elif self._laya is not None:
+            local_res = await self._laya.try_recognize(message, pattern_fn=self._pattern_recognize)
+        if local_res:
+            tau = (self._bge or self._laya).tau_direct
+            if local_res[1] >= tau:
+                cls_name, conf = local_res
+                try:
+                    intent = IntentCategory(cls_name)
+                except ValueError:
+                    intent = IntentCategory.OTHER
+                result = IntentResult(
+                    intent=intent,
+                    confidence=conf,
+                    urgency=self._urgency(message, intent),
+                    intent_group=self._intent_group(intent),
+                    entities=self._extract_entities(message),
+                    reasoning="laya+pattern fused (direct)",
+                    latency_ms=(time.monotonic() - t0) * 1000,
+                    source_scores={"laya_fused": conf},
+                )
+                self._cache[key] = result
+                return result
 
         # LLM 和 Embedding 并行（Embedding 不可用时跳过）
         llm_task = asyncio.create_task(self._llm_recognize(message, history))
