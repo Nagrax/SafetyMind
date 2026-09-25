@@ -16,6 +16,7 @@ import hashlib
 import asyncio
 import json
 import logging
+import os
 import time
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta
@@ -75,46 +76,94 @@ class MemoryContext:
 
 
 class _MemoryRedis:
-    """Redis 不可用时的进程内降级存储（桌面/演示模式）。
+    """Redis 不可用时的进程内降级存储（桌面模式）。
 
-    仅实现 MemoryManager 用到的命令；TTL 不生效，进程退出即失，
-    用于保证 desktop.pyw 双击可用而非生产用途。
+    支持可选 JSON 快照持久化：写入即落盘、启动时恢复，
+    桌面模式重启后会话与摘要不再丢失。TTL 以惰性过期近似实现
+    （访问时检查过期时间戳，过期键立即清除）。
     """
 
-    def __init__(self) -> None:
+    def __init__(self, persist_path: Optional[str] = None) -> None:
         self._lists: Dict[str, List[str]] = {}
         self._kv: Dict[str, str] = {}
+        self._expiry: Dict[str, float] = {}
+        self._persist_path = persist_path
+        if persist_path and os.path.exists(persist_path):
+            try:
+                snap = json.load(open(persist_path, encoding="utf-8"))
+                now = time.time()
+                exp_all = snap.get("expiry", {})
+                # 已过期的键连同数据一起丢弃（TTL 跨重启生效）
+                self._lists = {k: v for k, v in snap.get("lists", {}).items()
+                               if k not in exp_all or exp_all[k] > now}
+                self._kv = {k: v for k, v in snap.get("kv", {}).items()
+                            if k not in exp_all or exp_all[k] > now}
+                self._expiry = {k: v for k, v in exp_all.items() if v > now}
+            except Exception:
+                pass  # 快照损坏则从空状态开始
+
+    def _purge_expired(self, key: str) -> None:
+        exp = self._expiry.get(key)
+        if exp is not None and exp <= time.time():
+            self._lists.pop(key, None)
+            self._kv.pop(key, None)
+            self._expiry.pop(key, None)
+
+    def _save(self) -> None:
+        if not self._persist_path:
+            return
+        try:
+            os.makedirs(os.path.dirname(self._persist_path) or ".", exist_ok=True)
+            tmp = self._persist_path + ".tmp"
+            with open(tmp, "w", encoding="utf-8") as f:
+                json.dump({"lists": self._lists, "kv": self._kv, "expiry": self._expiry},
+                          f, ensure_ascii=False)
+            os.replace(tmp, self._persist_path)
+        except Exception:
+            pass  # 持久化失败不阻断对话
 
     async def lpush(self, key: str, value: str) -> int:
+        self._purge_expired(key)
         self._lists.setdefault(key, []).insert(0, value)
+        self._save()
         return len(self._lists[key])
 
     async def lrange(self, key: str, start: int, end: int) -> List[str]:
+        self._purge_expired(key)
         values = self._lists.get(key, [])
         if end == -1:
             return list(values[start:])
         return list(values[start:end + 1])
 
     async def llen(self, key: str) -> int:
+        self._purge_expired(key)
         return len(self._lists.get(key, []))
 
     async def expire(self, key: str, seconds: int) -> bool:
+        self._expiry[key] = time.time() + seconds
+        self._save()
         return True
 
     async def get(self, key: str) -> Optional[str]:
+        self._purge_expired(key)
         return self._kv.get(key)
 
     async def setex(self, key: str, seconds: int, value: str) -> bool:
         self._kv[key] = value
+        self._expiry[key] = time.time() + seconds
+        self._save()
         return True
 
     async def delete(self, key: str) -> int:
         existed = key in self._lists or key in self._kv
         self._lists.pop(key, None)
         self._kv.pop(key, None)
+        self._expiry.pop(key, None)
+        self._save()
         return 1 if existed else 0
 
     async def aclose(self) -> None:
+        self._save()
         return None
 
 
@@ -123,7 +172,8 @@ class MemoryManager:
     三级记忆管理器。
 
     工作记忆存 Redis（TTL 24h），情景记忆和用户画像存 ChromaDB（持久化）。
-    Redis 连接失败时自动降级为进程内存储，保证桌面单进程模式可用。
+    Redis 连接失败时自动降级为进程内存储（JSON 快照持久化，重启不丢），
+    保证桌面单进程模式可用。
     """
 
     WORKING_MAX   = 20    # 工作记忆最大条数，超过则触发压缩
@@ -188,8 +238,10 @@ class MemoryManager:
         except Exception as ex:
             if self._redis_local:
                 raise
-            logger.warning(f"Redis 不可用，切换为进程内记忆降级（仅桌面/演示模式）: {ex}")
-            self._redis = _MemoryRedis()
+            logger.warning(f"Redis 不可用，切换为进程内记忆降级（JSON 快照持久化，重启不丢）: {ex}")
+            snap_path = os.getenv("SAFETYMIND_MEMORY_SNAPSHOT",
+                                  os.path.join("data", "memory_snapshot.json"))
+            self._redis = _MemoryRedis(persist_path=snap_path)
             self._redis_local = True
             return await getattr(self._redis, op)(*args, **kwargs)
 

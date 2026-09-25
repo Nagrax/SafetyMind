@@ -1,0 +1,202 @@
+[
+ {
+  "text": "明天配电室要盲板抽堵，作业票怎么处理？",
+  "label": "work_permit"
+ },
+ {
+  "text": "特殊作业管理制度的版本管理和受控发放应该怎么处理？",
+  "label": "safety_document"
+ },
+ {
+  "text": "什么叫屏障思维，能不能举个例子说明？",
+  "label": "general_consult"
+ },
+ {
+  "text": "外来施工队进场动火，作业票怎么办理？",
+  "label": "work_permit"
+ },
+ {
+  "text": "接触苯系物岗位的员工多久做一次职业健康体检？",
+  "label": "occupational_health"
+ },
+ {
+  "text": "电子版操作规程怎么受控管理防止误用旧版？",
+  "label": "safety_document"
+ },
+ {
+  "text": "配电柜的轴承损坏，检维修计划怎么排？",
+  "label": "equipment_maintenance"
+ },
+ {
+  "text": "危化品库爆炸了，第一时间的现场处置步骤指的是什么？",
+  "label": "emergency_response"
+ },
+ {
+  "text": "专家来管廊做安全诊断，现场汇报材料怎么准备？",
+  "label": "inspection_audit"
+ },
+ {
+  "text": "有人苯中毒晕倒，现场急救和应急处置怎么做？",
+  "label": "emergency_response"
+ },
+ {
+  "text": "车间粉尘超标对工人有什么职业健康影响？",
+  "label": "occupational_health"
+ },
+ {
+  "text": "下午好",
+  "label": "greeting"
+ },
+ {
+  "text": "中控室收到反应釜温度二值报警，远程处置和现场处置怎么分工？",
+  "label": "equipment_alarm"
+ },
+ {
+  "text": "皮带输送机检修后试运期间温度超高报警，这时的处置和正常运行有什么不同？",
+  "label": "equipment_alarm"
+ },
+ {
+  "text": "政府部门联合检查和专项检查的区别是什么？",
+  "label": "inspection_audit"
+ },
+ {
+  "text": "现场发现反应釜安全附件失效，隐患上报单怎么填？",
+  "label": "hazard_report"
+ },
+ {
+  "text": "下午好啊朋友们",
+  "label": "greeting"
+ },
+ {
+  "text": "职业健康检查结果异常的复核流程是什么？",
+  "label": "occupational_health"
+ },
+ {
+  "text": "太专业了，帮大忙了呀？",
+  "label": "feedback"
+ },
+ {
+  "text": "DCS上换热器出现温度骤升报警，处置步骤是啥呢？",
+  "label": "equipment_alarm"
+ },
+ {
+  "text": "我瞅见那边管子渗油，这算隐患不，跟谁说去",
+  "label": "hazard_report"
+ },
+ {
+  "text": "危化品经营许可管理办法对企业的安全设施设计审查要求是啥呢？",
+  "label": "regulation_query"
+ },
+ {
+  "text": "氯气的MSDS哪里能查到，储存有啥特殊要求？",
+  "label": "chemical_safety"
+ },
+ {
+  "text": "瑞士奶酪模型在安全管理里咋落地？",
+  "label": "general_consult"
+ },
+ {
+  "text": "呼吸器俩种用哪个好",
+  "label": "ppe_inquiry"
+ },
+ {
+  "text": "明天车间要动火，作业票咋办呢？",
+  "label": "work_permit"
+ },
+ {
+  "text": "生产安全事故报告和调查弄条例对企业的重大危险源备案要求是什么？",
+  "label": "regulation_query"
+ },
+ {
+  "text": "下班路上看到中控室爬梯踏步锈蚀，我想把隐患报一下，流程咋走？",
+  "label": "hazard_report"
+ },
+ {
+  "text": ".泵房人员疏散集合点的设置和引导咋做呢？",
+  "label": "emergency_response"
+ },
+ {
+  "text": "中控室收到配电柜温度二值报警，远程处置和现场处置咋分工呀？",
+  "label": "equipment_alarm"
+ },
+ {
+  "text": "双氧水的燃烧爆炸危险特性和储存禁忌是啥呢？",
+  "label": "chemical_safety"
+ },
+ {
+  "text": "安全阀停车后的复位报警一直闪，咋消掉呢？",
+  "label": "equipment_alarm"
+ },
+ {
+  "text": "动火作业票与工艺处置票的关系是啥？",
+  "label": "work_permit"
+ },
+ {
+  "text": "最近好吗",
+  "label": "greeting"
+ },
+ {
+  "text": "泵修完想试转，进泵坑作业要不要办受限空间票？",
+  "label": "work_permit"
+ },
+ {
+  "text": "排查频次想从月度改成周度，排查计划该怎么调整？",
+  "label": "hazard_inspection"
+ },
+ {
+  "text": "各位老师好",
+  "label": "greeting"
+ },
+ {
+  "text": "找专家会商，马上",
+  "label": "escalation"
+ },
+ {
+  "text": "太感谢了说得很细",
+  "label": "feedback"
+ },
+ {
+  "text": "隐患排查和标准化考核是什么关系？",
+  "label": "hazard_inspection"
+ },
+ {
+  "text": "巡检看到输送管线接地线断开，趁还没扩大我先提交隐患上报。",
+  "label": "hazard_report"
+ },
+ {
+  "text": "我要见你们安全科长",
+  "label": "escalation"
+ },
+ {
+  "text": "培训学时不够的话，能不能用线上课程补齐？",
+  "label": "training_cert"
+ },
+ {
+  "text": "国家对你们这类危化品的储存标准是怎么规定的？",
+  "label": "chemical_safety"
+ },
+ {
+  "text": "满分回答",
+  "label": "feedback"
+ },
+ {
+  "text": "嗯你好",
+  "label": "greeting"
+ },
+ {
+  "text": "周六好",
+  "label": "greeting"
+ },
+ {
+  "text": "帮我查快递",
+  "label": "other"
+ },
+ {
+  "text": "几点了",
+  "label": "other"
+ },
+ {
+  "text": "杜邦理念里关于隐患的那条原文是怎么说的？",
+  "label": "general_consult"
+ }
+]

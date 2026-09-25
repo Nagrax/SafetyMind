@@ -1,7 +1,7 @@
 # SafetyMind 意图识别基准与评测报告
 
 > 版本：2026-09-25 ｜ 全部数字可由 `benchmarks/intent/` 中的数据集与脚本复现
-> 数据集、脚本、逐条预测均随仓库发布；模型权重从 HuggingFace 拉取（bge-base/large-zh-v1.5）
+> 数据集、脚本、逐条预测均随仓库发布；模型权重从 HuggingFace 拉取（bge-base/large-zh-v1.5）；标注协议为人机协同（GLM 初标 + 五模型交叉审计），人工盲测工具包见 benchmarks/intent/blind_test/
 
 ## 1. 一句话结论
 
