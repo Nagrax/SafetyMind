@@ -198,12 +198,19 @@ class IntentEvaluator:
 
         macro_f1 = statistics.mean(v["f1"] for v in per_class.values()) if per_class else 0.0
 
+        # 降级检测：LLM 意图调用失败时三路融合退化为 emb+pattern 两路，
+        # 评测结果必须显式标记，避免把降级成绩当全量成绩误读。
+        llm_failures = sum(1 for c in case_details if "LLM 失败" in c.get("reasoning", ""))
+        degraded = llm_failures > 0
+
         return {
             "accuracy":   round(accuracy, 4),
             "macro_f1":   round(macro_f1, 4),
             "per_class":  per_class,
             "total":      len(cases),
             "correct":    correct,
+            "degraded":   degraded,
+            "llm_failures": llm_failures,
             "cases":      case_details,
         }
 
