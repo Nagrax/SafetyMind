@@ -26,11 +26,12 @@ def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--split", default="test2", choices=["dev", "test", "test2"])
     ap.add_argument("--device", default="cpu", choices=["cpu", "cuda"])
+    ap.add_argument("--no-large", action="store_true", help="仅用 bge-base 单模（2G 内存形态）")
     args = ap.parse_args()
 
     items = load_items(args.split)
     clf = BGEProtoClassifier(temperature=0.03, tau_direct=0.8,
-                             use_large=True, device=args.device)
+                             use_large=not args.no_large, device=args.device)
     clf.probs("预热")  # 懒加载 + 预热
 
     ok = 0
