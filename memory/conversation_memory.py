@@ -218,16 +218,25 @@ class MemoryManager:
             )
             self._use_chroma_server = False
 
-        # 嵌入式（桌面）模式用本地 n-gram 向量，避免嵌入模型 CDN 下载；服务器模式由服务端嵌入
+        # 嵌入式（桌面/单机）模式优先 BGE 语义嵌入（真实中文语义，零 API 成本），
+        # 依赖缺失时回退本地 n-gram；集合名以 _bge 后缀区分向量空间。
         embedding_function = None
+        suffix = ""
         if not self._use_chroma_server:
-            from core.local_embedding import LocalEmbeddingFunction
-            embedding_function = LocalEmbeddingFunction()
+            mode = os.getenv("SAFETYMIND_EMBEDDING", "auto")
+            if mode in ("auto", "bge"):
+                from core.bge_embedding import try_bge_embedding
+                embedding_function = try_bge_embedding()
+            if embedding_function is None:
+                from core.local_embedding import LocalEmbeddingFunction
+                embedding_function = LocalEmbeddingFunction()
+            if embedding_function.name().startswith("safetymind-bge"):
+                suffix = "_bge"
 
         # 情景记忆：存储历史对话片段
-        self._episodic = chroma.get_or_create_collection("episodic", embedding_function=embedding_function)
+        self._episodic = chroma.get_or_create_collection("episodic" + suffix, embedding_function=embedding_function)
         # 用户画像：存储提炼出的偏好和实体
-        self._profile  = chroma.get_or_create_collection("user_profile", embedding_function=embedding_function)
+        self._profile  = chroma.get_or_create_collection("user_profile" + suffix, embedding_function=embedding_function)
 
     # ── Redis 访问（失败自动降级进程内存储）────────────────────────────────────
 
