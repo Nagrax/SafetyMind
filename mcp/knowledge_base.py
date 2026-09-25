@@ -19,6 +19,7 @@ import hashlib
 import logging
 from typing import Any, Dict, List, Optional
 
+import os
 import chromadb
 
 logger = logging.getLogger(__name__)
@@ -68,22 +69,36 @@ class KnowledgeBase:
                 settings=chromadb.Settings(anonymized_telemetry=False),
             )
 
-        # 服务器模式由服务端模型负责嵌入；嵌入式（桌面）模式改用本地 n-gram 向量：
-        # all-MiniLM 是英文模型且需从 CDN 下载 ~80MB，对中文法规语义有限、链路脆弱。
+        # 服务器模式由服务端模型负责嵌入；嵌入式（桌面/单机）模式优先 BGE 语义嵌入
+        # （真实中文语义，本地推理零 API 成本），依赖缺失或加载失败时回退 n-gram。
+        # 两种嵌入的向量空间不兼容，集合名以 @后缀 区分，各自独立播种默认文档。
         embedding_function = None
+        suffix = ""
         if not self._use_server:
-            from core.local_embedding import LocalEmbeddingFunction
-            embedding_function = LocalEmbeddingFunction()
+            mode = os.getenv("SAFETYMIND_EMBEDDING", "auto")  # auto | bge | ngram
+            if mode in ("auto", "bge"):
+                from core.bge_embedding import try_bge_embedding
+                embedding_function = try_bge_embedding()
+                if embedding_function is not None and mode == "bge":
+                    pass
+            if embedding_function is None and mode == "bge":
+                raise RuntimeError("SAFETYMIND_EMBEDDING=bge 但 BGE 嵌入加载失败")
+            if embedding_function is None:
+                from core.local_embedding import LocalEmbeddingFunction
+                embedding_function = LocalEmbeddingFunction()
+            if embedding_function.name().startswith("safetymind-bge"):
+                suffix = "_bge"
+            logger.info(f"知识库嵌入: {embedding_function.name()}")
 
         # 子块集合：检索入口
         self._collection = self._client.get_or_create_collection(
-            name=self.COLLECTION_NAME,
+            name=self.COLLECTION_NAME + suffix,
             metadata={"description": "SafetyMind RAG 知识库（子块）"},
             embedding_function=embedding_function,
         )
         # 父块集合：整篇文档，命中子块后取回完整上下文（仅为批量 get 的载体，不参与检索）
         self._parents = self._client.get_or_create_collection(
-            name=self.PARENT_COLLECTION_NAME,
+            name=self.PARENT_COLLECTION_NAME + suffix,
             metadata={"description": "SafetyMind RAG 知识库（父块·整篇）"},
             embedding_function=embedding_function,
         )
