@@ -11,7 +11,9 @@ load_dotenv(".env")
 import numpy as np
 
 STORE_DIR = os.path.join("data", "vector_store")
-STORE_VEC = os.path.join(STORE_DIR, "embeddings.npy")
+STORE_VEC = os.path.join(STORE_DIR, "embeddings.npy")  # 兼容旧路径
+STORE_VEC_BY_MODE = os.path.join(STORE_DIR, "embeddings_{mode}.npy")
+STORE_DOC_BY_MODE = os.path.join(STORE_DIR, "docs_{mode}.json")
 STORE_DOC = os.path.join(STORE_DIR, "docs.json")
 
 def get_ef(mode=None):
@@ -25,21 +27,29 @@ def get_ef(mode=None):
     from core.local_embedding import LocalEmbeddingFunction
     return LocalEmbeddingFunction(), "ngram"
 
+def _paths(mode):
+    m = mode or "auto"
+    if m == "auto":
+        m = "bge"  # auto 已验证可用即 bge
+    return os.path.join(STORE_DIR, f"embeddings_{m}.npy"), os.path.join(STORE_DIR, f"docs_{m}.json")
+
 def build(mode=None):
     seed = json.load(open("data/knowledge_seed/xlsx_docs.json", encoding="utf-8"))
     ef, used_mode = get_ef(mode)
+    vec_path, doc_path = _paths(used_mode)
     t0 = time.monotonic()
     texts = [d["content"] for d in seed]
     vecs = np.array(ef.embed_documents(texts), dtype=np.float32)
     os.makedirs(STORE_DIR, exist_ok=True)
-    np.save(STORE_VEC, vecs)
-    json.dump(seed, open(STORE_DOC, "w", encoding="utf-8"), ensure_ascii=False)
-    print(f"索引构建: {len(seed)} 片段 × {vecs.shape[1]} 维, 嵌入模式={used_mode}, 耗时 {time.monotonic()-t0:.0f}s")
+    np.save(vec_path, vecs)
+    json.dump(seed, open(doc_path, "w", encoding="utf-8"), ensure_ascii=False)
+    print(f"索引构建: {len(seed)} 片段 × {vecs.shape[1]} 维, 嵌入模式={used_mode}, 耗时 {time.monotonic()-t0:.0f}s → {vec_path}")
 
 def search(query, top_k=3, mode=None):
     ef, used_mode = get_ef(mode)
-    vecs = np.load(STORE_VEC)
-    docs = json.load(open(STORE_DOC, encoding="utf-8"))
+    vec_path, doc_path = _paths(used_mode)
+    vecs = np.load(vec_path)
+    docs = json.load(open(doc_path, encoding="utf-8"))
     qv = np.array(ef.embed_query([query])[0], dtype=np.float32)
     # 余弦相似度（向量已归一化时等价点积；做一次归一化防御）
     qn = qv / (np.linalg.norm(qv) + 1e-9)
