@@ -27,6 +27,7 @@ import chromadb
 import redis.asyncio as redis
 from anthropic import AsyncAnthropic
 
+from core.chroma_utils import open_local_chroma
 from core.llm_utils import extract_text_content
 
 logger = logging.getLogger(__name__)
@@ -212,10 +213,8 @@ class MemoryManager:
             logger.info(f"ChromaDB 已连接: {chroma_host}:{chroma_port}")
         except Exception:
             logger.info(f"ChromaDB 服务不可用，使用本地嵌入式模式: {chroma_path}")
-            chroma = chromadb.PersistentClient(
-                path=chroma_path,
-                settings=chromadb.Settings(anonymized_telemetry=False),
-            )
+            # 自愈打开：HNSW 损坏自动归档重建（损坏的旧情景记忆丢弃，可接受）
+            chroma = open_local_chroma(chroma_path)
             self._use_chroma_server = False
 
         # 嵌入式（桌面/单机）模式优先 BGE 语义嵌入（真实中文语义，零 API 成本），

@@ -29,6 +29,12 @@ class BgeEmbeddingFunction:
 
     def __init__(self, model_id: str = "BAAI/bge-base-zh-v1.5", device: str = "cpu",
                  max_length: int = 256, batch_size: int = 32):
+        # 本机缓存优先 D:\hf_cache（存在才覆盖默认值，其他机器不受影响）；
+        # xet 下载在本机会挂死，必须禁用。防止 HF 往 C 盘用户缓存写 400MB+ 模型。
+        import os
+        if os.path.isdir(r"D:\hf_cache"):
+            os.environ.setdefault("HF_HOME", r"D:\hf_cache")
+        os.environ.setdefault("HF_HUB_DISABLE_XET", "1")
         self._model_id = model_id
         self._max_length = max_length
         self._batch_size = batch_size

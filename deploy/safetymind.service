@@ -1,0 +1,22 @@
+[Unit]
+Description=SafetyMind 安全生产智能助手
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=safetymind
+Group=safetymind
+WorkingDirectory=/opt/safetymind
+EnvironmentFile=/opt/safetymind/.env
+# 重要：workers 必须为 1。嵌入式 chroma 与内存态 BGE 不支持多进程共享数据目录，
+# 并发打开会触发 HNSW 段损坏（Windows/Linux 均已复现）。并发由 asyncio 承载。
+ExecStart=/opt/safetymind/.venv/bin/python -m uvicorn api.main:app --host 127.0.0.1 --port 8000 --workers 1
+Restart=always
+RestartSec=5
+# 2c2G 防护：限制与兜底
+MemoryMax=1500M
+OOMScoreAdjust=-500
+
+[Install]
+WantedBy=multi-user.target

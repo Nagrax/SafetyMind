@@ -209,11 +209,18 @@ _URGENCY_KEYWORDS = {
         "触电", "大量泄漏", "救人", "被困", "有人受伤", "紧急", "立即", "立刻",
     ],
     UrgencyLevel.HIGH: [
-        "泄漏", "报警", "超温", "超压", "事故", "伤亡", "烧伤", "灼伤",
-        "骨折", "马上", "尽快", "今天", "urgent",
+        "泄漏", "渗漏", "刺漏", "喷料", "报警", "超温", "超压", "事故", "伤亡",
+        "烧伤", "灼伤", "骨折", "马上", "尽快", "今天", "urgent",
     ],
     UrgencyLevel.MEDIUM: ["这周", "隐患", "整改", "复查", "快点", "soon"],
 }
+
+# 组合升级规则：泄漏类 HIGH 词 + 扩散/恶化迹象词 → CRITICAL
+# （"液氯钢瓶泄漏正在扩散"这类真实紧急场景单靠词表会漏判；须先于词表判定）
+_URGENCY_COMBOS = (
+    (("泄漏", "刺漏", "渗漏", "喷料"), ("扩散", "喷", "涌", "蔓延", "止不住", "越漏越大", "正在扩大")),
+    (("冒烟",), ("越来越", "浓烟", "大量")),
+)
 
 # 常见危化品词表（实体抽取用，命中即记 chemical 实体）
 _CHEMICAL_VOCAB = [
@@ -265,8 +272,8 @@ class IntentRecognizer:
         self.cache_hits   = 0
         self.cache_misses = 0
         # 本地判别式前置（可选；默认关闭零侵入）：
-        #   SAFETYMIND_BGE=1  → BGE 原型分类器（SOTA: test 92.6%），优先
-        #   SAFETYMIND_LAYA=1 → Laya 判别式路由（test 55.2%），BGE 未启用时的备选
+        #   SAFETYMIND_BGE=1  → BGE 原型分类器（SOTA: test 96.4%），优先
+        #   SAFETYMIND_LAYA=1 → Laya 判别式路由（test 55.6%），BGE 未启用时的备选
         self._bge = None
         self._laya = None
         try:
@@ -574,6 +581,9 @@ class IntentRecognizer:
 
     def _urgency(self, message: str, intent: IntentCategory) -> UrgencyLevel:
         msg = message.lower()
+        for words, signs in _URGENCY_COMBOS:
+            if any(w in msg for w in words) and any(s in msg for s in signs):
+                return UrgencyLevel.CRITICAL
         for level, kws in _URGENCY_KEYWORDS.items():
             if any(kw in msg for kw in kws):
                 return level

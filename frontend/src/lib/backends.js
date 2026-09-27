@@ -35,6 +35,43 @@ export async function requestHealth(type, settings) {
   return requestJson(backendMeta(type, settings).baseUrl, '/health')
 }
 
+export async function requestConfig(type, settings) {
+  return requestJson(backendMeta(type, settings).baseUrl, '/config')
+}
+
+export async function requestConversations(type, settings, userId) {
+  const params = new URLSearchParams({ user_id: userId || 'anonymous' })
+  return requestJson(backendMeta(type, settings).baseUrl, `/conversations?${params}`)
+}
+
+export async function requestConversationMessages(type, settings, userId, convId) {
+  const params = new URLSearchParams({ user_id: userId || 'anonymous' })
+  return requestJson(backendMeta(type, settings).baseUrl, `/conversations/${encodeURIComponent(convId)}/messages?${params}`)
+}
+
+export async function deleteConversation(type, settings, userId, convId) {
+  const params = new URLSearchParams({ user_id: userId || 'anonymous' })
+  return requestJson(backendMeta(type, settings).baseUrl, `/conversations/${encodeURIComponent(convId)}?${params}`, { method: 'DELETE' })
+}
+
+export async function requestBootstrapAdmin(type, settings) {
+  return requestJson(backendMeta(type, settings).baseUrl, '/config/admin/bootstrap', { method: 'POST' })
+}
+
+export async function requestAdminConfig(type, settings, token) {
+  return requestJson(backendMeta(type, settings).baseUrl, '/config/admin', {
+    headers: { 'X-Admin-Token': token || '' }
+  })
+}
+
+export async function saveAdminConfig(type, settings, token, values) {
+  return requestJson(backendMeta(type, settings).baseUrl, '/config/admin', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json', 'X-Admin-Token': token || '' },
+    body: JSON.stringify({ values })
+  })
+}
+
 export async function requestMonitor(type, settings) {
   return requestJson(backendMeta(type, settings).baseUrl, '/monitor')
 }
@@ -59,9 +96,15 @@ export async function runEvaluation(type, settings, body = null) {
   })
 }
 
+export async function requestLastEval(type, settings) {
+  return requestJson(backendMeta(type, settings).baseUrl, '/eval/last')
+}
+
 export async function requestSearch(type, settings, query, topK = 5) {
+  // 检索测试语义是"验证文档能否被找到"：直连向量检索（几十毫秒），
+  // 不走改写+重排的完整链路（含两次 LLM，秒级），那留给 /search 演示端点。
   const params = new URLSearchParams({ query, top_k: String(topK) })
-  return requestJson(backendMeta(type, settings).baseUrl, `/search?${params}`, { method: 'POST' })
+  return requestJson(backendMeta(type, settings).baseUrl, `/search/direct?${params}`, { method: 'POST' })
 }
 
 export async function requestChat(type, settings, message) {
@@ -126,6 +169,7 @@ function normalizeChatResponse(type, raw) {
 
 async function requestJson(baseUrl, path, options = {}) {
   const url = `${normalizeBaseUrl(baseUrl)}${path}`
+  options.headers = { ...(options.headers || {}), 'X-Access-Token': localStorage.getItem('safetymind.accessToken') || '' }
   const response = await fetch(url, options)
   const text = await response.text()
   let data = null

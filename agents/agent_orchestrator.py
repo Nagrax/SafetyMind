@@ -353,23 +353,12 @@ class AgentOrchestrator:
             req.urgency = intent_result.urgency
             req.intent_confidence = intent_result.confidence
 
-        if self._needs_clarification(req):
-            return OrchestratorResult(
-                request_id=req.request_id,
-                response="我还不能确定您要处理的是哪类安全问题。请补充一下是隐患排查、隐患上报、作业票咨询、设备报警，还是事故应急？",
-                agent_type=AgentType.GENERAL,
-                intent=req.intent,
-                escalated=False,
-                latency_ms=(time.monotonic() - t0) * 1000,
-                agent_types=[AgentType.GENERAL],
-                primary_agent=AgentType.GENERAL,
-                routing_reason="低置信度 OTHER 意图，先澄清用户需求",
-                routing_confidence=req.intent_confidence,
-            )
-
         # CRITICAL 紧急事态：模板化应急响应（零 LLM 依赖）。
         # 设计依据：紧急情况的秒级确定性响应优于生成式回答（更快、无幻觉、
         # 端点故障时安全关键路径在线）；SAFETYMIND_CRITICAL_TEMPLATE=0 可关闭。
+        # 注意：必须先于澄清追问——紧急度独立于意图置信度（如"被困""救命"是
+        # CRITICAL 关键词但不在意图 pattern 词表，LLM 死时意图=OTHER 低置信），
+        # 紧急消息绝不能被澄清追问拦截。
         if (os.getenv("SAFETYMIND_CRITICAL_TEMPLATE", "1") == "1"
                 and req.urgency == UrgencyLevel.CRITICAL):
             template = self.CRITICAL_TEMPLATES.get(req.intent, self.CRITICAL_GENERIC)
@@ -385,6 +374,20 @@ class AgentOrchestrator:
                 primary_agent=AgentType.ESCALATION,
                 routing_reason="CRITICAL 紧急事态，模板化应急响应（零 LLM 依赖）",
                 routing_confidence=1.0,
+            )
+
+        if self._needs_clarification(req):
+            return OrchestratorResult(
+                request_id=req.request_id,
+                response="我还不能确定您要处理的是哪类安全问题。请补充一下是隐患排查、隐患上报、作业票咨询、设备报警，还是事故应急？",
+                agent_type=AgentType.GENERAL,
+                intent=req.intent,
+                escalated=False,
+                latency_ms=(time.monotonic() - t0) * 1000,
+                agent_types=[AgentType.GENERAL],
+                primary_agent=AgentType.GENERAL,
+                routing_reason="低置信度 OTHER 意图，先澄清用户需求",
+                routing_confidence=req.intent_confidence,
             )
 
         # 复杂问题自动并行协作，例如同一句同时涉及设备报警和作业票办理。

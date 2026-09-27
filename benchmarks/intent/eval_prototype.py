@@ -1,5 +1,5 @@
-# 语义原型分类器评测（冠军配置）：bge 双模型集成 + 244 条原型示例库
-# 用法: python eval_prototype.py [--split test|test2|dev] [--device cpu|cuda]
+# 语义原型分类器评测（冠军配置）：bge 双模型集成 + 213 条原型示例库
+# 用法: python eval_prototype.py [--split test|test2|dev] [--device cpu|cuda] [--no-large]
 # 依赖: pip install torch transformers；模型 BAAI/bge-base-zh-v1.5, BAAI/bge-large-zh-v1.5
 import os, sys, json, time, argparse
 from collections import defaultdict

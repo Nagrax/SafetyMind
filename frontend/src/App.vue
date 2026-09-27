@@ -1,206 +1,128 @@
 <template>
-  <main :class="['app-shell', `app-shell-${activeView}`]">
-    <header class="topbar">
-      <a class="brand" href="#" aria-label="SafetyMind 首页" @click.prevent="activeView = 'chat'">
-        <span class="brand-mark">S</span>
-        <span class="brand-name">SafetyMind</span>
-      </a>
-
-      <nav class="view-nav" aria-label="工作区">
-        <button :class="{ active: activeView === 'chat' }" @click="activeView = 'chat'">对话</button>
-        <button :class="{ active: activeView === 'knowledge' }" @click="activeView = 'knowledge'">知识库</button>
-        <button :class="{ active: activeView === 'evaluation' }" @click="activeView = 'evaluation'">评测</button>
-      </nav>
-
-      <div class="topbar-tools">
-        <span class="environment-pill" :title="healthOk ? '后端健康检查通过' : '后端不可达，请确认服务已启动'">
-          <i :class="healthOk ? 'online' : 'offline'"></i>
-          {{ healthOk ? 'API 在线' : 'API 离线' }}
-        </span>
-        <button class="docs-link" title="在浏览器中打开 Swagger 接口文档" @click="openDocs">API 文档</button>
-        <span class="user-pill" :title="'当前用户 ID（在连接配置中修改）：' + (settings.userId || 'anonymous')">
-          {{ settings.userId || 'anonymous' }}
-        </span>
-      </div>
-    </header>
-
-    <div v-if="toast" class="toast" role="status">{{ toast }}</div>
-
-    <section v-if="activeView === 'chat'" class="page page-chat">
-      <div class="page-heading">
-        <div class="heading-copy">
-          <span class="kicker">Safety console</span>
-          <h1>和安全生产 Agent 对话</h1>
-          <p>上报一条安全事件或作业请求，查看它如何识别风险意图、路由处置 Agent 并生成处置建议。</p>
+  <!--
+    移动优先的用户端结构（2026-09-26 重构）：
+    - 用户默认只见一个全屏对话页（header + 消息流 + 快捷场景 + 输入栏 + 转人工按钮）
+    - 文档入库收进"文档库"第二页；开发者信息（trace/监控/评测/Skills）整体移入
+      开发者面板（?dev=1 或菜单开启），用户端默认不可见
+    - 升级/紧急消息在对话流内给操作卡：直拨值班电话（tel:）+ 复制上报编号
+    - 桌面端同一套代码：对话区限宽居中，开发者面板变为右侧栏
+  -->
+  <main :class="['m-app', devMode ? 'dev-on' : '', isDesktopChat ? 'chat-desktop' : '', historyOpen ? 'hist-open' : 'hist-closed']">
+    <!-- ══════════ 对话页（用户主页） ══════════ -->
+    <template v-if="activeView === 'chat'">
+      <header class="m-header">
+        <div class="m-brand"><span class="m-logo">S</span><span>SafetyMind</span></div>
+        <div class="m-header-right">
+          <span class="m-status" :class="healthOk ? 'ok' : 'bad'" :title="healthOk ? '服务正常' : '服务不可达'"></span>
+          <button :class="['m-icon-btn', historyOpen ? 'active' : '']" aria-label="历史会话" title="历史会话 开/关" @click="historyOpen = !historyOpen">☰</button>
+          <button class="m-icon-btn" aria-label="设置" title="设置" @click="openSettings">⚙</button>
+          <button class="m-icon-btn" aria-label="开始新对话" title="新对话" @click="newConversation">✎</button>
+          <button class="m-lib-btn" aria-label="打开文档库" @click="activeView = 'library'">
+            <span>📚</span><span>文档库</span>
+          </button>
         </div>
-        <div class="heading-actions">
-          <span class="session-label">{{ settings.conversationId || '新会话' }}</span>
-          <button class="quiet-button" @click="clearConversation">清空</button>
+      </header>
+
+      <div class="m-messages" ref="messageList">
+        <div v-if="messages.length === 0" class="m-empty">
+          <div class="m-empty-icon">⛑</div>
+          <h2>你好，我是安全助手</h2>
+          <p>隐患、报警、作业票、法规，直接问；紧急情况秒回应急步骤。</p>
+          <div class="m-suggest">
+            <button v-for="p in STARTERS" :key="p.label" @click="usePrompt(p.text)">{{ p.label }}</button>
+          </div>
         </div>
+
+        <article v-for="item in messages" :key="item.id" :class="['m-msg', item.role, { critical: item.critical }]">
+          <div class="m-msg-body">
+            <p v-for="(line, i) in item.content.split('\n')" :key="i">{{ line }}</p>
+          </div>
+          <div v-if="item.role === 'assistant' && item.escalated" class="m-msg-actions">
+            <a v-if="config.escalationPhone" class="m-action primary" :href="`tel:${config.escalationPhone}`">📞 拨打安全值班</a>
+            <button v-if="item.requestId" class="m-action" @click="copyText(item.requestId, '上报编号已复制')">复制上报编号 {{ item.requestId }}</button>
+            <span v-else class="m-action muted-note">升级已留痕</span>
+          </div>
+        </article>
+
+        <div v-if="busy" class="m-msg assistant typing"><div class="m-msg-body"><span></span><span></span><span></span></div></div>
       </div>
 
-      <div class="chat-layout">
-        <section class="chat-stage">
-          <div class="stage-bar">
-            <div class="stage-context">
-              <span class="context-dot"></span>
-              <span>{{ currentBackend.baseUrl }}</span>
-            </div>
-            <span>{{ messages.length }} 条消息</span>
-          </div>
+      <div v-if="messages.length" class="m-quick">
+        <button v-for="p in STARTERS" :key="'q' + p.label" @click="usePrompt(p.text)">{{ p.emoji }} {{ p.label }}</button>
+      </div>
 
-          <div class="messages" ref="messageList">
-            <article v-for="item in messages" :key="item.id" :class="['message', item.role]">
-              <div class="message-meta">
-                <span>{{ item.role === 'user' ? '你' : 'SafetyMind 安全 Agent' }}</span>
-                <small v-if="item.meta">{{ item.meta }}</small>
-              </div>
-              <p>{{ item.content }}</p>
-            </article>
+      <footer class="m-composer">
+        <button class="m-call" aria-label="转人工" @click="escalationOpen = true">
+          <span class="m-call-icon">☎</span><span class="m-call-text">转人工</span>
+        </button>
+        <textarea
+          v-model="draft"
+          rows="1"
+          placeholder="描述你的安全问题…"
+          maxlength="2000"
+          @input="autoGrow"
+          @keydown.enter.exact.prevent="onEnter"
+        ></textarea>
+        <button class="m-send" :disabled="busy || !draft.trim()" @click="sendMessage" aria-label="发送">➤</button>
+      </footer>
 
-            <div v-if="messages.length === 0" class="empty-state">
-              <div class="empty-symbol">✦</div>
-              <h2>从一个安全事件开始</h2>
-              <p>下面的快捷场景只是起点，你也可以直接输入自己的测试用例。</p>
-              <div class="starter-prompts">
-                <button @click="usePrompt('压力容器压力异常升高，请给出应急处置建议')">设备报警</button>
-                <button @click="usePrompt('现场发现有人未佩戴安全帽进入作业区，如何处理')">隐患上报</button>
-                <button @click="usePrompt('动火作业需要办理什么票证？')">作业票咨询</button>
-              </div>
-            </div>
-          </div>
+      <!-- ══════════ 知识库右栏（桌面 ≥1200px 常驻，参考 IDE 多栏面板） ══════════ -->
+      <aside class="kb-rail">
+        <div class="kb-head">
+          <h3>知识库</h3>
+          <span class="kb-count">{{ knowledgeCount }} 条</span>
+        </div>
+        <div class="kb-search">
+          <input v-model="searchQuery" placeholder="检索规程 / 制度…" @keydown.enter="searchKnowledge" />
+          <button @click="searchKnowledge" :disabled="busy">检索</button>
+        </div>
+        <div class="kb-results">
+          <article v-for="(item, index) in searchResults" :key="item.id || item.title || index" class="kb-result">
+            <strong>{{ item.title || '未命名文档' }}</strong>
+            <p>{{ item.content }}</p>
+          </article>
+          <div v-if="!searchResults.length" class="kb-tip">输入关键词即可检索安全规程，例如"受限空间"、"动火"。</div>
+        </div>
+        <button class="kb-goto" @click="activeView = 'library'">📚 打开文档库添加文档</button>
+      </aside>
+    </template>
 
-          <form class="composer" @submit.prevent="sendMessage">
-            <textarea
-              v-model="draft"
-              rows="3"
-              placeholder="输入消息..."
-              @keydown.meta.enter.prevent="sendMessage"
-              @keydown.ctrl.enter.prevent="sendMessage"
-            ></textarea>
-            <div class="composer-bottom">
-              <span>⌘ / Ctrl + Enter 发送</span>
-              <button type="submit" :disabled="busy || !draft.trim()">{{ busy ? '处理中' : '发送' }}</button>
+    <!-- ══════════ 文档库页 ══════════ -->
+    <template v-else-if="activeView === 'library'">
+      <header class="m-header">
+        <button class="m-icon-btn back" aria-label="返回对话" @click="activeView = 'chat'">
+          <svg width="16" height="16" viewBox="0 0 16 16" fill="none" aria-hidden="true">
+            <path d="M10 3L5 8l5 5" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"/>
+          </svg>
+        </button>
+        <div class="m-brand"><span class="m-logo">S</span><span>文档库</span></div>
+        <span class="m-chunks">{{ knowledgeCount }} 条知识</span>
+      </header>
+
+      <div class="m-page">
+        <section class="m-card">
+          <div class="m-card-head"><h3>加入文档</h3><span>入库后助手即可检索</span></div>
+          <label class="m-upload">
+            <input type="file" accept=".txt,.md,.json" @change="handleUpload" />
+            <div class="m-upload-box">
+              <div class="m-upload-icon">📄</div>
+              <strong>点击选择文件</strong>
+              <small>支持 .txt / .md / .json，单文件 ≤10MB</small>
             </div>
-          </form>
+          </label>
+          <details class="m-manual">
+            <summary>手动粘贴一段规程 / 制度</summary>
+            <label><span>标题</span><input v-model="docTitle" placeholder="如：动火作业管理规定" /></label>
+            <label><span>内容</span><textarea v-model="docContent" rows="5" placeholder="粘贴文本内容"></textarea></label>
+            <button class="m-btn" :disabled="busy || !docTitle.trim() || !docContent.trim()" @click="submitKnowledge">添加到知识库</button>
+          </details>
         </section>
 
-        <aside class="chat-sidebar" ref="sidebarRef">
-          <div class="chat-sidebar-scroll">
-            <section class="side-card session-card">
-              <div class="card-heading">
-                <div>
-                  <span class="kicker">Session</span>
-                  <h2>会话信息</h2>
-                </div>
-                <span class="status-copy muted">{{ settings.conversationId ? '已启用' : '新会话' }}</span>
-              </div>
-              <div class="session-grid">
-                <div>
-                  <span>会话 ID</span>
-                  <strong>{{ settings.conversationId || '自动生成' }}</strong>
-                </div>
-                <div>
-                  <span>用户 ID</span>
-                  <strong>{{ settings.userId || 'anonymous' }}</strong>
-                </div>
-              </div>
-            </section>
-
-            <section class="side-card connection-card">
-              <div class="card-heading">
-                <div>
-                  <span class="kicker">Connection</span>
-                  <h2>连接配置</h2>
-                </div>
-                <span class="status-copy" :class="healthOk ? 'success' : 'muted'">{{ healthLabel }}</span>
-              </div>
-
-              <div class="connection-endpoint">
-                <span>接口地址</span>
-                <code>{{ currentBackend.baseUrl }}</code>
-              </div>
-
-              <label>
-                <span>用户 ID</span>
-                <input v-model="settings.userId" @change="persist" placeholder="u1001" />
-              </label>
-              <label>
-                <span>会话 ID</span>
-                <input v-model="settings.conversationId" @change="persist" placeholder="自动生成" />
-              </label>
-              <div class="side-actions">
-                <button @click="checkHealth">检查连接</button>
-                <button class="quiet-button" @click="refreshConsole">刷新</button>
-              </div>
-            </section>
-
-            <section class="side-card trace-card">
-              <div class="card-heading">
-                <div>
-                  <span class="kicker">Last trace</span>
-                  <h2>最近一次请求</h2>
-                </div>
-                <span class="trace-status" :class="lastResponse ? 'has-data' : ''"></span>
-              </div>
-
-              <div v-if="lastResponse" class="trace-body">
-                <div class="latency">
-                  <span>处置耗时</span>
-                  <strong>{{ lastResponse.latencyMs || '-' }}<small> ms</small></strong>
-                </div>
-                <dl class="detail-list">
-                  <div><dt>主 Agent</dt><dd>{{ lastResponse.primaryAgent || lastResponse.agentType || '-' }}</dd></div>
-                  <div><dt>意图</dt><dd>{{ lastResponse.intent || '-' }}</dd></div>
-                  <div><dt>置信度</dt><dd>{{ formatPercent(lastResponse.routingConfidence) }}</dd></div>
-                  <div><dt>知识库</dt><dd :class="lastResponse.knowledgeUsed ? 'success' : 'muted'">{{ lastResponse.knowledgeUsed ? '已使用' : '未使用' }}</dd></div>
-                  <div><dt>升级处置</dt><dd :class="lastResponse.escalated ? 'danger' : 'muted'">{{ lastResponse.escalated ? '是' : '否' }}</dd></div>
-                </dl>
-                <p v-if="lastResponse.routingReason" class="routing-reason">{{ lastResponse.routingReason }}</p>
-              </div>
-              <p v-else class="side-empty">发送消息后，这里会显示安全 Agent 路由、风险意图和耗时。</p>
-            </section>
-
-            <section class="side-card monitor-card">
-              <div class="card-heading">
-                <div>
-                  <span class="kicker">Runtime</span>
-                  <h2>运行状态</h2>
-                </div>
-                <button class="link-button" @click="loadMonitor">刷新</button>
-              </div>
-              <div class="mini-stats">
-                <div><strong>{{ totalRequests }}</strong><span>请求</span></div>
-                <div><strong>{{ agentCount }}</strong><span>Agent</span></div>
-                <div><strong>{{ activeAlerts.length }}</strong><span>告警</span></div>
-              </div>
-              <div v-if="activeAlerts.length" class="alert-note">{{ activeAlerts[0].detail || activeAlerts[0].title }}</div>
-              <p v-else class="healthy-note">当前没有活跃告警。</p>
-            </section>
-          </div>
-        </aside>
-      </div>
-    </section>
-
-    <section v-else-if="activeView === 'knowledge'" class="page page-knowledge">
-      <div class="page-heading">
-        <div class="heading-copy">
-          <span class="kicker">Safety knowledge</span>
-          <h1>安全知识库</h1>
-          <p>搜索、补充和维护安全生产 Agent 使用的安全规程、SOP 与应急处置知识。</p>
-        </div>
-        <div class="count-display"><strong>{{ knowledgeCount }}</strong><span>chunks</span></div>
-      </div>
-
-      <div class="knowledge-layout">
-        <section class="workspace-card search-workspace">
-          <div class="card-heading">
-            <div><span class="kicker">Retrieval</span><h2>检索知识</h2></div>
-            <code>POST /search</code>
-          </div>
-          <div class="search-line">
-            <input v-model="searchQuery" placeholder="例如：受限空间作业注意事项" @keydown.enter="searchKnowledge" />
-            <button @click="searchKnowledge" :disabled="busy || !searchQuery.trim()">搜索</button>
+        <section class="m-card">
+          <div class="m-card-head"><h3>检索测试</h3><span>验证文档能否被找到</span></div>
+          <div class="m-search-line">
+            <input v-model="searchQuery" placeholder="如：受限空间作业注意事项" @keydown.enter="searchKnowledge" />
+            <button class="m-btn" :disabled="busy || !searchQuery.trim()" @click="searchKnowledge">搜</button>
           </div>
           <div v-if="searchResults.length" class="result-list">
             <article v-for="(item, index) in searchResults" :key="item.id || item.title || index" class="result-item">
@@ -211,83 +133,183 @@
               </div>
             </article>
           </div>
-          <div v-else class="workspace-empty">输入安全咨询问题开始搜索。</div>
         </section>
 
-        <section class="workspace-card import-workspace">
-          <div class="card-heading">
-            <div><span class="kicker">Ingestion</span><h2>添加知识</h2></div>
-            <code>ChromaDB</code>
-          </div>
-          <label><span>标题</span><input v-model="docTitle" placeholder="安全操作规程补充" /></label>
-          <label><span>内容</span><textarea v-model="docContent" rows="7" placeholder="输入安全规程、应急预案或作业票要求"></textarea></label>
-          <div class="side-actions">
-            <button @click="submitKnowledge" :disabled="busy || !docTitle.trim() || !docContent.trim()">添加文档</button>
-            <label class="upload-button">上传文件<input type="file" accept=".txt,.md,.json" @change="handleUpload" /></label>
-          </div>
-        </section>
-      </div>
-
-      <section class="workspace-card skills-workspace">
-        <div class="card-heading">
-          <div><span class="kicker">Loaded skills</span><h2>已加载能力</h2></div>
-          <button class="link-button" @click="reloadSkillSet">重新加载</button>
-        </div>
-        <div class="skill-table">
-          <div v-for="skill in skillsData.skills" :key="skill.name" class="skill-item">
-            <span class="skill-dot"></span><strong>{{ skill.name }}</strong><span>{{ skill.description || '业务规范能力' }}</span><small>{{ skill.content_chars || 0 }} chars</small>
-          </div>
-          <div v-if="!skillsData.skills.length" class="workspace-empty">暂无已加载 Skill。</div>
-        </div>
-      </section>
-    </section>
-
-    <section v-else class="page page-evaluation">
-      <div class="page-heading">
-        <div class="heading-copy">
-          <span class="kicker">Evaluation lab</span>
-          <h1>评测安全 Agent</h1>
-          <p>运行内置评测，查看风险意图识别、处置质量和回归结果。</p>
-        </div>
-        <button @click="runEvaluation" :disabled="busy">{{ busy ? '运行中...' : '运行评测' }}</button>
-      </div>
-
-      <div v-if="evalData" class="evaluation-content">
-        <div class="evaluation-summary">
-          <div class="score-hero"><span>通过率</span><strong>{{ formatPercent(evalData.pass_rate) }}</strong><small>{{ evalData.passed }} / {{ evalData.total }} 用例通过</small></div>
-          <div><span>通过</span><strong>{{ evalData.passed }}</strong></div>
-          <div><span>总数</span><strong>{{ evalData.total }}</strong></div>
-          <div><span>回归</span><strong :class="evalData.regressions?.length ? 'danger' : 'success'">{{ evalData.regressions?.length || 0 }}</strong></div>
-        </div>
-        <div class="evaluation-layout">
-          <section class="workspace-card">
-            <div class="card-heading"><div><span class="kicker">Scores</span><h2>平均评分</h2></div></div>
-            <div class="score-list">
-              <div v-for="(value, key) in evalData.avg_scores" :key="key"><span>{{ key }}</span><i><b :style="{ width: `${Math.min(Number(value) * 10, 100)}%` }"></b></i><strong>{{ Number(value).toFixed(2) }}</strong></div>
+        <section v-if="devMode" class="m-card">
+          <div class="m-card-head"><h3>已加载能力</h3><button class="link-button" @click="reloadSkillSet">重新加载</button></div>
+          <div class="skill-table">
+            <div v-for="skill in skillsData.skills" :key="skill.name" class="skill-item">
+              <span class="skill-dot"></span><strong>{{ skill.name }}</strong><small>{{ skill.content_chars || 0 }} chars</small>
             </div>
-          </section>
-          <section class="workspace-card">
-            <div class="card-heading"><div><span class="kicker">Recommendations</span><h2>优化建议</h2></div></div>
-            <div v-if="evalData.recommendations?.length" class="recommendations"><p v-for="(item, index) in evalData.recommendations" :key="index">{{ item }}</p></div>
-            <div v-else class="workspace-empty">本次评测没有返回额外建议。</div>
-          </section>
-        </div>
+            <div v-if="!skillsData.skills.length" class="workspace-empty">暂无已加载 Skill。</div>
+          </div>
+        </section>
       </div>
-      <div v-else class="evaluation-empty"><div class="empty-symbol">◎</div><h2>还没有评测结果</h2><p>点击右上角运行一次评测。</p></div>
-    </section>
+    </template>
+
+    <!-- ══════════ 设置（管理令牌 + .env 白名单配置）══════════ -->
+    <div v-if="settingsOpen" class="sheet-mask" @click.self="settingsOpen = false">
+      <div class="sheet cfg-sheet">
+        <h3>系统设置</h3>
+        <p class="cfg-intro">这里修改 LLM 密钥、值班电话等系统配置。<b>本机自用无需密码</b>；只有把系统部署到服务器给多人用时，才需要设置管理密码保护这些配置。</p>
+        <div v-if="generatedToken" class="cfg-generated">
+          <b>你的管理密码（仅显示这一次，请抄录保存）：</b>
+          <code>{{ generatedToken }}</code>
+          <button @click="copyText(generatedToken, '已复制')">复制</button>
+          <button @click="confirmGenerated">我已保存，进入配置</button>
+        </div>
+        <label class="cfg-row">
+          <span>访问令牌<small>管理员发给你的口令；本机自用留空即可</small></span>
+          <input v-model="accessToken" placeholder="无令牌则留空" @change="persist" />
+        </label>
+        <div v-if="!adminCfg.length" class="cfg-first">
+          <button @click="loadAdminConfig">我已有管理密码，点击输入</button>
+          <button @click="bootstrapAdmin">首次使用：一键生成管理密码</button>
+        </div>
+        <label v-else class="cfg-token">
+          <span>管理密码</span>
+          <input v-model="adminToken" :type="showPw ? 'text' : 'password'" placeholder="输入管理密码" @change="persist" />
+          <button class="pw-eye" @click="showPw = !showPw" aria-label="显示或隐藏密码">{{ showPw ? '🙈' : '👁' }}</button>
+          <button @click="loadAdminConfig">重新加载</button>
+          <button class="pw-logout" @click="forgetAdmin">退出管理</button>
+        </label>
+        <div v-if="adminCfg.length" class="cfg-list">
+          <label v-for="c in adminCfg" :key="c.key" class="cfg-row">
+            <span>{{ c.label }}<small>{{ c.key }}<template v-if="c.restart"> · 重启生效</template></small></span>
+            <select v-if="c.enum" v-model="cfgDraft[c.key]">
+              <option v-for="opt in c.enum" :key="opt" :value="opt">{{ opt }}</option>
+            </select>
+            <input v-else :type="c.secret ? 'password' : 'text'" v-model="cfgDraft[c.key]"
+                   :placeholder="c.configured ? '已配置（留空保持不变）' : '未配置'" autocomplete="off" />
+          </label>
+        </div>
+        <button v-if="adminCfg.length" class="m-btn" :disabled="busy" @click="saveAdminConfig">保存配置</button>
+        <p class="sheet-note">密钥只显示掩码；LLM 相关配置保存后需重启生效。手机版窗口关闭后请重新打开。</p>
+        <button class="quiet" @click="settingsOpen = false">关闭</button>
+      </div>
+    </div>
+
+    <!-- ══════════ 转人工 ══════════ -->
+    <div v-if="escalationOpen" class="sheet-mask" @click.self="escalationOpen = false">
+      <div class="sheet escalation">
+        <h3>转人工</h3>
+        <a v-if="config.escalationPhone" class="sheet-call" :href="`tel:${config.escalationPhone}`">
+          <strong>拨打安全值班电话</strong><span>{{ config.escalationPhone }}</span>
+        </a>
+        <button @click="escalateInChat">在对话中要求人工处理</button>
+        <p class="sheet-note">紧急情况（着火 / 泄漏 / 人员被困）请直接拨打电话，同时按助手给出的应急步骤行动。</p>
+        <button class="quiet" @click="escalationOpen = false">取消</button>
+      </div>
+    </div>
+
+    <!-- ══════════ 历史会话（手机：抽屉；桌面 ≥980px：常驻左栏） ══════════ -->
+    <aside :class="['hist-panel', historyOpen ? 'open' : '']">
+      <div class="hist-head">
+        <h3>历史会话</h3>
+        <button class="m-icon-btn hist-close" aria-label="关闭历史列表" @click="historyOpen = false">✕</button>
+      </div>
+      <div class="hist-list">
+        <div v-for="c in conversations" :key="c.conv_id" :class="['hist-item', c.conv_id === settings.conversationId ? 'active' : '']" role="button" tabindex="0" @click="openConversation(c)" @keydown.enter="openConversation(c)">
+          <strong>{{ c.title }}</strong>
+          <small>{{ formatHistTime(c.updated_at) }} · {{ c.message_count }} 条</small>
+          <button class="hist-del" aria-label="删除会话" @click.stop="removeConversation(c)">✕</button>
+        </div>
+        <div v-if="!conversations.length" class="hist-empty">还没有历史会话</div>
+      </div>
+    </aside>
+    <div v-if="historyOpen" class="hist-mask" @click="historyOpen = false"></div>
+
+    <!-- ══════════ 开发者面板（dev 模式） ══════════ -->
+    <aside v-if="devMode" class="dev-panel" ref="sidebarRef">
+      <div class="dev-panel-head">
+        <h2>开发者面板</h2>
+        <button class="m-icon-btn" @click="devMode = false">✕</button>
+      </div>
+      <div class="dev-panel-scroll">
+        <section class="side-card trace-card">
+          <div class="card-heading">
+            <div><span class="kicker">Last trace</span><h2>最近一次请求</h2></div>
+            <span class="trace-status" :class="lastResponse ? 'has-data' : ''"></span>
+          </div>
+          <div v-if="lastResponse" class="trace-body">
+            <div class="latency"><span>处置耗时</span><strong>{{ lastResponse.latencyMs || '-' }}<small> ms</small></strong></div>
+            <dl class="detail-list">
+              <div><dt>主 Agent</dt><dd>{{ lastResponse.primaryAgent || lastResponse.agentType || '-' }}</dd></div>
+              <div><dt>意图</dt><dd>{{ lastResponse.intent || '-' }}</dd></div>
+              <div><dt>置信度</dt><dd>{{ formatPercent(lastResponse.routingConfidence) }}</dd></div>
+              <div><dt>知识库</dt><dd :class="lastResponse.knowledgeUsed ? 'success' : 'muted'">{{ lastResponse.knowledgeUsed ? '已使用' : '未使用' }}</dd></div>
+              <div><dt>升级处置</dt><dd :class="lastResponse.escalated ? 'danger' : 'muted'">{{ lastResponse.escalated ? '是' : '否' }}</dd></div>
+            </dl>
+            <p v-if="lastResponse.routingReason" class="routing-reason">{{ lastResponse.routingReason }}</p>
+          </div>
+          <p v-else class="side-empty">发送消息后，这里会显示安全 Agent 路由、风险意图和耗时。</p>
+        </section>
+
+        <section class="side-card connection-card">
+          <div class="card-heading">
+            <div><span class="kicker">Connection</span><h2>连接配置</h2></div>
+            <span class="status-copy" :class="healthOk ? 'success' : 'muted'">{{ healthLabel }}</span>
+          </div>
+          <div class="connection-endpoint"><span>接口地址</span><code>{{ currentBackend.baseUrl }}</code></div>
+          <label><span>用户 ID</span><input v-model="settings.userId" @change="persist" placeholder="u1001" /></label>
+          <label><span>会话 ID</span><input v-model="settings.conversationId" @change="persist" placeholder="自动生成" /></label>
+          <div class="side-actions">
+            <button @click="checkHealth">检查连接</button>
+            <button class="quiet-button" @click="refreshConsole">刷新</button>
+            <button class="quiet-button" @click="openDocs">API 文档</button>
+          </div>
+        </section>
+
+        <section class="side-card monitor-card">
+          <div class="card-heading">
+            <div><span class="kicker">Runtime</span><h2>运行状态</h2></div>
+            <button class="link-button" @click="loadMonitor">刷新</button>
+          </div>
+          <div class="mini-stats">
+            <div><strong>{{ totalRequests }}</strong><span>请求</span></div>
+            <div><strong>{{ agentCount }}</strong><span>Agent</span></div>
+            <div><strong>{{ activeAlerts.length }}</strong><span>告警</span></div>
+          </div>
+          <div v-if="activeAlerts.length" class="alert-note">{{ activeAlerts[0].detail || activeAlerts[0].title }}</div>
+          <p v-else class="healthy-note">当前没有活跃告警。</p>
+        </section>
+
+        <section class="side-card eval-card">
+          <div class="card-heading">
+            <div><span class="kicker">Evaluation</span><h2>评测</h2></div>
+            <button @click="runEvaluation" :disabled="busy">{{ busy ? '运行中...' : '运行评测' }}</button>
+          </div>
+          <div v-if="evalData" class="evaluation-summary">
+            <div class="score-hero"><span>通过率</span><strong>{{ formatPercent(evalData.pass_rate) }}</strong><small>{{ evalData.passed }} / {{ evalData.total }}</small></div>
+            <div><span>回归</span><strong :class="evalData.regressions?.length ? 'danger' : 'success'">{{ evalData.regressions?.length || 0 }}</strong></div>
+          </div>
+          <p v-else class="side-empty">尚未运行评测。</p>
+        </section>
+      </div>
+    </aside>
+
+    <div v-if="toast" class="toast" role="status">{{ toast }}</div>
   </main>
 </template>
 
 <script setup>
-import { computed, nextTick, onBeforeUnmount, onMounted, reactive, ref, watch } from 'vue'
+import { computed, nextTick, onMounted, reactive, ref, watch } from 'vue'
 import {
   addKnowledge,
   backendMeta,
   createInitialSettings,
+  deleteConversation as requestDeleteConversation,
   reloadSkills,
   requestChat,
+  requestConfig,
+  requestConversationMessages,
+  requestAdminConfig,
+  requestBootstrapAdmin,
+  requestConversations,
   requestHealth,
+  saveAdminConfig as requestSaveAdmin,
   requestKnowledgeStats,
+  requestLastEval,
   requestMonitor,
   requestSearch,
   requestSkills,
@@ -297,77 +319,163 @@ import {
 } from './lib/backends'
 
 const settings = reactive(createInitialSettings())
-// 支持 ?view=chat|knowledge|evaluation 深链接（书签/截图/外链直达指定页）
-const VIEWS = ['chat', 'knowledge', 'evaluation']
-const initialView = new URLSearchParams(window.location.search).get('view')
-const activeView = ref(VIEWS.includes(initialView) ? initialView : 'chat')
+const STARTERS = [
+  { emoji: '🔥', label: '应急处置', text: '车间着火了，怎么应急处置？' },
+  { emoji: '⚠️', label: '隐患上报', text: '现场发现配电箱门未关闭且周围有积水，怎么上报这个隐患？' },
+  { emoji: '🎫', label: '作业票', text: '明天要动火焊接，动火作业票怎么办、谁来审批？' },
+  { emoji: '📖', label: '查法规', text: '受限空间作业的气体检测有什么标准要求？' },
+]
+
+const activeView = ref('chat')
+const devMode = ref(new URLSearchParams(window.location.search).get('dev') === '1'
+  || localStorage.getItem('safetymind.dev') === '1')
+const escalationOpen = ref(false)
+// 桌面端默认展开历史列；手机端默认收起（抽屉）
+const historyOpen = ref(window.innerWidth >= 980)
+const settingsOpen = ref(false)
+const showPw = ref(false)
+const generatedToken = ref('')
+const adminCfg = ref([])
+const cfgDraft = reactive({})
+
+function openSettings() {
+  historyOpen.value = false
+  settingsOpen.value = true
+  loadAdminConfig()
+}
+
+async function loadAdminConfig() {
+  try {
+    const data = await requestAdminConfig(settings.backend, settings, adminToken.value)
+    adminCfg.value = data.config || []
+    for (const c of adminCfg.value) cfgDraft[c.key] = c.secret ? '' : c.value
+    if (!adminToken.value) localStorage.setItem('safetymind.adminToken', adminToken.value)
+  } catch (e) {
+    adminCfg.value = []
+    if (e.message.includes('403')) showToast('尚未设置管理密码：点击下方一键生成')
+    else if (e.message.includes('401')) showToast('管理密码无效，请重新输入')
+    else showToast('配置加载失败')
+  }
+}
+
+async function bootstrapAdmin() {
+  busy.value = true
+  try {
+    const r = await requestBootstrapAdmin(settings.backend, settings)
+    generatedToken.value = r.admin_token
+    adminToken.value = r.admin_token
+    localStorage.setItem('safetymind.adminToken', adminToken.value)
+    showToast('管理密码已生成，请在下方抄录保存')
+  } catch (e) {
+    showToast(e.message.includes('409') ? '已配置过管理密码，请直接输入' : '生成失败')
+  }
+  finally { busy.value = false }
+}
+
+async function saveAdminConfig() {
+  const values = {}
+  for (const c of adminCfg.value) {
+    const v = (cfgDraft[c.key] ?? '').trim()
+    if (c.secret && v === '') continue        // 密钥留空 = 保持原值
+    values[c.key] = v
+  }
+  if (!Object.keys(values).length) { showToast('没有需要保存的修改'); return }
+  busy.value = true
+  try {
+    const r = await requestSaveAdmin(settings.backend, settings, adminToken.value, values)
+    showToast(r.hint || '已保存')
+    localStorage.setItem('safetymind.adminToken', adminToken.value)
+    await loadAdminConfig()
+  } catch (e) { showToast('保存失败: ' + e.message.slice(0, 60)) }
+  finally { busy.value = false }
+}
+const adminToken = ref(localStorage.getItem('safetymind.adminToken') || '')
+const accessToken = ref(localStorage.getItem('safetymind.accessToken') || '')
+const conversations = ref([])
+const config = ref({ escalationPhone: '' })
+
 const messages = ref([])
 const draft = ref('')
 const busy = ref(false)
 const healthOk = ref(false)
 const healthLabel = ref('未检查')
-const statusText = ref('')
 const knowledgeCount = ref('-')
 const searchQuery = ref('受限空间作业注意事项')
 const searchResults = ref([])
-const docTitle = ref('安全操作规程')
-const docContent = ref('进入受限空间作业前必须进行气体检测并办理受限空间作业票。')
+const docTitle = ref('')
+const docContent = ref('')
 const messageList = ref(null)
 const sidebarRef = ref(null)
 const monitorData = ref({ agent_stats: {}, tool_stats: {}, active_alerts: [], suggestions: [] })
-const skillsData = ref({ count: 0, skills: [], errors: [] })
+const skillsData = ref({ count: 0, skills: [] })
 const lastResponse = ref(null)
 const evalData = ref(null)
 const toast = ref('')
 let toastTimer
 let messageSequence = 0
-let sidebarObserver
 
+// 响应式窗口宽度：缩放窗口时桌面/手机布局实时切换
+const windowWidth = ref(window.innerWidth)
+window.addEventListener('resize', () => { windowWidth.value = window.innerWidth })
+const isDesktopChat = computed(() => activeView.value === 'chat' && windowWidth.value >= 980)
 const currentBackend = computed(() => backendMeta(settings.backend, settings))
-const docsUrl = computed(() => `${currentBackend.value.baseUrl}/docs`)
-
-function openDocs() {
-  const url = docsUrl.value
-  // 桌面端（pywebview）不处理 target=_blank，走桥接用系统浏览器打开；
-  // 普通浏览器环境直接开新标签页。
-  if (window.pywebview?.api?.open_external) {
-    window.pywebview.api.open_external(url)
-  } else {
-    window.open(url, '_blank', 'noopener')
-  }
-}
 const activeAlerts = computed(() => monitorData.value.active_alerts || [])
 const agentCount = computed(() => Object.keys(monitorData.value.agent_stats || {}).length)
 const totalRequests = computed(() => Object.values(monitorData.value.agent_stats || {}).reduce((sum, item) => sum + Number(item.total || 0), 0))
 
+watch(devMode, value => localStorage.setItem('safetymind.dev', value ? '1' : '0'))
+watch(accessToken, v => localStorage.setItem('safetymind.accessToken', v || ''))
 watch(() => settings.conversationId, persist)
-onMounted(() => {
+
+onMounted(async () => {
   refreshConsole()
-  updateSidebarHeight()
-  if (typeof ResizeObserver !== 'undefined') {
-    sidebarObserver = new ResizeObserver(updateSidebarHeight)
-    if (sidebarRef.value) sidebarObserver.observe(sidebarRef.value)
+  loadConversations()
+  // 刷新后自动恢复当前会话的消息（conv_id 已持久化，消息从服务端历史拉回）
+  if (settings.conversationId) {
+    try {
+      const data = await requestConversationMessages(settings.backend, settings, settings.userId, settings.conversationId)
+      const msgs = data.messages || []
+      if (msgs.length) {
+        messages.value = msgs.map((m, i) => ({
+          id: 'restore-' + i,
+          role: m.role === 'assistant' ? 'assistant' : 'user',
+          content: m.content,
+          escalated: Boolean(m.escalated),
+          requestId: m.request_id || '',
+          critical: Boolean(m.escalated),
+        }))
+        scrollToBottom()
+      }
+    } catch { /* 历史接口失败则保持空态，不阻塞 */ }
   }
-  window.addEventListener('resize', updateSidebarHeight)
 })
 
-onBeforeUnmount(() => {
-  sidebarObserver?.disconnect?.()
-  window.removeEventListener('resize', updateSidebarHeight)
-})
+watch(() => settings.userId, loadConversations)
+// 手机端每次打开历史抽屉都刷新列表
+watch(historyOpen, open => { if (open) loadConversations() })
+// 离开对话页（如去文档库）时收起历史面板，避免残留遮挡
+watch(activeView, v => { if (v !== 'chat') historyOpen.value = false })
 
 function persist() { saveSettings(settings) }
 
-function updateSidebarHeight() {
-  const sidebar = sidebarRef.value
-  if (!sidebar) return
-  const rect = sidebar.getBoundingClientRect()
-  const height = Math.max(320, Math.floor(rect.height))
-  sidebar.style.setProperty('--sidebar-height', `${height}px`)
+async function refreshConsole() {
+  await Promise.allSettled([checkHealth(), loadStats(), loadMonitor(), loadSkills(), loadConfig(), loadLastEval()])
 }
 
-async function refreshConsole() {
-  await Promise.allSettled([checkHealth(), loadStats(), loadMonitor(), loadSkills()])
+// 评测页加载时拉取最近一次评测报告（后端持久化于 data/eval/last_report.json），
+// 页面不再空白；后端返回空态结构（available=false）时保持空态展示。
+async function loadLastEval() {
+  try {
+    const data = await requestLastEval(settings.backend, settings)
+    evalData.value = (data && data.available === false) ? null : data
+  } catch { /* 后端不可用时保持空态 */ }
+}
+
+async function loadConfig() {
+  try {
+    const data = await requestConfig(settings.backend, settings)
+    config.value = { escalationPhone: String(data.escalation_phone || '').trim() }
+  } catch { config.value = { escalationPhone: '' } }
 }
 
 async function checkHealth() {
@@ -375,11 +483,9 @@ async function checkHealth() {
     const data = await requestHealth(settings.backend, settings)
     healthOk.value = data.status === 'ok'
     healthLabel.value = data.status || 'ok'
-    statusText.value = JSON.stringify(data, null, 2)
-  } catch (error) {
+  } catch {
     healthOk.value = false
     healthLabel.value = '不可用'
-    statusText.value = error.message
   }
 }
 
@@ -387,25 +493,17 @@ async function loadStats() {
   try {
     const data = await requestKnowledgeStats(settings.backend, settings)
     knowledgeCount.value = data.total_chunks ?? data.totalChunks ?? '-'
-  } catch {
-    knowledgeCount.value = '-'
-  }
+  } catch { knowledgeCount.value = '-' }
 }
 
 async function loadMonitor() {
-  try {
-    monitorData.value = await requestMonitor(settings.backend, settings)
-  } catch {
-    monitorData.value = { agent_stats: {}, tool_stats: {}, active_alerts: [], suggestions: [] }
-  }
+  try { monitorData.value = await requestMonitor(settings.backend, settings) }
+  catch { monitorData.value = { agent_stats: {}, tool_stats: {}, active_alerts: [], suggestions: [] } }
 }
 
 async function loadSkills() {
-  try {
-    skillsData.value = await requestSkills(settings.backend, settings)
-  } catch {
-    skillsData.value = { count: 0, skills: [], errors: [] }
-  }
+  try { skillsData.value = await requestSkills(settings.backend, settings) }
+  catch { skillsData.value = { count: 0, skills: [], errors: [] } }
 }
 
 async function reloadSkillSet() {
@@ -413,10 +511,8 @@ async function reloadSkillSet() {
   try {
     skillsData.value = await reloadSkills(settings.backend, settings)
     showToast('Skills 已重新加载')
-  } catch (error) {
-    statusText.value = error.message
-    showToast('Skills 加载失败')
-  } finally { busy.value = false }
+  } catch { showToast('Skills 加载失败') }
+  finally { busy.value = false }
 }
 
 async function sendMessage() {
@@ -424,6 +520,7 @@ async function sendMessage() {
   if (!content || busy.value) return
   messages.value.push({ id: createMessageId(), role: 'user', content })
   draft.value = ''
+  resetGrow()
   busy.value = true
   try {
     const response = await requestChat(settings.backend, settings, content)
@@ -432,25 +529,107 @@ async function sendMessage() {
       persist()
     }
     lastResponse.value = response
-    const meta = [response.intent, response.primaryAgent || response.agentType, response.knowledgeUsed ? 'RAG' : '', response.escalated ? '升级处置' : ''].filter(Boolean).join(' · ')
-    messages.value.push({ id: createMessageId(), role: 'assistant', content: response.response, meta })
-    await loadMonitor()
+    messages.value.push({
+      id: createMessageId(),
+      role: 'assistant',
+      content: response.response,
+      escalated: response.escalated,
+      requestId: response.requestId || '',
+      critical: response.escalated,
+    })
+    loadMonitor()
   } catch (error) {
-    messages.value.push({ id: createMessageId(), role: 'assistant', content: error.message, meta: '请求失败' })
+    messages.value.push({ id: createMessageId(), role: 'assistant', content: `请求失败：${error.message}\n请检查网络后重试；紧急情况请直接拨打值班电话。` })
   } finally {
     busy.value = false
-    await nextTick()
-    messageList.value?.scrollTo({ top: messageList.value.scrollHeight, behavior: 'smooth' })
+    scrollToBottom()
   }
 }
 
-function usePrompt(prompt) { draft.value = prompt }
+function usePrompt(prompt) { draft.value = prompt; autoGrow({ target: null }) }
 
-function clearConversation() {
+function confirmGenerated() {
+  generatedToken.value = ''
+  loadAdminConfig()
+}
+
+function forgetAdmin() {
+  localStorage.removeItem('safetymind.adminToken')
+  adminToken.value = ''
+  adminCfg.value = []
+  showToast('已退出管理：此浏览器不再记住管理密码')
+}
+
+function newConversation() {
   messages.value = []
   lastResponse.value = null
   settings.conversationId = ''
   persist()
+  historyOpen.value = false
+  showToast('已开始新对话')
+}
+
+async function loadConversations() {
+  try {
+    const data = await requestConversations(settings.backend, settings, settings.userId)
+    conversations.value = data.conversations || []
+  } catch { conversations.value = [] }
+}
+
+async function openConversation(item) {
+  historyOpen.value = false
+  try {
+    const data = await requestConversationMessages(settings.backend, settings, settings.userId, item.conv_id)
+    settings.conversationId = item.conv_id
+    persist()
+    lastResponse.value = null
+    messages.value = (data.messages || []).map((m, i) => ({
+      id: `hist-${item.conv_id}-${i}`,
+      role: m.role === 'assistant' ? 'assistant' : 'user',
+      content: m.content,
+      escalated: Boolean(m.escalated),
+      requestId: m.request_id || '',
+      critical: Boolean(m.escalated),
+    }))
+    activeView.value = 'chat'
+    scrollToBottom()
+    showToast(`已恢复：${item.title}`)
+  } catch { showToast('历史会话读取失败') }
+}
+
+async function removeConversation(item) {
+  try {
+    await requestDeleteConversation(settings.backend, settings, settings.userId, item.conv_id)
+    if (item.conv_id === settings.conversationId) newConversation()
+    loadConversations()
+    showToast('已删除该会话')
+  } catch { showToast('删除失败') }
+}
+
+function formatHistTime(ts) {
+  const n = Number(ts || 0)
+  if (!n) return ''
+  const d = new Date(n * 1000)
+  const today = new Date()
+  const sameDay = d.toDateString() === today.toDateString()
+  const hm = `${String(d.getHours()).padStart(2, '0')}:${String(d.getMinutes()).padStart(2, '0')}`
+  if (sameDay) return `今天 ${hm}`
+  const days = Math.floor((today - d) / 86400000)
+  if (days === 0) return `昨天 ${hm}`
+  if (days < 7) return `${days} 天前`
+  return `${d.getMonth() + 1}/${d.getDate()}`
+}
+
+function escalateInChat() {
+  escalationOpen.value = false
+  draft.value = '这个问题我需要人工处理，请转人工。'
+  activeView.value = 'chat'
+}
+
+function openDocs() {
+  const url = `${currentBackend.value.baseUrl}/docs`
+  if (window.pywebview?.api?.open_external) window.pywebview.api.open_external(url)
+  else window.open(url, '_blank', 'noopener')
 }
 
 async function searchKnowledge() {
@@ -458,24 +637,21 @@ async function searchKnowledge() {
   try {
     const data = await requestSearch(settings.backend, settings, searchQuery.value, 5)
     searchResults.value = data.results || []
-    showToast(`检索完成，返回 ${searchResults.value.length} 条结果`)
-  } catch (error) {
-    statusText.value = error.message
-    showToast('检索失败，请检查连接')
-  } finally { busy.value = false }
+    if (!searchResults.value.length) showToast('没有检索到相关内容')
+  } catch { showToast('检索失败，请检查连接') }
+  finally { busy.value = false }
 }
 
 async function submitKnowledge() {
   busy.value = true
   try {
-    const data = await addKnowledge(settings.backend, settings, [{ title: docTitle.value.trim(), content: docContent.value.trim() }])
-    statusText.value = JSON.stringify(data, null, 2)
+    await addKnowledge(settings.backend, settings, [{ title: docTitle.value.trim(), content: docContent.value.trim() }])
     await loadStats()
-    showToast('文档已添加')
-  } catch (error) {
-    statusText.value = error.message
-    showToast('文档导入失败')
-  } finally { busy.value = false }
+    docTitle.value = ''
+    docContent.value = ''
+    showToast('文档已添加，助手现在可以检索它')
+  } catch { showToast('文档导入失败') }
+  finally { busy.value = false }
 }
 
 async function handleUpload(event) {
@@ -484,14 +660,11 @@ async function handleUpload(event) {
   if (!file) return
   busy.value = true
   try {
-    const data = await uploadKnowledge(settings.backend, settings, file)
-    statusText.value = JSON.stringify(data, null, 2)
+    await uploadKnowledge(settings.backend, settings, file)
     await loadStats()
-    showToast(`${file.name} 导入成功`)
-  } catch (error) {
-    statusText.value = error.message
-    showToast('文件导入失败')
-  } finally { busy.value = false }
+    showToast(`${file.name} 已入库`)
+  } catch { showToast('文件导入失败（支持 txt / md / json）') }
+  finally { busy.value = false }
 }
 
 async function runEvaluation() {
@@ -499,10 +672,35 @@ async function runEvaluation() {
   try {
     evalData.value = await requestEvaluation(settings.backend, settings)
     showToast('评测完成')
-  } catch (error) {
-    statusText.value = error.message
-    showToast('评测运行失败')
-  } finally { busy.value = false }
+  } catch { showToast('评测运行失败') }
+  finally { busy.value = false }
+}
+
+function copyText(text, tip) {
+  if (navigator.clipboard?.writeText) navigator.clipboard.writeText(text).then(() => showToast(tip), () => showToast(text))
+  else showToast(text)
+}
+
+function autoGrow(event) {
+  const el = event?.target
+  const area = el || document.querySelector('.m-composer textarea')
+  if (!area) return
+  area.style.height = 'auto'
+  area.style.height = Math.min(area.scrollHeight, 132) + 'px'
+}
+
+function resetGrow() {
+  const area = document.querySelector('.m-composer textarea')
+  if (area) area.style.height = 'auto'
+}
+
+function onEnter(event) {
+  if (event.isComposing) return  // 中文输入法回车选词不发送
+  sendMessage()
+}
+
+function scrollToBottom() {
+  nextTick(() => messageList.value?.scrollTo({ top: messageList.value.scrollHeight, behavior: 'smooth' }))
 }
 
 function formatPercent(value) {

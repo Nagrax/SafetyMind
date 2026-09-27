@@ -22,6 +22,8 @@ from typing import Any, Dict, List, Optional
 import os
 import chromadb
 
+from core.chroma_utils import open_local_chroma
+
 logger = logging.getLogger(__name__)
 
 
@@ -64,10 +66,8 @@ class KnowledgeBase:
             logger.info(f"知识库 ChromaDB 已连接: {chroma_host}:{chroma_port}")
         except Exception:
             logger.info(f"知识库 ChromaDB 服务不可用，使用本地模式: {chroma_path}")
-            self._client = chromadb.PersistentClient(
-                path=chroma_path,
-                settings=chromadb.Settings(anonymized_telemetry=False),
-            )
+            # 自愈打开：HNSW 段损坏时自动归档重建，避免启动即崩（Windows 已复现多次）
+            self._client = open_local_chroma(chroma_path)
 
         # 服务器模式由服务端模型负责嵌入；嵌入式（桌面/单机）模式优先 BGE 语义嵌入
         # （真实中文语义，本地推理零 API 成本），依赖缺失或加载失败时回退 n-gram。
