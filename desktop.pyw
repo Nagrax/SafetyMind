@@ -24,8 +24,63 @@ from pathlib import Path
 ROOT = Path(__file__).resolve().parent
 os.chdir(ROOT)
 
+
+def _log(msg: str) -> None:
+    """启动日志（D 盘 data/desktop.log）。pythonw 无控制台，这是排障的唯一黑匣子。"""
+    try:
+        from datetime import datetime
+        p = ROOT / "data" / "desktop.log"
+        p.parent.mkdir(exist_ok=True)
+        with open(p, "a", encoding="utf-8") as f:
+            f.write(f"{datetime.now():%m-%d %H:%M:%S} [{os.getpid()}] {msg}\n")
+    except Exception:
+        pass
+
+
+def _pid_alive(pid: int) -> bool:
+    try:
+        import ctypes
+        k32 = ctypes.windll.kernel32
+        h = k32.OpenProcess(0x1000, False, pid)  # PROCESS_QUERY_LIMITED_INFORMATION
+        if not h:
+            return False
+        k32.CloseHandle(h)
+        return True
+    except Exception:
+        return False
+
+
+def _single_instance() -> bool:
+    """单实例锁：桌面端共用本地 chroma/sqlite，两个实例并发会互相锁死。"""
+    lock = ROOT / "data" / "desktop.lock"
+    try:
+        if lock.exists():
+            old = int((lock.read_text(encoding="utf-8").strip() or "0"))
+            if old and old != os.getpid() and _pid_alive(old):
+                _log(f"重复启动被拦截（已有实例 pid={old}）")
+                _msg(
+                    "SafetyMind 桌面端已经在运行。\n\n"
+                    "请查看任务栏中已有的窗口；若找不到窗口，请打开任务管理器\n"
+                    "结束 pythonw.exe 进程后重新双击。"
+                )
+                return False
+        lock.parent.mkdir(exist_ok=True)
+        lock.write_text(str(os.getpid()), encoding="utf-8")
+    except Exception:
+        pass
+    return True
+
+
+# 本机下载/缓存一律 D 盘（HF 默认写 C 盘用户缓存，必须在此前置覆盖；
+# 双击启动不经过任何 shell 配置，只能在这里兜底）。
+_HF_CACHE = ROOT.drive + "\\hf_cache"
+if os.path.isdir(_HF_CACHE):
+    os.environ.setdefault("HF_HOME", _HF_CACHE)
+os.environ.setdefault("HF_HUB_DISABLE_XET", "1")   # 本机 xet 下载会挂死
+os.environ.setdefault("HF_ENDPOINT", "https://hf-mirror.com")
+os.environ.setdefault("API_HOST", "127.0.0.1")  # 桌面端仅本机监听：管理端点本地免密
+
 CREATE_NEW_CONSOLE = 0x00000010
-DETACHED_PROCESS = 0x00000008
 
 
 def _msg(text: str, title: str = "SafetyMind") -> None:
@@ -75,6 +130,7 @@ def _bootstrap() -> None:
         capture_output=True,
     )
     if probe.returncode != 0:
+        _log(f"依赖探测失败 rc={probe.returncode}，开始安装 requirements")
         code = _run_visible([str(venv_python), "-m", "pip", "install", "-r", "requirements.txt"])
         if code != 0:
             _msg(
@@ -85,10 +141,12 @@ def _bootstrap() -> None:
             )
             sys.exit(1)
 
-    # 用无窗口的 pythonw 重启自身，退出当前进程
+    # 用无窗口的 pythonw 重启自身，退出当前进程。
+    # 注意不要加 DETACHED_PROCESS：pythonw 本就无控制台，加该标志曾导致
+    # WebView2 窗口无法创建（进程活着但无窗口的"打不开"僵尸态）。
+    _log("依赖就绪，重启为 venv pythonw")
     subprocess.Popen(
         [str(_venv_pythonw()), str(Path(__file__).resolve())],
-        creationflags=DETACHED_PROCESS,
         close_fds=True,
     )
     sys.exit(0)
@@ -133,18 +191,33 @@ def main() -> None:
     from api.main import app
 
     port = _pick_port()
+    _log(f"后端启动 port={port}")
     server = uvicorn.Server(uvicorn.Config(
         app, host="127.0.0.1", port=port, log_level="warning",
     ))
     threading.Thread(target=server.run, daemon=True).start()
 
     # 等后端就绪（最多 90 秒：冷启动含知识库导入），避免窗口先于服务白屏
-    for _ in range(450):
+    ready = False
+    _deadline = time.time() + 90  # 真实 90 秒墙钟
+    while time.time() < _deadline:
         try:
             urllib.request.urlopen(f"http://127.0.0.1:{port}/health", timeout=1)
+            ready = True
             break
         except Exception:
             time.sleep(0.2)
+    if not ready:
+        # 后端起不来：明确退出并释放单实例锁，绝不无声卡死或开空白窗口
+        _log("后端 90s 未就绪，进程退出（锁已释放，可重新双击）")
+        _msg(
+            "后端启动超时（90 秒未就绪），进程已退出。\n\n"
+            "常见原因：其他实例占用了本地数据库文件。\n"
+            "处理：关闭所有 SafetyMind 窗口后重新双击；若仍失败，\n"
+            "请把 data/desktop.log 发给维护者。"
+        )
+        sys.exit(1)
+    _log(f"后端就绪 port={port}，打开窗口")
 
     def open_external(url: str) -> None:
         """供前端调用：pywebview 不处理 target=_blank，外部链接走系统浏览器。"""
@@ -159,12 +232,17 @@ def main() -> None:
     )
     window.expose(open_external)
     webview.start()
+    _log("窗口已关闭，进程退出")
     # 窗口关闭后主线程退出，daemon 线程里的服务随之结束
 
 
 if __name__ == "__main__":
+    _log(f"desktop.pyw 启动 python={sys.executable}")
     try:
+        if not _single_instance():
+            sys.exit(1)
         if not _in_project_venv():
+            _log("非 venv 运行，进入 bootstrap 自举")
             _bootstrap()
         _check_api_key()
         main()
@@ -172,4 +250,13 @@ if __name__ == "__main__":
         raise
     except Exception as ex:  # 任何未预期错误都弹窗，绝不静默退出
         import traceback
+        _log(f"启动失败: {ex}\n{traceback.format_exc()[-500:]}")
         _msg(f"桌面端启动失败：\n\n{ex}\n\n{traceback.format_exc()[-800:]}")
+    finally:
+        # 只清理自己写入的锁：被单实例拒绝的进程不得删除存活实例的锁
+        try:
+            lock = ROOT / "data" / "desktop.lock"
+            if lock.exists() and lock.read_text(encoding="utf-8").strip() == str(os.getpid()):
+                lock.unlink(missing_ok=True)
+        except Exception:
+            pass

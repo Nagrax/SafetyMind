@@ -25,7 +25,7 @@
 
 ### 意图识别基准（完整方法、负结果与复现步骤见 [docs/BENCHMARK.md](docs/BENCHMARK.md)）
 
-自建 19 类安全意图基准：2453 条（dev 1003 / test 1033 / 独立留出 test2 410），人机协同标注 + 五模型一致性审计（标注噪声率 0.9%），数据集与评测脚本随仓库开源（`benchmarks/intent/`）。
+自建 19 类安全意图基准：数据文件共 2453 条（v3.1 审计版 2036 = dev 1003 / test 1033；独立留出 test2 文件 417 条，其中 7 条生成残留/歧义项在评测脚本中显式剔除，实际评测 410 条，剔除清单见 `benchmarks/intent/eval_prototype.py`），人机协同标注 + 五模型一致性审计（标注噪声率 0.9%），数据集与评测脚本随仓库开源（`benchmarks/intent/`）。
 
 | 意图引擎 | 准确率（test n=1033，同口径） | 单条延迟 p50（CPU / GPU） |
 | --- | --- | --- |
@@ -39,9 +39,11 @@
 
 ## 三种使用形态，一套后端
 
-- **桌面**：双击 `desktop.pyw` —— pywebview 原生窗口，FastAPI 在窗口背后运行，关窗即退；首次双击自动创建虚拟环境并安装依赖（可见进度窗口），本地无 Redis/ChromaDB 时自动降级为进程内记忆（JSON 快照持久化，重启不丢）+ 嵌入式向量库，**零模型下载、离线可启动**（启用本地语义引擎 `SAFETYMIND_BGE=1` 后首次需下载约 1.7GB 嵌入模型权重）
+- **桌面**：双击 `desktop.pyw` —— pywebview 原生窗口，FastAPI 在窗口背后运行，关窗即退；首次双击自动创建虚拟环境并安装依赖（可见进度窗口），本地无 Redis/ChromaDB 时自动降级为进程内记忆（JSON 快照持久化，重启不丢）+ 嵌入式向量库（本地库损坏自动归档重建，不阻塞启动）。默认嵌入为 BGE 语义向量（首次自动下载约 400MB 至 `HF_HOME`，设 `SAFETYMIND_EMBEDDING=ngram` 可完全零下载离线启动）；启用本地意图引擎 `SAFETYMIND_BGE=1` 后首次需下载约 1.7GB 嵌入模型权重
+- **手机版窗口**：双击 `mobile.pyw` —— 后端已在跑时直接弹出 390×844 手机比例窗口（无地址栏），后端未运行时自动拉起；也可用浏览器手机模式访问同一地址
 - **Web**：`start_web.bat` 或 `python -m api.main` —— 浏览器访问 `http://127.0.0.1:8000`，前端由后端同源伺服
 - **Docker**：`docker compose up -d` —— Redis + ChromaDB + Prometheus + Nginx 完整生产编排
+- **服务器部署**：Ubuntu + systemd + Caddy 自动 HTTPS 的完整步骤见 [docs/DEPLOY.md](docs/DEPLOY.md)（2 核 2GiB 实测可行，含 swap、验收清单与备份）
 
 Vue 3 前端（`frontend/`）提供对话、技能查看/热加载、知识库统计、检索演示、评测面板、监控面板，预构建产物随仓库分发，无需 Node 环境即可运行。
 
@@ -75,7 +77,7 @@ flowchart TB
     W --> P["后台异步更新人员安全画像"]
 ```
 
-> 上图为默认配置（三路融合）。启用 `SAFETYMIND_BGE=1` 后，意图阶段由本地语义原型分类器级联替代（95.3%/96.4%，置信度达阈直出、跳过 LLM 调用），其余链路不变。
+> 上图为默认配置（三路融合）。启用 `SAFETYMIND_BGE=1` 后，意图阶段由本地语义原型分类器级联替代（双模集成 test 96.4% / 独立留出 test2 94.9%，置信度达阈直出、跳过 LLM 调用），其余链路不变。
 
 ## 快速开始
 
@@ -115,7 +117,7 @@ docker compose up -d    # 首次启动会导入 7 篇默认安全知识库文档
 ## 关键设计决策
 
 - **意图层为什么用分类器而不是全交给大模型**：安全生产的误路由代价不对称——隐患上报被当闲聊回答是漏报。封闭意图集 + 显式紧急度门控是可测试、可审计的升级触发器（`/eval/run` 直接度量），一句"请模型自行判断是否升级"的 prompt 做不到。
-- **三路融合的诚实边界**：官方 Anthropic SDK 无 embeddings 资源，向量路在默认配置下是本地字符 n-gram 哈希——词面近似而非语义检索；配置第三方 `base_url` 时该路整体禁用，权重切换为 0.85/0.15。该弱点已在两侧解决：意图侧由本地语义原型分类器替代（基准 96.4%/94.9%），RAG 侧嵌入式模式默认升级为 BGE 语义嵌入（检索命中 7/7 vs n-gram 4/7，实测见 BENCHMARK.md）。
+- **三路融合的诚实边界**：官方 Anthropic SDK 无 embeddings 资源，向量路在默认配置下是本地字符 n-gram 哈希——词面近似而非语义检索；配置第三方 `base_url` 时该路整体禁用，权重切换为 0.85/0.15。该弱点已在两侧解决：意图侧由本地语义原型分类器替代（基准 96.4%/94.9%），RAG 侧嵌入式模式默认升级为 BGE 语义嵌入（真实业务语料 7 条定向查询命中 7/7 vs n-gram 词面 1-2/7；默认知识库 top3 命中 7/7 vs 4/7，均见 BENCHMARK.md §8）。
 - **父子召回的取舍**：法规文档一句话命中时，500 字子块往往缺少条款限定语境，因此检索子块、返回整篇父文档（截断 1200 字）；相邻子块共享边界句，降低关键限定词被切断的概率。
 - **Agent 的兑现条件**：当前 Agent 层的价值在 SOP 隔离、升级保障与可观测路由；接上工具动作（建工单、查作业票状态、拉 DCS 报警）后才是完整的编排收益，这是下一步方向。
 
@@ -130,7 +132,12 @@ docker compose up -d    # 首次启动会导入 7 篇默认安全知识库文档
 | GET/POST | `/skills` · `/skills/reload` | 技能查看 / 运行时热加载 |
 | GET | `/monitor` · `/metrics` | 监控摘要 / Prometheus 指标 |
 | POST | `/eval/run` | 意图 F1 + LLM-as-Judge 评测 |
-| GET | `/health` | 健康检查 |
+| GET | `/health` · `/config` | 健康检查 / 用户端配置（值班电话） |
+| GET/POST/DELETE | `/conversations*` | 历史会话列表 / 恢复 / 删除 |
+| POST | `/search/direct` | 直连向量检索（几十毫秒，跳过改写与重排） |
+| GET | `/audit` · `/audit/stats` · `/upgrades` · `/tickets` | 审计/升级/工单管理端点（需 `X-Admin-Token`，配置见环境变量表） |
+
+设置 `ACCESS_TOKEN` 后，除健康检查/用户端配置/前端静态资源外，以上端点均要求请求头 `X-Access-Token`（发给使用者的口令，前端"设置"页填一次即记住）。
 
 前端通过 `/api/python/*` 前缀访问以上接口（与 Nginx 反代路径一致），后端已同时挂载两套路径。
 
@@ -153,6 +160,15 @@ docker compose up -d    # 首次启动会导入 7 篇默认安全知识库文档
 | `SAFETYMIND_LAYA` | 关闭 | `1` 启用 Laya 判别式路由备选引擎 |
 | `SAFETYMIND_EMBEDDING` | `auto` | RAG/记忆嵌入：`auto`（bge 可用即用，缺失回退 n-gram）/ `bge` / `ngram` |
 | `SAFETYMIND_MEMORY_SNAPSHOT` | `data/memory_snapshot.json` | 桌面模式记忆快照路径 |
+| `SAFETYMIND_CRITICAL_TEMPLATE` | `1` | `0` 关闭 CRITICAL 紧急事态的模板化零 LLM 应急响应 |
+| `HF_HOME` | 平台默认 | 本地嵌入模型缓存目录（默认会写 C 盘用户缓存数百 MB，建议指向数据盘） |
+| `HF_ENDPOINT` / `HF_HUB_DISABLE_XET` | 官方 | HF 镜像端点 / 禁用 xet 下载（部分网络下 xet 会挂死） |
+| `CHROMA_KB_PERSIST_DIRECTORY` | `./data/kb_chroma` | RAG 知识库本地向量目录（与对话记忆库分离，损坏自愈互不连坐） |
+| `AUDIT_ENABLED` / `AUDIT_DB_PATH` | `1` / `./data/audit.db` | 审计+升级+工单（SQLite 单文件，每条请求留痕，升级自动建单） |
+| `ESCALATION_WEBHOOK_URL` | 空 | 值班群机器人 webhook（企业微信/钉钉/飞书文本格式）；CRITICAL 升级时推送，留空=仅落库 |
+| `ADMIN_TOKEN` | 空 | 管理密码：保护审计/工单/配置等管理端点（请求头 `X-Admin-Token`）。**网络部署（`API_HOST` 非回环）必须设置，留空=管理端点锁定**；本地单人模式免密 |
+| `ACCESS_TOKEN` | 空 | 公网访问口令：设置后所有业务端点要求请求头 `X-Access-Token`（发给使用者）；留空=不启用（本地自用） |
+| `API_HOST` | `127.0.0.1`（desktop/mobile 启动器自动设置） | 监听地址；`python -m api.main` 默认 `0.0.0.0`——**网络暴露时必须配置 `ADMIN_TOKEN` 与 `ACCESS_TOKEN`** |
 
 ## 项目结构
 
@@ -171,6 +187,8 @@ SafetyMind/
 ├── frontend/                # Vue 3 前端（src + 预构建 dist）
 ├── config/                  # Nginx / Prometheus
 ├── benchmarks/intent/       # 意图基准（2453 条数据集 + 复现脚本 + 盲测工具包）
+├── tests/test_adversarial.py # 对抗/降级场景门禁（LLM 死端点 / 本地引擎失败 / 记忆持久化）
+├── tests/test_frontend_endpoints.py # 前端-后端接线测试（关键端点真实可用）
 ├── docs/BENCHMARK.md        # 基准完整报告（方法/主结果/负结果/延迟）
 └── docker-compose.yml       # 生产编排
 ```

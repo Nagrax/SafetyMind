@@ -1,13 +1,13 @@
 # BGE 原型分类器（SOTA 配置）：中文短描述+全定义+模板+手写示例 → 原型均值 → 余弦 softmax
-# 证据: laya_eval/RESULTS.md — test n=1039 acc 92.6%（large+base 0.7/0.3 集成），零死类
-# 环境开关: SAFETYMIND_BGE=1（默认 off）；SAFETYMIND_BGE_LARGE=1 加载 large 并与 base 0.7/0.3 集成
+# 证据: docs/BENCHMARK.md — test n=1033 acc 96.42%（base+large 0.5/0.5 集成，213 条示例库，2026-09-26 复测复现）
+# 环境开关: SAFETYMIND_BGE=1（默认 off）；SAFETYMIND_BGE_LARGE=1 加载 large 并与 base 0.5/0.5 集成
 import os
 import math
 from typing import Callable, Dict, Optional, Tuple
 
 INSTR = ""  # 实测指令前缀有害（dev 82.5 vs 82.9）
 
-# ── 示例库（AI 生成自标注；模板 54 + 手写 Round1 95 + Round2 错误驱动定向 20）──
+# ── 示例库（AI 生成自标注；模板 54 + 手写与错误驱动定向四轮，共 213 条；HAND4 批次因 dev 过拟合已剔除）──
 HAND = {
  "equipment_alarm": ["造粒机模头温度报警响了，现在要怎么操作？","中间罐液位高报警连锁启动了，先做哪一步？","循环水泵出口压力低报警，岗位工该怎么应对？","一氧化碳探头报警持续响，值班人员处置顺序是什么？","蒸汽管网压力骤降报警，中控要做什么？"],
  "equipment_maintenance": ["罗茨风机齿轮箱异响，检修方案怎么定？","板式换热器压差变大，什么时候安排清洗检修？","年度大修中阀门解体检查的重点是什么？","减速机油封渗油，日常保养怎么处理？","仪表风压缩机保养周期表怎么编制？"],
@@ -110,6 +110,7 @@ class BGEProtoClassifier:
         self.use_large = use_large
         self.device = device
         self._models = None  # [(name, tok, model)]
+        self._load_failed = False  # 懒加载失败后置位：不再重复拉起模型，直接降级
 
     @classmethod
     def from_env(cls) -> Optional["BGEProtoClassifier"]:
@@ -123,36 +124,50 @@ class BGEProtoClassifier:
         )
 
     def _get_models(self):
+        if self._load_failed:
+            raise RuntimeError("BGE 本地引擎此前加载失败，已静默降级（不重试）")
         if self._models is None:
-            os.environ.setdefault("HF_HUB_DISABLE_XET", "1")
-            os.environ.setdefault("HF_HOME", r"D:\hf_cache")
-            import torch
-            from transformers import AutoTokenizer, AutoModel
-            from core.intent_recognizer import _TEMPLATES, IntentCategory
-            from core.laya_recognizer import ZH_KEY, ZH_SHORT
-            bank = build_bank(IntentCategory, _TEMPLATES, ZH_KEY, ZH_SHORT, self._definitions())
-            names = ["BAAI/bge-base-zh-v1.5"] + (["BAAI/bge-large-zh-v1.5"] if self.use_large else [])
-            self._weights = [0.5] + ([0.5] if self.use_large else [])
-            self._models = []
-            self._protos = []
-            for name in names:
-                tok = AutoTokenizer.from_pretrained(name)
-                mdl = AutoModel.from_pretrained(name); mdl.eval(); mdl.to(self.device)
-                texts, pcls = [], []
-                for v, lst in bank.items():
-                    for t in lst:
-                        texts.append(t); pcls.append(v)
-                E = self._embed(texts, tok, mdl)
-                cat_vals = [c.value for c in IntentCategory]
-                protos = torch.zeros(len(cat_vals), E.shape[1]); cnt = {}
-                for j, cls in enumerate(pcls):
-                    protos[cat_vals.index(cls)] += E[j]; cnt[cls] = cnt.get(cls, 0) + 1
-                for cls in cat_vals: protos[cat_vals.index(cls)] /= max(1, cnt[cls])
-                protos = torch.nn.functional.normalize(protos, dim=-1)
-                self._models.append((name, tok, mdl))
-                self._protos.append(protos)
-            self._cat_vals = [c.value for c in IntentCategory]
+            try:
+                self._load_models()
+            except Exception:
+                # 失败必须回滚到"未初始化"并置失败位。否则 _models 停留在空列表，
+                # 后续调用会跳过初始化：probs() 返回 None → fuse_with_pattern(None)
+                # 抛 TypeError（历史 Bug：部分初始化后连续调用崩溃）。
+                self._models = None
+                self._load_failed = True
+                raise
         return self._models
+
+    def _load_models(self):
+        os.environ.setdefault("HF_HUB_DISABLE_XET", "1")
+        os.environ.setdefault("HF_ENDPOINT", "https://hf-mirror.com")
+        os.environ.setdefault("HF_HOME", r"D:\hf_cache")
+        import torch
+        from transformers import AutoTokenizer, AutoModel
+        from core.intent_recognizer import _TEMPLATES, IntentCategory
+        from core.laya_recognizer import ZH_KEY, ZH_SHORT
+        bank = build_bank(IntentCategory, _TEMPLATES, ZH_KEY, ZH_SHORT, self._definitions())
+        names = ["BAAI/bge-base-zh-v1.5"] + (["BAAI/bge-large-zh-v1.5"] if self.use_large else [])
+        self._weights = [0.5] + ([0.5] if self.use_large else [])
+        self._models = []
+        self._protos = []
+        for name in names:
+            tok = AutoTokenizer.from_pretrained(name)
+            mdl = AutoModel.from_pretrained(name); mdl.eval(); mdl.to(self.device)
+            texts, pcls = [], []
+            for v, lst in bank.items():
+                for t in lst:
+                    texts.append(t); pcls.append(v)
+            E = self._embed(texts, tok, mdl)
+            cat_vals = [c.value for c in IntentCategory]
+            protos = torch.zeros(len(cat_vals), E.shape[1]); cnt = {}
+            for j, cls in enumerate(pcls):
+                protos[cat_vals.index(cls)] += E[j]; cnt[cls] = cnt.get(cls, 0) + 1
+            for cls in cat_vals: protos[cat_vals.index(cls)] /= max(1, cnt[cls])
+            protos = torch.nn.functional.normalize(protos, dim=-1)
+            self._models.append((name, tok, mdl))
+            self._protos.append(protos)
+        self._cat_vals = [c.value for c in IntentCategory]
 
     def _definitions(self) -> Dict[str, str]:
         # 与 runner.DEF 同源的类定义（复制关键描述，避免引 runner 的 argparse 副作用）
@@ -194,6 +209,8 @@ class BGEProtoClassifier:
     def probs(self, message: str) -> Dict[str, float]:
         """集成概率 {intent_value: prob}。"""
         models = self._get_models()
+        if not models:
+            return {}  # 引擎不可用：返回空概率而非 None，交由调用方降级
         import torch
         ens = None
         for (name, tok, mdl), w in zip(models, self._weights):
@@ -212,6 +229,8 @@ class BGEProtoClassifier:
             ens = self.probs(message)
         except Exception:
             return None
+        if not ens:
+            return None  # 空概率 = 引擎不可用，禁止传入 fuse_with_pattern（TypeError）
         pat = pattern_fn(message)
         pat_cls = pat.get("intent")
         if hasattr(pat_cls, "value"):

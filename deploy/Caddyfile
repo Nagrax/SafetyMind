@@ -1,0 +1,7 @@
+# 将域名换成你的实际域名；Caddy 会自动申请并续期 HTTPS 证书
+your-domain.com {
+    encode gzip
+    reverse_proxy 127.0.0.1:8000
+    # 上传/对话体量小，默认超时即可；如需流式长连接可加：
+    # reverse_proxy 127.0.0.1:8000 { flush_interval -1 }
+}

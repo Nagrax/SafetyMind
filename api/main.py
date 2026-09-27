@@ -1,9 +1,11 @@
 
 import asyncio
+import json
 import logging
 import os
 import pathlib
 import sys
+import time
 import uuid
 from contextlib import asynccontextmanager
 from typing import Any, Dict, List, Optional
@@ -15,7 +17,8 @@ if _ROOT not in sys.path:
 
 import uvicorn
 from dotenv import load_dotenv
-from fastapi import FastAPI, HTTPException, Response, UploadFile, File
+from fastapi import FastAPI, HTTPException, Request, Response, UploadFile, File, Header, Depends
+from fastapi.responses import JSONResponse
 from fastapi.middleware.cors import CORSMiddleware
 from prometheus_client import CONTENT_TYPE_LATEST, generate_latest
 from pydantic import BaseModel, Field
@@ -44,6 +47,8 @@ _tool_manager = None
 _monitor      = None
 _evaluator    = None
 _skill_manager = None
+_conv_store   = None
+_audit        = None
 
 def _anthropic_cfg() -> Dict[str, Any]:
     key = os.getenv("ANTHROPIC_API_KEY", "")
@@ -61,7 +66,7 @@ def _anthropic_cfg() -> Dict[str, Any]:
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    global _orchestrator, _memory, _tool_manager, _monitor, _evaluator, _skill_manager
+    global _orchestrator, _memory, _tool_manager, _monitor, _evaluator, _skill_manager, _conv_store, _audit
 
     print(BANNER, flush=True)
 
@@ -73,6 +78,8 @@ async def lifespan(app: FastAPI):
     from memory.conversation_memory import MemoryManager
     from monitor.performance_monitor import PerformanceMonitor
     from core.skill_loader import SkillManager
+    from memory.conversation_store import ConversationStore
+    from core.audit_store import AuditStore
 
     cfg = _anthropic_cfg()
     logger.info(f"模型: {cfg['model']}  base_url: {cfg.get('base_url', '(官方)')}")
@@ -105,7 +112,7 @@ async def lifespan(app: FastAPI):
         redis_url=os.getenv("REDIS_URL", "redis://redis:6379/0"),
         chroma_host=os.getenv("CHROMA_HOST", "chromadb"),
         chroma_port=int(os.getenv("CHROMA_PORT", "8000")),
-        chroma_path=os.getenv("CHROMA_PERSIST_DIRECTORY", "/app/data/chroma"),
+        chroma_path=os.getenv("CHROMA_PERSIST_DIRECTORY", "./data/chroma"),
         api_key=cfg["api_key"],
         base_url=cfg.get("base_url"),
         model=cfg["model"],
@@ -120,7 +127,8 @@ async def lifespan(app: FastAPI):
     kb = KnowledgeBase(
         chroma_host=os.getenv("CHROMA_HOST", "chromadb"),
         chroma_port=int(os.getenv("CHROMA_PORT", "8000")),
-        chroma_path=os.getenv("CHROMA_PERSIST_DIRECTORY", "/app/data/chroma"),
+        # 知识库与对话记忆分目录存储：一边损坏不连坐另一边，也更利于单独重建
+        chroma_path=os.getenv("CHROMA_KB_PERSIST_DIRECTORY", "./data/kb_chroma"),
     )
     logger.info(f"知识库已加载: {await kb.doc_count_async()} 个文档片段")
 
@@ -172,6 +180,23 @@ async def lifespan(app: FastAPI):
         baseline_path=os.getenv("EVAL_BASELINE_PATH", "/app/data/eval/baseline.json"),
     )
 
+    # 会话历史持久化（跨天可恢复；写入失败不阻断对话）
+    _conv_store = ConversationStore()
+
+    # 审计/升级/工单存储（SQLite；AUDIT_ENABLED=0 可整体关闭）
+    _audit = None
+    if os.getenv("AUDIT_ENABLED", "1") == "1":
+        try:
+            _audit = AuditStore()
+            logger.info(f"审计存储已启用: {os.getenv('AUDIT_DB_PATH', 'data/audit.db')}")
+        except Exception as ex:
+            logger.warning(f"审计存储初始化失败（对话不受影响）: {ex}")
+
+    # 意图引擎后台预热：启用 SAFETYMIND_BGE=1 时，首条消息不再等本地模型冷加载
+    # （冷加载约 20-40s，预热后意图阶段毫秒级直出）。
+    if os.getenv("SAFETYMIND_BGE", "") == "1":
+        asyncio.create_task(_orchestrator.recognize_intent("系统预热"))
+
     logger.info("SafetyMind 已就绪")
     yield
 
@@ -195,6 +220,34 @@ app.add_middleware(
     allow_methods=["*"],
     allow_headers=["*"],
 )
+
+
+# ── 公网访问门（可选）：.env 设置 ACCESS_TOKEN 后，业务端点要求 X-Access-Token 头。
+#    公开项：前端静态资源、健康检查、用户端配置、API 文档。
+#    管理端点另有 ADMIN_TOKEN 双重门。留空 = 不启用（本地单人形态）。
+_PUBLIC_EXACT = {"/", "/health", "/config", "/metrics", "/monitor",
+                 "/docs", "/redoc", "/openapi.json", "/favicon.ico"}
+_PUBLIC_PREFIX = ("/assets/", "/docs/", "/api/python/health", "/api/python/config",
+                  "/api/python/docs", "/api/python/openapi.json")
+
+
+@app.middleware("http")
+async def access_gate(request: Request, call_next):
+    token = os.getenv("ACCESS_TOKEN", "").strip()
+    if token:
+        path = request.url.path
+        is_public = (path in _PUBLIC_EXACT
+                     or path.startswith(_PUBLIC_PREFIX)
+                     or request.method == "OPTIONS")
+        if not is_public:
+            supplied = request.headers.get("X-Access-Token", "")
+            if supplied != token:
+                return JSONResponse({"detail": "需要访问令牌（X-Access-Token）"}, status_code=401)
+    return await call_next(request)
+
+
+class AccessTokenInput(BaseModel):
+    value: str
 
 
 # ── 请求/响应模型 ─────────────────────────────────────────────────────────────
@@ -221,9 +274,169 @@ class ChatResponse(BaseModel):
     entities: Dict[str, List[str]] = Field(default_factory=dict)
     intent_confidence: float = 0.0
     intent_source_scores: Dict[str, float] = Field(default_factory=dict)
+    request_id:  str = ""   # 升级留痕编号（用户端"复制上报编号"用）
 
 
 # ── 路由 ──────────────────────────────────────────────────────────────────────
+@app.get("/config")
+async def app_config():
+    """用户端展示配置（转人工值班电话等）。无敏感信息，可公开。"""
+    return {
+        "escalation_phone": os.getenv("ESCALATION_PHONE", "").strip(),
+        "product": "SafetyMind",
+    }
+
+
+# ── 会话历史（跨天可恢复）───────────────────────────────────────────────────
+@app.get("/conversations", tags=["会话历史"])
+async def list_conversations(user_id: str = "anonymous"):
+    """当前用户的历史会话列表（按最近更新倒序）。"""
+    if _conv_store is None:
+        raise HTTPException(503, "会话存储未初始化")
+    return {"conversations": _conv_store.list_conversations(user_id)}
+
+
+@app.get("/conversations/{conv_id}/messages", tags=["会话历史"])
+async def get_conversation_messages(conv_id: str, user_id: str = "anonymous"):
+    """读取某历史会话的完整消息（用于恢复继续对话）。"""
+    if _conv_store is None:
+        raise HTTPException(503, "会话存储未初始化")
+    return {"conv_id": conv_id, "messages": _conv_store.get_messages(user_id, conv_id)}
+
+
+@app.delete("/conversations/{conv_id}", tags=["会话历史"])
+async def delete_conversation(conv_id: str, user_id: str = "anonymous"):
+    if _conv_store is None:
+        raise HTTPException(503, "会话存储未初始化")
+    return {"deleted": _conv_store.delete_conversation(user_id, conv_id)}
+
+
+# ── 审计 / 升级 / 工单（管理端点）────────────────────────────────────────────
+def _admin_auth_required() -> bool:
+    """管理密码只保护一种场景：服务以网络形态部署、可能有多人访问。
+    本地单人形态（回环监听）永远免密——这是对"本机自用无需密码"承诺的兑现；
+    此前"设了 ADMIN_TOKEN 本地也要输"的规则会造成 bootstrap 与输入互相堵死的死锁，已废弃。"""
+    host = os.getenv("API_HOST", "0.0.0.0").strip().lower()  # 与 uvicorn 绑定默认值一致：未声明视为网络暴露
+    return host not in ("127.0.0.1", "localhost", "::1")
+
+
+def require_admin(x_admin_token: str = Header(default="", alias="X-Admin-Token")):
+    """管理端点鉴权：部署形态（API_HOST 非回环）要求 .env 配置 ADMIN_TOKEN 并以
+    请求头 X-Admin-Token 访问；未配置 = 锁定（防裸奔上线）。
+    本地单人形态自动放行——管理功能保护的是"多人在网络上访问"的场景。"""
+    if not _admin_auth_required():
+        return
+    expected = os.getenv("ADMIN_TOKEN", "").strip()
+    if not expected:
+        raise HTTPException(
+            503, "服务以网络模式运行但未设置管理密码：请在 .env 配置 ADMIN_TOKEN（首次可在设置页一键生成）")
+    if x_admin_token != expected:
+        raise HTTPException(401, "管理密码无效")
+
+
+@app.get("/audit", tags=["审计"])
+async def audit_list(limit: int = 100, escalated_only: bool = False, _admin: None = Depends(require_admin)):
+    if _audit is None:
+        raise HTTPException(503, "审计存储未启用（AUDIT_ENABLED=0）")
+    return {"entries": _audit.list_audit(limit=limit, escalated_only=escalated_only)}
+
+
+@app.get("/audit/stats", tags=["审计"])
+async def audit_stats(_admin: None = Depends(require_admin)):
+    """安环部周报数据源：请求数/升级数/未确认升级/工单闭环与超期。"""
+    if _audit is None:
+        raise HTTPException(503, "审计存储未启用（AUDIT_ENABLED=0）")
+    return _audit.stats()
+
+
+@app.get("/upgrades", tags=["审计"])
+async def upgrades_list(limit: int = 50, unacked_only: bool = False, _admin: None = Depends(require_admin)):
+    if _audit is None:
+        raise HTTPException(503, "审计存储未启用")
+    return {"upgrades": _audit.list_upgrades(limit=limit, unacked_only=unacked_only)}
+
+
+@app.post("/upgrades/{upgrade_id}/ack", tags=["审计"])
+async def upgrade_ack(upgrade_id: int, _admin: None = Depends(require_admin)):
+    """值班确认：收到并处理了该次升级。"""
+    if _audit is None:
+        raise HTTPException(503, "审计存储未启用")
+    return {"acked": _audit.ack_upgrade(upgrade_id)}
+
+
+class TicketInput(BaseModel):
+    title: str
+    type: str = "hazard"          # hazard | emergency | permit | maintenance
+    priority: str = "normal"      # low | normal | high | critical
+    assignee: str = ""
+    due_hours: Optional[float] = None   # 相对当前时间的限期（小时）
+
+
+@app.get("/tickets", tags=["审计"])
+async def tickets_list(status: Optional[str] = None, limit: int = 100,
+                       _admin: None = Depends(require_admin)):
+    if _audit is None:
+        raise HTTPException(503, "审计存储未启用")
+    return {"tickets": _audit.list_tickets(status=status, limit=limit)}
+
+
+@app.post("/tickets", tags=["审计"])
+async def ticket_create(body: TicketInput, _admin: None = Depends(require_admin)):
+    if _audit is None:
+        raise HTTPException(503, "审计存储未启用")
+    due = (time.time() + body.due_hours * 3600) if body.due_hours else None
+    tid = _audit.create_ticket(body.title, type_=body.type, priority=body.priority,
+                               assignee=body.assignee, due_ts=due)
+    return {"ticket_id": tid}
+
+
+@app.post("/tickets/{ticket_id}/close", tags=["审计"])
+async def ticket_close(ticket_id: int, _admin: None = Depends(require_admin)):
+    if _audit is None:
+        raise HTTPException(503, "审计存储未启用")
+    return {"closed": _audit.close_ticket(ticket_id)}
+
+
+# ── .env 可视化配置（管理端点；白名单 + 掩码 + 原子写）───────────────────────
+@app.post("/config/admin/bootstrap", tags=["审计"])
+async def admin_config_bootstrap():
+    """首次设置：ADMIN_TOKEN 未配置时一键生成管理密码（仅未配置时可用，先到先得）。
+    已配置后此端点永久失效——改密码必须凭现有密码走 /config/admin。"""
+    from core.env_config import EnvConfigManager
+    _h = os.getenv("API_HOST", "0.0.0.0").strip().lower()
+    if _h not in ("127.0.0.1", "localhost", "::1"):
+        raise HTTPException(403, "网络部署形态禁止远程 bootstrap：请管理员在服务器 .env 预设 ADMIN_TOKEN 后重启")
+    if os.getenv("ADMIN_TOKEN", "").strip():
+        raise HTTPException(409, "管理密码已配置；修改需凭现有密码在设置页操作")
+    import secrets
+    token = "sm-" + secrets.token_urlsafe(12)
+    mgr = EnvConfigManager(os.getenv("ENV_FILE_PATH", os.path.join(_ROOT, ".env")))
+    mgr.write_config({"ADMIN_TOKEN": token})
+    return {"admin_token": token, "hint": "请妥善保存，此窗口关闭后不再显示"}
+
+
+@app.get("/config/admin", tags=["审计"])
+async def admin_config_get(_admin: None = Depends(require_admin)):
+    from core.env_config import EnvConfigManager
+    mgr = EnvConfigManager(os.getenv("ENV_FILE_PATH", os.path.join(_ROOT, ".env")))
+    host = os.getenv("API_HOST", "0.0.0.0").strip().lower()
+    auth_mode = "local" if host in ("127.0.0.1", "localhost", "::1") else "network"
+    return {"auth_mode": auth_mode, "config": mgr.read_config()}
+
+
+@app.post("/config/admin", tags=["审计"])
+async def admin_config_post(body: Dict[str, Any], _admin: None = Depends(require_admin)):
+    from core.env_config import EnvConfigManager
+    mgr = EnvConfigManager(os.getenv("ENV_FILE_PATH", os.path.join(_ROOT, ".env")))
+    try:
+        result = mgr.write_config(body.get("values") or {})
+    except ValueError as ex:
+        raise HTTPException(400, str(ex))
+    result["hint"] = ("以下配置需重启服务生效: " + ", ".join(result["restart_required"])) \
+        if result["restart_required"] else "全部即时生效"
+    return result
+
+
 @app.get("/health")
 async def health():
     if _orchestrator is None:
@@ -274,7 +487,15 @@ async def chat(req: ChatRequest):
     ] if mem_ctx.recent_messages else None
 
     intent_result = await _orchestrator.recognize_intent(req.message, history=history)
-    knowledge_text, knowledge_used = await _build_knowledge_context(req.message, intent=intent_result.intent)
+
+    # RAG 门控（意图级 + 紧急度级）：寒暄/反馈/转人工/无关意图不检索；
+    # CRITICAL 且应急模板开启时同样跳过 RAG——模板不使用知识库。
+    # 注意与 SAFETYMIND_CRITICAL_TEMPLATE 联动：模板关闭时紧急消息仍需 RAG 上下文走 LLM。
+    from core.intent_recognizer import UrgencyLevel
+    knowledge_text, knowledge_used = "", False
+    _template_on = os.getenv("SAFETYMIND_CRITICAL_TEMPLATE", "1") == "1"
+    if not (_template_on and intent_result.urgency == UrgencyLevel.CRITICAL):
+        knowledge_text, knowledge_used = await _build_knowledge_context(req.message, intent=intent_result.intent)
     context_parts = [mem_ctx.to_prompt_text()]
     if knowledge_text:
         context_parts.append(knowledge_text)
@@ -303,6 +524,48 @@ async def chat(req: ChatRequest):
     # 5. 异步更新用户画像（不阻塞响应）
     asyncio.create_task(_memory.update_profile(req.user_id, conv_id))
 
+    # 6. 会话历史落盘（跨天可恢复）+ 审计留痕 + CRITICAL 升级事件。
+    #    必须在 return 之前：失败仅告警，绝不阻断响应。
+    if _conv_store is not None:
+        try:
+            _conv_store.append_message(req.user_id, conv_id, "user", req.message)
+            _conv_store.append_message(req.user_id, conv_id, "assistant", result.response,
+                                       escalated=result.escalated, request_id=result.request_id)
+        except Exception as ex:
+            logger.warning(f"会话历史写入失败: {ex}")
+
+    if _audit is not None:
+        try:
+            degraded = bool(getattr(intent_result, "degraded", False))
+            _audit.audit_request(result.request_id, req.user_id, conv_id, req.message,
+                                 intent_result.intent.value if intent_result.intent else "other",
+                                 intent_result.urgency.value if intent_result.urgency else "low",
+                                 result.escalated, result.latency_ms,
+                                 degraded=degraded, knowledge_used=knowledge_used)
+            if result.escalated:
+                upgrade_id = _audit.add_upgrade(result.request_id, req.user_id, conv_id,
+                                                req.message, intent_result.intent.value or "other")
+                _audit.create_ticket(f"应急升级: {' '.join(req.message.split())[:60]}",
+                                     type_="emergency", priority="critical",
+                                     source_request_id=result.request_id)
+                webhook = os.getenv("ESCALATION_WEBHOOK_URL", "").strip()
+                if webhook:
+                    msg_digest = " ".join(req.message.split())[:60]
+
+                    async def _notify(upgrade_id=upgrade_id, webhook=webhook,
+                                      rid=result.request_id, msg_digest=msg_digest):
+                        from core.audit_store import notify_escalation_blocking
+                        ok = await asyncio.to_thread(notify_escalation_blocking, webhook, {
+                            "request_id": rid,
+                            "text": f"【SafetyMind 应急升级】编号 {rid}\n内容: {msg_digest}\n时间: {time.strftime('%m-%d %H:%M:%S')}\n已自动建单并留痕，请值班确认。",
+                        })
+                        if ok:
+                            _audit.mark_notified(upgrade_id, "webhook")
+
+                    asyncio.create_task(_notify())
+        except Exception as ex:
+            logger.warning(f"审计/升级记录失败: {ex}")
+
     return ChatResponse(
         conv_id=conv_id,
         response=result.response,
@@ -320,6 +583,7 @@ async def chat(req: ChatRequest):
         entities=intent_result.entities,
         intent_confidence=round(intent_result.confidence, 4),
         intent_source_scores=intent_result.source_scores,
+        request_id=result.request_id,
     )
 
 
@@ -407,12 +671,28 @@ async def prometheus_metrics():
 async def search(query: str, top_k: int = 5):
     """
     演示检索优化链路：查询改写 → 并行召回 → 重排 → Top-K。
-    展示 MCP 工具调用的核心亮点。
+    展示 MCP 工具调用的核心亮点。含两次 LLM 调用，延迟为秒级。
     """
     if _tool_manager is None:
         raise HTTPException(503, "服务未就绪")
     result = await _tool_manager.search_with_rewrite("knowledge_search", query, top_k=top_k)
     return {"query": query, "results": result.data, "reranked": result.reranked}
+
+
+@app.post("/search/direct")
+async def search_direct(query: str, top_k: int = 5):
+    """
+    直连向量检索（bge 嵌入 + 余弦）：跳过查询改写与 LLM 重排，几十毫秒返回。
+    供前端"检索测试"使用——其语义是"验证文档能否被找到"，不需要完整优化链路。
+    """
+    if _tool_manager is None:
+        raise HTTPException(503, "服务未就绪")
+    tool = _tool_manager._tools.get("knowledge_search")
+    if tool is None:
+        raise HTTPException(503, "知识库未初始化")
+    kb = tool.handler.__self__
+    results = await kb.search_async(query, top_k=top_k)
+    return {"query": query, "results": results, "reranked": False}
 
 
 class DocInput(BaseModel):
@@ -528,6 +808,15 @@ async def knowledge_stats():
     return {"total_chunks": await kb.doc_count_async()}
 
 
+def _eval_last_report_path() -> pathlib.Path:
+    """最近一次评测报告的持久化路径（EVAL_LAST_REPORT_PATH 可覆盖）。
+
+    默认随仓库 data/eval/（Docker 内 _ROOT=/app，与 baseline.json 同目录）。
+    """
+    default = pathlib.Path(_ROOT) / "data" / "eval" / "last_report.json"
+    return pathlib.Path(os.getenv("EVAL_LAST_REPORT_PATH", str(default)))
+
+
 @app.post("/eval/run")
 async def run_eval(body: Optional[EvalRunInput] = None):
     """运行内置评测用例，返回评测报告。"""
@@ -559,7 +848,8 @@ async def run_eval(body: Optional[EvalRunInput] = None):
         intent_cases=intent_cases,
         dialog_cases=dialog_cases,
     )
-    return {
+    data = {
+        "timestamp":       report.timestamp,
         "pass_rate":       report.pass_rate,
         "total":           report.total,
         "passed":          report.passed,
@@ -577,6 +867,32 @@ async def run_eval(body: Optional[EvalRunInput] = None):
             for r in report.results
         ],
     }
+    # 持久化最近一次报告：服务重启后评测页仍可经 GET /eval/last 展示，不再空白。
+    # 持久化失败不阻断本次响应（评测结果已在内存中返回）。
+    try:
+        path = _eval_last_report_path()
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(json.dumps(data, ensure_ascii=False, indent=2), encoding="utf-8")
+    except OSError as ex:
+        logger.warning(f"评测报告持久化失败（不影响本次响应）: {ex}")
+    return data
+
+
+@app.get("/eval/last")
+async def last_eval_report():
+    """返回最近一次评测报告（/eval/run 完成时持久化到 data/eval/last_report.json）。
+
+    尚无报告或文件损坏时返回 200 + 明确空态结构（available=false），
+    前端评测页据此显示空态，而不是报错或空白。
+    """
+    path = _eval_last_report_path()
+    if not path.exists():
+        return {"available": False, "message": "尚未运行评测，暂无历史报告"}
+    try:
+        return json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, ValueError) as ex:
+        logger.warning(f"评测报告读取失败: {ex}")
+        return {"available": False, "message": f"最近一次评测报告读取失败（{path.name} 损坏）"}
 
 
 # ── 前端同源服务（桌面/单进程模式）───────────────────────────────────────────
@@ -646,7 +962,7 @@ async def _cli():
         redis_url=os.getenv("REDIS_URL", "redis://localhost:6379/0"),
         chroma_host=os.getenv("CHROMA_HOST", "localhost"),
         chroma_port=int(os.getenv("CHROMA_PORT", "8000")),
-        chroma_path=os.getenv("CHROMA_PERSIST_DIRECTORY", "/tmp/chroma"),
+        chroma_path=os.getenv("CHROMA_PERSIST_DIRECTORY", "./data/chroma"),
         api_key=cfg["api_key"],
         base_url=cfg.get("base_url"),
         model=cfg["model"],
