@@ -76,7 +76,9 @@ class EnvConfigManager:
                 raise ValueError(f"不允许的配置键: {key}")
             meta = ADMIN_ENV_KEYS[key]
             v = str(raw).strip()
-            if "\n" in raw or "\r" in raw:
+            # 换行检查必须针对 str 化后的值：raw 若是 int/dict 等非字符串，
+            # `in raw` 会抛 TypeError 绕过端点的 ValueError→400 处理变成 500。
+            if "\n" in v or "\r" in v:
                 raise ValueError(f"{key} 不允许换行（防配置注入）")
             if meta.get("enum") and v and v not in meta["enum"]:
                 raise ValueError(f"{key} 仅允许: {'/'.join(meta['enum'])}")

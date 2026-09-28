@@ -34,7 +34,30 @@
         </div>
 
         <article v-for="item in messages" :key="item.id" :class="['m-msg', item.role, { critical: item.critical }]">
-          <div class="m-msg-body">
+          <!-- 助手消息：Markdown 渲染。parseMarkdown/inlineTokens 只产数据块，
+               全部经 {{ }} 插值转义，无 v-html/innerHTML，XSS 面为零 -->
+          <div v-if="item.role === 'assistant'" class="m-msg-body md-body">
+            <template v-for="(block, bi) in parseMarkdown(item.content)" :key="bi">
+              <pre v-if="block.t === 'code'" class="md-code"><code>{{ block.lines.join('\n') }}</code></pre>
+              <component :is="'h' + block.level" v-else-if="block.t === 'h'" :class="'md-h md-h' + block.level"><template v-for="(seg, si) in inlineTokens(block.text)" :key="si"><strong v-if="seg.t === 'b'">{{ seg.v }}</strong><code v-else-if="seg.t === 'c'" class="md-inline-code">{{ seg.v }}</code><br v-else-if="seg.t === 'br'" /><template v-else>{{ seg.v }}</template></template></component>
+              <hr v-else-if="block.t === 'hr'" class="md-hr" />
+              <ul v-else-if="block.t === 'ul'" class="md-list">
+                <li v-for="(li, ix) in block.items" :key="ix">
+                  <template v-for="(seg, si) in inlineTokens(li)" :key="si"><strong v-if="seg.t === 'b'">{{ seg.v }}</strong><code v-else-if="seg.t === 'c'" class="md-inline-code">{{ seg.v }}</code><br v-else-if="seg.t === 'br'" /><template v-else>{{ seg.v }}</template></template>
+                </li>
+              </ul>
+              <ol v-else-if="block.t === 'ol'" class="md-list">
+                <li v-for="(li, ix) in block.items" :key="ix">
+                  <template v-for="(seg, si) in inlineTokens(li)" :key="si"><strong v-if="seg.t === 'b'">{{ seg.v }}</strong><code v-else-if="seg.t === 'c'" class="md-inline-code">{{ seg.v }}</code><br v-else-if="seg.t === 'br'" /><template v-else>{{ seg.v }}</template></template>
+                </li>
+              </ol>
+              <p v-else>
+                <template v-for="(seg, si) in inlineTokens(block.text)" :key="si"><strong v-if="seg.t === 'b'">{{ seg.v }}</strong><code v-else-if="seg.t === 'c'" class="md-inline-code">{{ seg.v }}</code><br v-else-if="seg.t === 'br'" /><template v-else>{{ seg.v }}</template></template>
+              </p>
+            </template>
+          </div>
+          <!-- 用户消息与旧行为一致：纯文本逐行插值 -->
+          <div v-else class="m-msg-body">
             <p v-for="(line, i) in item.content.split('\n')" :key="i">{{ line }}</p>
           </div>
           <div v-if="item.role === 'assistant' && item.escalated" class="m-msg-actions">
@@ -317,6 +340,7 @@ import {
   saveSettings,
   uploadKnowledge
 } from './lib/backends'
+import { inlineTokens, parseMarkdown } from './lib/markdown'
 
 const settings = reactive(createInitialSettings())
 const STARTERS = [
@@ -349,7 +373,6 @@ async function loadAdminConfig() {
     const data = await requestAdminConfig(settings.backend, settings, adminToken.value)
     adminCfg.value = data.config || []
     for (const c of adminCfg.value) cfgDraft[c.key] = c.secret ? '' : c.value
-    if (!adminToken.value) localStorage.setItem('safetymind.adminToken', adminToken.value)
   } catch (e) {
     adminCfg.value = []
     if (e.message.includes('403')) showToast('尚未设置管理密码：点击下方一键生成')
@@ -538,6 +561,7 @@ async function sendMessage() {
       critical: response.escalated,
     })
     loadMonitor()
+    loadConversations()   // 新会话建立/新消息落库后，历史会话列表实时刷新（无需手动刷新页面）
   } catch (error) {
     messages.value.push({ id: createMessageId(), role: 'assistant', content: `请求失败：${error.message}\n请检查网络后重试；紧急情况请直接拨打值班电话。` })
   } finally {
@@ -638,7 +662,7 @@ async function searchKnowledge() {
     const data = await requestSearch(settings.backend, settings, searchQuery.value, 5)
     searchResults.value = data.results || []
     if (!searchResults.value.length) showToast('没有检索到相关内容')
-  } catch { showToast('检索失败，请检查连接') }
+  } catch (error) { showToast(error.message || '检索失败，请检查连接') }
   finally { busy.value = false }
 }
 
@@ -650,7 +674,7 @@ async function submitKnowledge() {
     docTitle.value = ''
     docContent.value = ''
     showToast('文档已添加，助手现在可以检索它')
-  } catch { showToast('文档导入失败') }
+  } catch (error) { showToast(error.message || '文档导入失败') }
   finally { busy.value = false }
 }
 
@@ -663,7 +687,7 @@ async function handleUpload(event) {
     await uploadKnowledge(settings.backend, settings, file)
     await loadStats()
     showToast(`${file.name} 已入库`)
-  } catch { showToast('文件导入失败（支持 txt / md / json）') }
+  } catch (error) { showToast(error.message || '文件导入失败（支持 txt / md / json）') }
   finally { busy.value = false }
 }
 
@@ -672,7 +696,7 @@ async function runEvaluation() {
   try {
     evalData.value = await requestEvaluation(settings.backend, settings)
     showToast('评测完成')
-  } catch { showToast('评测运行失败') }
+  } catch (error) { showToast(error.message || '评测运行失败') }
   finally { busy.value = false }
 }
 

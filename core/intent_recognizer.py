@@ -72,6 +72,9 @@ class IntentResult:
     reasoning:  str
     latency_ms: float
     source_scores: Dict[str, float] = field(default_factory=dict)
+    # True = 本次识别走了降级路径（LLM 失败兜底，或融合置信度低于阈值降级为 OTHER）。
+    # api/main.py 审计留痕读取此字段写入 audit_log.degraded，勿删。
+    degraded: bool = False
 
 
 # ── Few-shot 模板（同时用于 LLM 示例和 Embedding 匹配）────────────────────────
@@ -347,7 +350,7 @@ class IntentRecognizer:
             llm = await llm_task
             emb = {"intent": IntentCategory.OTHER, "confidence": 0.0}
 
-        intent, confidence, source_scores = self._vote(llm, emb, pat)
+        intent, confidence, source_scores, degraded = self._vote(llm, emb, pat)
         entities = self._extract_entities(message)
         urgency  = self._urgency(message, intent)
 
@@ -360,6 +363,7 @@ class IntentRecognizer:
             reasoning=llm.get("reasoning", ""),
             latency_ms=(time.monotonic() - t0) * 1000,
             source_scores=source_scores,
+            degraded=degraded,
         )
 
         # LRU 缓存
@@ -489,8 +493,13 @@ class IntentRecognizer:
 
     # ── 投票合并 ──────────────────────────────────────────────────────────────
 
-    def _vote(self, llm: Dict, emb: Dict, pat: Dict) -> tuple[IntentCategory, float, Dict[str, float]]:
-        """加权投票。返回最终意图、融合置信度和各路来源得分。"""
+    def _vote(self, llm: Dict, emb: Dict, pat: Dict) -> tuple[IntentCategory, float, Dict[str, float], bool]:
+        """加权投票。返回最终意图、融合置信度、各路来源得分与降级标记。
+
+        degraded=True 的两种情形：
+          1. LLM 识别失败（网络/鉴权/解析异常），靠 Embedding/关键词兜底或置 OTHER；
+          2. LLM 正常但融合置信度低于阈值，按模块约定降级为 OTHER。
+        """
         source_scores = {
             "llm": float(llm.get("confidence", 0.0) or 0.0),
             "embedding": float(emb.get("confidence", 0.0) or 0.0),
@@ -498,10 +507,10 @@ class IntentRecognizer:
         }
         if llm.get("failed"):
             if emb.get("intent") != IntentCategory.OTHER and emb.get("confidence", 0.0) > 0:
-                return emb["intent"], source_scores["embedding"], source_scores
+                return emb["intent"], source_scores["embedding"], source_scores, True
             if pat.get("intent") != IntentCategory.OTHER and pat.get("confidence", 0.0) > 0:
-                return pat["intent"], source_scores["pattern"], source_scores
-            return IntentCategory.OTHER, 0.0, source_scores
+                return pat["intent"], source_scores["pattern"], source_scores, True
+            return IntentCategory.OTHER, 0.0, source_scores, True
 
         if self._embedding_enabled:
             weights = [(llm, 0.7), (emb, 0.2), (pat, 0.1)]
@@ -519,10 +528,10 @@ class IntentRecognizer:
         pat_conf = float(pat.get("confidence", 0.0) or 0.0)
         if best in _GENERIC_INTENTS and pat_intent in _SPECIFIC_INTENTS and pat_conf >= 0.5 and best_score < 0.8:
             source_scores["refined_by_pattern"] = pat_conf
-            return pat_intent, max(best_score, pat_conf), source_scores
+            return pat_intent, max(best_score, pat_conf), source_scores, False
         if best_score < self.threshold:
-            return IntentCategory.OTHER, best_score, source_scores
-        return best, best_score, source_scores
+            return IntentCategory.OTHER, best_score, source_scores, True
+        return best, best_score, source_scores, False
 
     # ── 实体提取 ──────────────────────────────────────────────────────────────
 
