@@ -43,19 +43,21 @@
 - **手机版窗口**：双击 `mobile.pyw` —— 后端已在跑时直接弹出 390×844 手机比例窗口（无地址栏），后端未运行时自动拉起；也可用浏览器手机模式访问同一地址
 - **Web**：`start_web.bat` 或 `python -m api.main` —— 浏览器访问 `http://127.0.0.1:8000`，前端由后端同源伺服
 - **Docker**：`docker compose up -d` —— Redis + ChromaDB + Prometheus + Nginx 完整生产编排
+- **服务器实测容量**：2 核 2GiB + BGE 本地引擎，20 并发混合负载 90 秒零崩溃（对话经并发闸门排队，检索/统计毫秒级；对话吞吐受免费模型限流约束，切付费模型立解）
 - **服务器部署**：Ubuntu + systemd + Caddy 自动 HTTPS 的完整步骤见 [docs/DEPLOY.md](docs/DEPLOY.md)（2 核 2GiB 实测可行，含 swap、验收清单与备份）
 
 Vue 3 前端（`frontend/`）提供对话、技能查看/热加载、知识库统计、检索演示、评测面板、监控面板，预构建产物随仓库分发，无需 Node 环境即可运行。
 
 <p align="center">
-  <img src="docs/screenshots/overview.png" width="82%" alt="SafetyMind 对话页：快捷安全场景、路由信息与运行状态侧栏" />
+  <img src="docs/screenshots/overview.png" width="82%" alt="SafetyMind 桌面对话页：历史会话左栏、对话区、知识库右栏三栏布局" />
 </p>
 
 <p align="center">
-  <img src="docs/screenshots/knowledge.png" width="82%" alt="SafetyMind 知识库页：父子召回检索结果、文档导入与已加载 Skills" />
+  <img src="docs/screenshots/knowledge.png" width="82%" alt="SafetyMind 文档库页：上传文档、手动粘贴入库与检索测试" />
+  <img src="docs/screenshots/mobile.png" width="30%" alt="SafetyMind 手机端：移动优先布局，对话、文档库、转人工三件套" />
 </p>
 
-上图分别为**对话页**（快捷安全场景一键试用，右侧栏实时显示主 Agent、意图、置信度、路由原因与运行状态）与**知识库页**（检索演示走改写→并行召回→重排全链路，支持文档/文件导入与 Skills 热加载）。页面支持 `?view=chat|knowledge|evaluation` 深链接直达。
+上图为**桌面对话页**（三栏：历史会话 / 对话区 / 知识库右栏，检索即点即出）与**文档库页**（上传、粘贴入库、检索测试）；小图为**手机端**（同一套代码按屏宽自适应，转人工常驻底部）。页面支持 `?view=chat|knowledge|evaluation` 深链接直达。
 
 ## 运行时链路
 
@@ -169,6 +171,8 @@ docker compose up -d    # 首次启动会导入 7 篇默认安全知识库文档
 | `ADMIN_TOKEN` | 空 | 管理密码：保护审计/工单/配置等管理端点（请求头 `X-Admin-Token`）。**网络部署（`API_HOST` 非回环）必须设置，留空=管理端点锁定**；本地单人模式免密 |
 | `ACCESS_TOKEN` | 空 | 公网访问口令：设置后所有业务端点要求请求头 `X-Access-Token`（发给使用者）；留空=不启用（本地自用） |
 | `API_HOST` | `127.0.0.1`（desktop/mobile 启动器自动设置） | 监听地址；`python -m api.main` 默认 `0.0.0.0`——**网络暴露时必须配置 `ADMIN_TOKEN` 与 `ACCESS_TOKEN`** |
+| `SAFETYMIND_DEPLOYED` | 空 | 服务器反代部署标记：设 `1` 后管理端点强制鉴权（防绑定地址欺骗免密）；桌面端勿设 |
+| `CHAT_MAX_CONCURRENCY` | `4` | 对话链路并发闸门：LLM/torch 推理限流保护（20 并发压测实测保护检索端点不被饿死） |
 
 ## 项目结构
 
@@ -197,3 +201,10 @@ SafetyMind/
 ├── docs/                    # BENCHMARK.md（基准报告）+ DEPLOY.md（部署指南）
 └── docker-compose.yml       # 生产编排
 ```
+
+## 路线图
+
+- **外部工具动作**：升级自动建单（SQLite 工单 + 值班 webhook 通知）已上线；剩余为对接客户侧工单系统（REST 出站）与 DCS 实时报警订阅；
+- **更强 LLM 对照**：以强模型（v4-pro / DeepSeek 级）复测三路融合与两级终判的对照实验（免费档 flash 的对照已完成，见 BENCHMARK.md）；
+- **人工盲测回填**：盲测工具包已随仓库提供（`benchmarks/intent/blind_test/`，50 条分层样本），人工一致率待回填基准文档；
+- **HTTPS 与域名**：当前以内测形态运行（IP 直连 + 访问门），绑定域名后由 Caddy 自动签发证书（配置见 docs/DEPLOY.md）。
