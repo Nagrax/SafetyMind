@@ -138,6 +138,25 @@ async def lifespan(app: FastAPI):
     )
     logger.info(f"知识库已加载: {await kb.doc_count_async()} 个文档片段")
 
+    # 模型后台预热：意图 BGE 与知识库嵌入器是两个独立实例、各自懒加载一份模型
+    # （2 核上各 ~40s）。不预热时重启后首条消息付第一份、首条 RAG 消息再付第二份
+    # （线上实测：冷启动后第一条 43.5s、下一条非生成段 49s）。预热在后台串行进行，
+    # 不阻塞 startup；失败不影响功能（回落懒加载）。
+    async def _warm_models():
+        try:
+            if os.getenv("SAFETYMIND_BGE", "") == "1":
+                r = getattr(_orchestrator, "_intent_recognizer", None)
+                bge = getattr(r, "_bge", None) if r else None
+                if bge is not None:
+                    await bge.try_recognize("系统预热", pattern_fn=r._pattern_recognize)
+                    logger.info("预热完成：意图 BGE")
+            await kb.search_async("系统预热", top_k=1)
+            logger.info("预热完成：知识库嵌入器")
+        except Exception as ex:
+            logger.warning(f"模型预热失败（将懒加载兜底）: {ex}")
+
+    asyncio.create_task(_warm_models())
+
     def knowledge_fallback(params: Dict[str, Any], context: Optional[Dict[str, Any]], error: str):
         query = params.get("query", "")
         return [{
