@@ -179,6 +179,12 @@ async function requestJson(baseUrl, path, options = {}) {
     data = text
   }
   if (!response.ok) {
+    if (response.status === 401 && String(data && data.detail || '').includes('访问令牌')) {
+      throw new Error('需要访问令牌：请点右上角 ⚙ 设置，在"访问令牌"中填入管理员发的口令')
+    }
+    if (response.status === 401) {
+      throw new Error('管理密码无效，请重新输入')
+    }
     const detail = typeof data === 'string' ? data : JSON.stringify(data)
     throw new Error(`${response.status} ${response.statusText}: ${detail}`)
   }
