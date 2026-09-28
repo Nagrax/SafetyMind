@@ -53,6 +53,32 @@ def _infer_gate_get() -> threading.Semaphore:
     return _infer_gate
 
 
+# 进程级模型单例：同一 model_id 只加载一份。意图 BGE（core/intent_bge.py）与本嵌入器
+# 用的是同一个 bge-base——曾经各自加载一份把 2c2G 的 RSS 推到 1362MB（MemoryMax=1500M
+# 仅剩 138MB 余量，并发有 OOM-kill 风险），共享后省约 450MB 且二次加载零成本。
+_MODEL_CACHE: "OrderedDict[str, tuple]" = OrderedDict()
+_MODEL_CACHE_LOCK = threading.Lock()
+
+
+def get_shared_bge(model_id: str, device: str = "cpu"):
+    """获取（或首次加载并缓存）共享的 bge tokenizer+model。进程内幂等。"""
+    import torch
+    from transformers import AutoModel, AutoTokenizer
+    # 本机缓存优先 D:\hf_cache（存在才覆盖默认值）；xet 下载在本机会挂死，必须禁用
+    if os.path.isdir(r"D:\hf_cache"):
+        os.environ.setdefault("HF_HOME", r"D:\hf_cache")
+    os.environ.setdefault("HF_HUB_DISABLE_XET", "1")
+    _apply_torch_thread_limit()
+    with _MODEL_CACHE_LOCK:
+        if model_id not in _MODEL_CACHE:
+            tok = AutoTokenizer.from_pretrained(model_id)
+            mdl = AutoModel.from_pretrained(model_id)
+            mdl.eval()
+            mdl.to(device)
+            _MODEL_CACHE[model_id] = (tok, mdl)
+        return _MODEL_CACHE[model_id]
+
+
 class BgeEmbeddingFunction:
     """ChromaDB 兼容的 bge 嵌入函数（新式 input 签名 + embed_query 协议）。
 
@@ -64,22 +90,14 @@ class BgeEmbeddingFunction:
     def __init__(self, model_id: str = "BAAI/bge-base-zh-v1.5", device: str = "cpu",
                  max_length: int = 256, batch_size: int = 32):
         import torch
-        from transformers import AutoModel, AutoTokenizer
-        # 本机缓存优先 D:\hf_cache（存在才覆盖默认值，其他机器不受影响）；
-        # xet 下载在本机会挂死，必须禁用。防止 HF 往 C 盘用户缓存写 400MB+ 模型。
-        import os
-        if os.path.isdir(r"D:\hf_cache"):
-            os.environ.setdefault("HF_HOME", r"D:\hf_cache")
-        os.environ.setdefault("HF_HUB_DISABLE_XET", "1")
-        _apply_torch_thread_limit()
+        # 进程级共享单例（见 get_shared_bge 注释）：与意图 BGE 共用同一份权重
+        tok, mdl = get_shared_bge(model_id, device)
         self._torch = torch
         self._model_id = model_id
         self._max_length = max_length
         self._batch_size = batch_size
-        self._tokenizer = AutoTokenizer.from_pretrained(model_id)
-        self._model = AutoModel.from_pretrained(model_id)
-        self._model.eval()
-        self._model.to(device)
+        self._tokenizer = tok
+        self._model = mdl
         self._device = device
 
     def _mean_pool(self, last_hidden, mask):
