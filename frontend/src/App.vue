@@ -65,6 +65,14 @@
             <button v-if="item.requestId" class="m-action" @click="copyText(item.requestId, '上报编号已复制')">复制上报编号 {{ item.requestId }}</button>
             <span v-else class="m-action muted-note">升级已留痕</span>
           </div>
+          <div v-else-if="item.role === 'assistant' && item.requestId && !item.feedbackSent" class="m-msg-actions">
+            <span class="m-action muted-note">这条回答有帮助吗？</span>
+            <button class="m-action" :disabled="feedbackBusy" @click="sendFeedback(item, 'up')">👍</button>
+            <button class="m-action" :disabled="feedbackBusy" @click="sendFeedback(item, 'down')">👎</button>
+          </div>
+          <div v-else-if="item.role === 'assistant' && item.feedbackSent" class="m-msg-actions">
+            <span class="m-action muted-note">已记录，感谢反馈</span>
+          </div>
         </article>
 
         <div v-if="busy" class="m-msg assistant typing"><div class="m-msg-body"><span></span><span></span><span></span></div></div>
@@ -334,6 +342,7 @@ import {
   saveAdminConfig as requestSaveAdmin,
   requestKnowledgeStats,
   requestLastEval,
+  requestFeedback,
   requestMonitor,
   requestSearch,
   requestSkills,
@@ -421,6 +430,7 @@ const config = ref({ escalationPhone: '' })
 const messages = ref([])
 const draft = ref('')
 const busy = ref(false)
+const feedbackBusy = ref(false)
 const healthOk = ref(false)
 const healthLabel = ref('未检查')
 const knowledgeCount = ref('-')
@@ -711,6 +721,28 @@ async function runEvaluation() {
 function copyText(text, tip) {
   if (navigator.clipboard?.writeText) navigator.clipboard.writeText(text).then(() => showToast(tip), () => showToast(text))
   else showToast(text)
+}
+
+// 回答反馈（Skill 自进化一期的证据源）：👍/👎 即 POST /feedback，负反馈后台提炼候选
+async function sendFeedback(item, rating) {
+  if (feedbackBusy.value) return
+  feedbackBusy.value = true
+  try {
+    await requestFeedback(settings.backend, settings, {
+      request_id: item.requestId || '',
+      rating,
+      user_id: settings.userId || 'anonymous',
+      conv_id: settings.conversationId || '',
+      message_head: (messages.value[Math.max(0, messages.value.indexOf(item) - 1)]?.content || '').slice(0, 120),
+      answer_head: (item.content || '').slice(0, 200),
+    })
+    item.feedbackSent = true
+    showToast(rating === 'up' ? '感谢认可，已记录' : '已记录，会用来改进回答规则')
+  } catch (e) {
+    showToast('反馈提交失败，请稍后重试')
+  } finally {
+    feedbackBusy.value = false
+  }
 }
 
 function autoGrow(event) {
