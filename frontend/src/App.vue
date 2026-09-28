@@ -193,8 +193,8 @@
           <span>访问令牌<small>管理员发给你的口令；本机自用留空即可</small></span>
           <input v-model="accessToken" placeholder="无令牌则留空" @change="persist" />
         </label>
-        <div v-if="!adminCfg.length" class="cfg-first">
-          <button @click="loadAdminConfig">我已有管理密码，点击输入</button>
+        <div v-if="!adminCfg.length && !adminInputOpen" class="cfg-first">
+          <button @click="adminInputOpen = true">我已有管理密码，点击输入</button>
           <button @click="bootstrapAdmin">首次使用：一键生成管理密码</button>
         </div>
         <label v-else class="cfg-token">
@@ -370,12 +370,16 @@ const settingsOpen = ref(false)
 const showPw = ref(false)
 const generatedToken = ref('')
 const adminCfg = ref([])
+// 管理密码输入框显式开关：入口按钮直接开输入框，不再依赖"已加载成功"才显示
+// （历史 bug：显示条件挂在 adminCfg.length 上，密码无效时输入框永远不出现=入口死锁）
+const adminInputOpen = ref(false)
 const cfgDraft = reactive({})
 
 function openSettings() {
   historyOpen.value = false
   settingsOpen.value = true
-  loadAdminConfig()
+  // 没存过管理密码就不自动请求：普通用户打开设置页不该被 401 弹"配置加载失败"惊扰
+  if (adminToken.value) loadAdminConfig()
 }
 
 async function loadAdminConfig() {
@@ -385,9 +389,18 @@ async function loadAdminConfig() {
     for (const c of adminCfg.value) cfgDraft[c.key] = c.secret ? '' : c.value
   } catch (e) {
     adminCfg.value = []
-    if (e.message.includes('403')) showToast('尚未设置管理密码：点击下方一键生成')
-    else if (e.message.includes('401')) showToast('管理密码无效，请重新输入')
-    else showToast('配置加载失败')
+    const m = e.message || ''
+    // requestJson 已把 401 转成中文（不含"401"字样）——按内容匹配，并顺带打开输入框供重输
+    if (m.includes('管理密码无效') || m.includes('401')) {
+      showToast('管理密码无效，请重新输入')
+      adminInputOpen.value = true
+    } else if (m.includes('需要访问令牌')) {
+      showToast('需要访问令牌：请先在上方"访问令牌"填入管理员发的口令')
+    } else if (m.includes('403')) {
+      showToast('尚未设置管理密码：点击下方一键生成（仅本机可用）')
+    } else {
+      showToast('配置加载失败：' + m.slice(0, 60))
+    }
   }
 }
 
@@ -398,9 +411,13 @@ async function bootstrapAdmin() {
     generatedToken.value = r.admin_token
     adminToken.value = r.admin_token
     localStorage.setItem('safetymind.adminToken', adminToken.value)
+    adminInputOpen.value = true
     showToast('管理密码已生成，请在下方抄录保存')
   } catch (e) {
-    showToast(e.message.includes('409') ? '已配置过管理密码，请直接输入' : '生成失败')
+    const m = e.message || ''
+    if (m.includes('409')) showToast('已配置过管理密码，请直接输入')
+    else if (m.includes('403')) showToast(m.split(':').slice(1).join(':').slice(0, 80) || '本机首次使用才可一键生成；线上部署请向管理员索取口令')
+    else showToast('生成失败：' + m.slice(0, 60))
   }
   finally { busy.value = false }
 }
@@ -599,6 +616,7 @@ function forgetAdmin() {
   localStorage.removeItem('safetymind.adminToken')
   adminToken.value = ''
   adminCfg.value = []
+  adminInputOpen.value = false
   showToast('已退出管理：此浏览器不再记住管理密码')
 }
 
