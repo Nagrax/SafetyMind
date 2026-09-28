@@ -262,7 +262,7 @@ class IntentRecognizer:
         kwargs: Dict[str, Any] = {"api_key": api_key}
         if base_url:
             kwargs["base_url"] = base_url
-        self.client    = AsyncAnthropic(**kwargs)
+        self.client    = AsyncAnthropic(**kwargs, max_retries=1)
         self.model     = model
         self.threshold = confidence_threshold
         # 第三方兼容 API（如 DeepSeek）通常不支持 Embedding，禁用该策略。
