@@ -11,9 +11,6 @@ import logging
 import threading
 from typing import List, Optional
 
-import torch
-from transformers import AutoModel, AutoTokenizer
-
 logger = logging.getLogger(__name__)
 
 _state_lock = threading.Lock()
@@ -25,16 +22,21 @@ class BgeEmbeddingFunction:
     """ChromaDB 兼容的 bge 嵌入函数（新式 input 签名 + embed_query 协议）。
 
     与 core.local_embedding.LocalEmbeddingFunction 同接口，可直接互换。
+    torch/transformers 在构造时惰性导入——模块导入本身必须零重依赖，
+    否则 auto 模式"依赖缺失回退 n-gram"的承诺在 import 阶段就会失效。
     """
 
     def __init__(self, model_id: str = "BAAI/bge-base-zh-v1.5", device: str = "cpu",
                  max_length: int = 256, batch_size: int = 32):
+        import torch
+        from transformers import AutoModel, AutoTokenizer
         # 本机缓存优先 D:\hf_cache（存在才覆盖默认值，其他机器不受影响）；
         # xet 下载在本机会挂死，必须禁用。防止 HF 往 C 盘用户缓存写 400MB+ 模型。
         import os
         if os.path.isdir(r"D:\hf_cache"):
             os.environ.setdefault("HF_HOME", r"D:\hf_cache")
         os.environ.setdefault("HF_HUB_DISABLE_XET", "1")
+        self._torch = torch
         self._model_id = model_id
         self._max_length = max_length
         self._batch_size = batch_size
@@ -48,15 +50,16 @@ class BgeEmbeddingFunction:
         mask = mask.unsqueeze(-1).float()
         return (last_hidden * mask).sum(1) / mask.sum(1).clamp(min=1e-9)
 
-    @torch.no_grad()
     def _encode(self, texts: List[str]) -> List[List[float]]:
+        torch = self._torch
         outs = []
-        for i in range(0, len(texts), self._batch_size):
-            enc = self._tokenizer(texts[i:i + self._batch_size], padding=True,
-                                  truncation=True, max_length=self._max_length,
-                                  return_tensors="pt").to(self._device)
-            emb = self._mean_pool(self._model(**enc).last_hidden_state, enc["attention_mask"])
-            outs.append(torch.nn.functional.normalize(emb, dim=-1))
+        with torch.no_grad():
+            for i in range(0, len(texts), self._batch_size):
+                enc = self._tokenizer(texts[i:i + self._batch_size], padding=True,
+                                      truncation=True, max_length=self._max_length,
+                                      return_tensors="pt").to(self._device)
+                emb = self._mean_pool(self._model(**enc).last_hidden_state, enc["attention_mask"])
+                outs.append(torch.nn.functional.normalize(emb, dim=-1))
         return torch.cat(outs).tolist() if outs else []
 
     def __call__(self, input):  # noqa: A002 - chromadb 约定参数名
