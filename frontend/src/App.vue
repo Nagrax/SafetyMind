@@ -546,13 +546,14 @@ async function sendMessage() {
   draft.value = ''
   resetGrow()
   busy.value = true
-  // 等待响应期间刷新页面也不丢会话：发请求前先本地生成并持久化 conv_id，
-  // 否则响应未返回时 conversationId 尚未落 localStorage，刷新后会话失联
-  if (!settings.conversationId) {
-    settings.conversationId = crypto.randomUUID()
-    persist()
-  }
   try {
+    // 等待响应期间刷新页面也不丢会话：发请求前先本地生成并持久化 conv_id，
+    // 否则响应未返回时 conversationId 尚未落 localStorage，刷新后会话失联。
+    // 必须在 try 内：newConvId/persist 一旦抛错，finally 才能解除 busy（否则永久卡死）
+    if (!settings.conversationId) {
+      settings.conversationId = newConvId()
+      persist()
+    }
     const response = await requestChat(settings.backend, settings, content)
     if (response.conversationId && !settings.conversationId) {
       settings.conversationId = response.conversationId
@@ -742,6 +743,18 @@ function formatPercent(value) {
 function createMessageId() {
   messageSequence += 1
   return `message-${Date.now()}-${messageSequence}`
+}
+
+// conv_id 生成：crypto.randomUUID 仅安全上下文（HTTPS/localhost）可用，
+// 线上纯 HTTP+IP 部署没有该函数（实测 TypeError）——必须带 RFC4122 v4 手写兜底
+function newConvId() {
+  if (typeof crypto !== 'undefined' && typeof crypto.randomUUID === 'function') {
+    return crypto.randomUUID()
+  }
+  return 'xxxxxxxx-xxxx-4xxx-yxxx-xxxxxxxxxxxx'.replace(/[xy]/g, c => {
+    const r = (Math.random() * 16) | 0
+    return (c === 'x' ? r : (r & 0x3) | 0x8).toString(16)
+  })
 }
 
 function showToast(message) {
