@@ -39,20 +39,20 @@
           <div v-if="item.role === 'assistant'" class="m-msg-body md-body">
             <template v-for="(block, bi) in parseMarkdown(item.content)" :key="bi">
               <pre v-if="block.t === 'code'" class="md-code"><code>{{ block.lines.join('\n') }}</code></pre>
-              <component :is="'h' + block.level" v-else-if="block.t === 'h'" :class="'md-h md-h' + block.level"><template v-for="(seg, si) in inlineTokens(block.text)" :key="si"><strong v-if="seg.t === 'b'">{{ seg.v }}</strong><code v-else-if="seg.t === 'c'" class="md-inline-code">{{ seg.v }}</code><br v-else-if="seg.t === 'br'" /><template v-else>{{ seg.v }}</template></template></component>
+              <component :is="'h' + block.level" v-else-if="block.t === 'h'" :class="'md-h md-h' + block.level"><template v-for="(seg, si) in inlineTokens(block.text)" :key="si"><strong v-if="seg.t === 'b'">{{ seg.v }}</strong><code v-else-if="seg.t === 'c'" class="md-inline-code">{{ seg.v }}</code><em v-else-if="seg.t === 'i'" class="md-em">{{ seg.v }}</em><br v-else-if="seg.t === 'br'" /><template v-else>{{ seg.v }}</template></template></component>
               <hr v-else-if="block.t === 'hr'" class="md-hr" />
               <ul v-else-if="block.t === 'ul'" class="md-list">
                 <li v-for="(li, ix) in block.items" :key="ix">
-                  <template v-for="(seg, si) in inlineTokens(li)" :key="si"><strong v-if="seg.t === 'b'">{{ seg.v }}</strong><code v-else-if="seg.t === 'c'" class="md-inline-code">{{ seg.v }}</code><br v-else-if="seg.t === 'br'" /><template v-else>{{ seg.v }}</template></template>
+                  <template v-for="(seg, si) in inlineTokens(li)" :key="si"><strong v-if="seg.t === 'b'">{{ seg.v }}</strong><code v-else-if="seg.t === 'c'" class="md-inline-code">{{ seg.v }}</code><em v-else-if="seg.t === 'i'" class="md-em">{{ seg.v }}</em><br v-else-if="seg.t === 'br'" /><template v-else>{{ seg.v }}</template></template>
                 </li>
               </ul>
               <ol v-else-if="block.t === 'ol'" class="md-list">
                 <li v-for="(li, ix) in block.items" :key="ix">
-                  <template v-for="(seg, si) in inlineTokens(li)" :key="si"><strong v-if="seg.t === 'b'">{{ seg.v }}</strong><code v-else-if="seg.t === 'c'" class="md-inline-code">{{ seg.v }}</code><br v-else-if="seg.t === 'br'" /><template v-else>{{ seg.v }}</template></template>
+                  <template v-for="(seg, si) in inlineTokens(li)" :key="si"><strong v-if="seg.t === 'b'">{{ seg.v }}</strong><code v-else-if="seg.t === 'c'" class="md-inline-code">{{ seg.v }}</code><em v-else-if="seg.t === 'i'" class="md-em">{{ seg.v }}</em><br v-else-if="seg.t === 'br'" /><template v-else>{{ seg.v }}</template></template>
                 </li>
               </ol>
               <p v-else>
-                <template v-for="(seg, si) in inlineTokens(block.text)" :key="si"><strong v-if="seg.t === 'b'">{{ seg.v }}</strong><code v-else-if="seg.t === 'c'" class="md-inline-code">{{ seg.v }}</code><br v-else-if="seg.t === 'br'" /><template v-else>{{ seg.v }}</template></template>
+                <template v-for="(seg, si) in inlineTokens(block.text)" :key="si"><strong v-if="seg.t === 'b'">{{ seg.v }}</strong><code v-else-if="seg.t === 'c'" class="md-inline-code">{{ seg.v }}</code><em v-else-if="seg.t === 'i'" class="md-em">{{ seg.v }}</em><br v-else-if="seg.t === 'br'" /><template v-else>{{ seg.v }}</template></template>
               </p>
             </template>
           </div>
@@ -275,7 +275,7 @@
             <span class="status-copy" :class="healthOk ? 'success' : 'muted'">{{ healthLabel }}</span>
           </div>
           <div class="connection-endpoint"><span>接口地址</span><code>{{ currentBackend.baseUrl }}</code></div>
-          <label><span>用户 ID</span><input v-model="settings.userId" @change="persist" placeholder="u1001" /></label>
+          <label><span>用户 ID</span><input v-model="settings.userId" @change="persist" placeholder="自动生成（每浏览器唯一）" /></label>
           <label><span>会话 ID</span><input v-model="settings.conversationId" @change="persist" placeholder="自动生成" /></label>
           <div class="side-actions">
             <button @click="checkHealth">检查连接</button>

@@ -75,6 +75,9 @@ class IntentResult:
     # True = 本次识别走了降级路径（LLM 失败兜底，或融合置信度低于阈值降级为 OTHER）。
     # api/main.py 审计留痕读取此字段写入 audit_log.degraded，勿删。
     degraded: bool = False
+    # 直出路径的次优意图（exclude 首选后重融合得到）。api 层用于低置信带澄清式反问。
+    alt_intent: Optional[str] = None
+    alt_confidence: float = 0.0
 
 
 # ── Few-shot 模板（同时用于 LLM 示例和 Embedding 匹配）────────────────────────
@@ -327,6 +330,29 @@ class IntentRecognizer:
                     intent = IntentCategory(cls_name)
                 except ValueError:
                     intent = IntentCategory.OTHER
+                # 次优意图：把首选从融合分布中整体剔除后重算（probs 有 LRU 缓存，近零成本），
+                # 供 api 层低置信带澄清式反问（SAFETYMIND_CLARIFY）。
+                # 注意 fuse_with_pattern 的 exclude 只免 pattern 加分、不剔类——不能拿来算次优。
+                alt_name, alt_conf = None, 0.0
+                if self._bge is not None:
+                    try:
+                        from core.intent_bge import GENERIC_NOISE
+                        ens = self._bge.probs(message)
+                        pat = self._pattern_recognize(message)
+                        pat_cls = pat.get("intent")
+                        if hasattr(pat_cls, "value"):
+                            pat_cls = pat_cls.value
+                        score2 = {k: v for k, v in ens.items() if k != cls_name}
+                        total2 = sum(score2.values())
+                        if pat_cls and pat_cls != cls_name and pat_cls not in GENERIC_NOISE:
+                            c2 = max(0.0, min(1.0, float(pat.get("confidence", 0.0))))
+                            score2[pat_cls] = score2.get(pat_cls, 0.0) + 0.15 * c2
+                            total2 += 0.15 * c2
+                        if score2 and total2 > 0:
+                            alt_name = max(score2, key=score2.get)
+                            alt_conf = score2[alt_name] / total2
+                    except Exception:
+                        alt_name, alt_conf = None, 0.0
                 result = IntentResult(
                     intent=intent,
                     confidence=conf,
@@ -336,6 +362,8 @@ class IntentRecognizer:
                     reasoning="laya+pattern fused (direct)",
                     latency_ms=(time.monotonic() - t0) * 1000,
                     source_scores={"laya_fused": conf},
+                    alt_intent=alt_name,
+                    alt_confidence=alt_conf,
                 )
                 self._cache[key] = result
                 return result
