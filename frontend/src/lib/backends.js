@@ -162,6 +162,7 @@ function normalizeChatResponse(type, raw) {
     intentSourceScores: raw.intent_source_scores || raw.intentSourceScores || {},
     escalated: Boolean(raw.escalated),
     latencyMs: Number(raw.latency_ms ?? raw.latencyMs ?? 0),
+    totalMs: Number(raw.total_ms ?? raw.totalMs ?? 0),
     knowledgeUsed: Boolean(raw.knowledge_used ?? raw.knowledgeUsed),
     raw
   }

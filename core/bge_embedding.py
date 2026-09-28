@@ -6,9 +6,19 @@
 
 回退策略：torch/transformers 缺失或模型加载失败时返回 None，
 调用方应回退 LocalEmbeddingFunction（n-gram），保证零破坏。
+
+小核服务器保护（线上压测实测：2 核 + 多路并发推理会打满 CPU 并饿死事件循环，
+整个服务连 /health 都无响应，撤载后 30-40s 才恢复）：
+- torch 推理线程数默认 1（SAFETYMIND_TORCH_THREADS 可覆盖）；进程级全局设置，
+  同时约束知识库嵌入与意图 BGE 两条推理路径；
+- 推理并发闸门默认 1（SAFETYMIND_EMBED_MAX_CONCURRENCY）：上层 asyncio.to_thread
+  的线程扇出在闸门处串行化，宁可排队不雪崩；
+- 确定性结果 LRU 缓存：同一文本不重复推理（压测/检索测试大量重复查询）。
 """
 import logging
+import os
 import threading
+from collections import OrderedDict
 from typing import List, Optional
 
 logger = logging.getLogger(__name__)
@@ -16,6 +26,31 @@ logger = logging.getLogger(__name__)
 _state_lock = threading.Lock()
 _shared: Optional["BgeEmbeddingFunction"] = None
 _shared_tried = False
+
+# 进程级推理闸门与缓存：进程内所有 BgeEmbeddingFunction 共享（单例语义）。
+_infer_gate: Optional[threading.Semaphore] = None
+_embed_cache: "OrderedDict[tuple, list]" = OrderedDict()
+_embed_cache_lock = threading.Lock()
+_EMBED_CACHE_MAX = 1024
+
+
+def _apply_torch_thread_limit() -> None:
+    """限制 torch 进程内推理线程数（幂等；torch.set_num_threads 是进程全局的）。"""
+    try:
+        import torch
+    except Exception:
+        return
+    n = int(os.getenv("SAFETYMIND_TORCH_THREADS", "1"))
+    if n >= 1:
+        torch.set_num_threads(n)
+
+
+def _infer_gate_get() -> threading.Semaphore:
+    global _infer_gate
+    if _infer_gate is None:
+        n = max(1, int(os.getenv("SAFETYMIND_EMBED_MAX_CONCURRENCY", "1")))
+        _infer_gate = threading.Semaphore(n)
+    return _infer_gate
 
 
 class BgeEmbeddingFunction:
@@ -36,6 +71,7 @@ class BgeEmbeddingFunction:
         if os.path.isdir(r"D:\hf_cache"):
             os.environ.setdefault("HF_HOME", r"D:\hf_cache")
         os.environ.setdefault("HF_HUB_DISABLE_XET", "1")
+        _apply_torch_thread_limit()
         self._torch = torch
         self._model_id = model_id
         self._max_length = max_length
@@ -52,15 +88,29 @@ class BgeEmbeddingFunction:
 
     def _encode(self, texts: List[str]) -> List[List[float]]:
         torch = self._torch
-        outs = []
-        with torch.no_grad():
-            for i in range(0, len(texts), self._batch_size):
-                enc = self._tokenizer(texts[i:i + self._batch_size], padding=True,
-                                      truncation=True, max_length=self._max_length,
-                                      return_tensors="pt").to(self._device)
-                emb = self._mean_pool(self._model(**enc).last_hidden_state, enc["attention_mask"])
-                outs.append(torch.nn.functional.normalize(emb, dim=-1))
-        return torch.cat(outs).tolist() if outs else []
+        cache_key = (self._model_id, tuple(texts))
+        with _embed_cache_lock:
+            hit = _embed_cache.get(cache_key)
+            if hit is not None:
+                _embed_cache.move_to_end(cache_key)
+                return [list(v) for v in hit]  # 拷贝，防调用方改动污染缓存
+        gate = _infer_gate_get()
+        with gate:  # 串行/限并发推理：小核机器上并行 torch 只会互相拖死（见模块注释）
+            outs = []
+            with torch.no_grad():
+                for i in range(0, len(texts), self._batch_size):
+                    enc = self._tokenizer(texts[i:i + self._batch_size], padding=True,
+                                          truncation=True, max_length=self._max_length,
+                                          return_tensors="pt").to(self._device)
+                    emb = self._mean_pool(self._model(**enc).last_hidden_state, enc["attention_mask"])
+                    outs.append(torch.nn.functional.normalize(emb, dim=-1))
+            vectors = torch.cat(outs).tolist() if outs else []
+        with _embed_cache_lock:
+            _embed_cache[cache_key] = vectors
+            _embed_cache.move_to_end(cache_key)
+            while len(_embed_cache) > _EMBED_CACHE_MAX:
+                _embed_cache.popitem(last=False)
+        return [list(v) for v in vectors]
 
     def __call__(self, input):  # noqa: A002 - chromadb 约定参数名
         return self.embed_documents(input)

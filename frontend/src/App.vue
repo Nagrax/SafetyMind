@@ -255,7 +255,8 @@
             <span class="trace-status" :class="lastResponse ? 'has-data' : ''"></span>
           </div>
           <div v-if="lastResponse" class="trace-body">
-            <div class="latency"><span>处置耗时</span><strong>{{ lastResponse.latencyMs || '-' }}<small> ms</small></strong></div>
+            <div class="latency"><span>处置耗时</span><strong>{{ lastResponse.totalMs || lastResponse.latencyMs || '-' }}<small> ms</small></strong></div>
+            <p v-if="lastResponse.totalMs && lastResponse.latencyMs && lastResponse.totalMs > lastResponse.latencyMs * 1.5" class="routing-reason">全链路 {{ lastResponse.totalMs }}ms（含排队/意图/检索；生成 {{ lastResponse.latencyMs }}ms）</p>
             <dl class="detail-list">
               <div><dt>主 Agent</dt><dd>{{ lastResponse.primaryAgent || lastResponse.agentType || '-' }}</dd></div>
               <div><dt>意图</dt><dd>{{ lastResponse.intent || '-' }}</dd></div>
@@ -545,6 +546,12 @@ async function sendMessage() {
   draft.value = ''
   resetGrow()
   busy.value = true
+  // 等待响应期间刷新页面也不丢会话：发请求前先本地生成并持久化 conv_id，
+  // 否则响应未返回时 conversationId 尚未落 localStorage，刷新后会话失联
+  if (!settings.conversationId) {
+    settings.conversationId = crypto.randomUUID()
+    persist()
+  }
   try {
     const response = await requestChat(settings.backend, settings, content)
     if (response.conversationId && !settings.conversationId) {

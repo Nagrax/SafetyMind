@@ -243,7 +243,8 @@ class EndToEndEvaluator:
         kwargs: Dict[str, Any] = {"api_key": api_key}
         if base_url:
             kwargs["base_url"] = base_url
-        client = AsyncAnthropic(**kwargs, max_retries=1)
+        from core.llm_utils import llm_client_kwargs
+        client = AsyncAnthropic(**kwargs, **llm_client_kwargs())
 
         self._orchestrator     = orchestrator
         self._judge            = LLMJudge(client, model)
