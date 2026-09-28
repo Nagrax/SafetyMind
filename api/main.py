@@ -226,6 +226,30 @@ app.add_middleware(
 # 把毫秒级检索也饿死（压测实测 search p50 6.5s）。限制同时 4 路进对话链路，
 # 其余请求在 asyncio 层排队——LLM 是外部瓶颈，排队比雪崩好。
 _CHAT_GATE = asyncio.Semaphore(int(os.getenv("CHAT_MAX_CONCURRENCY", "4")))
+# 排队上限：闸门满时最多再等这么久。LLM 客户端已统一 60s 超时（llm_client_kwargs），
+# 单路最长可预期；但线上压测实测无上限排队会把客户端拖到 180s+ 才断。
+# 超时回 429 让前端提示稍后重试，比无限挂死体面。设 0 = 关闭（恢复旧行为）。
+_CHAT_QUEUE_TIMEOUT = float(os.getenv("CHAT_QUEUE_TIMEOUT_S", "180"))
+
+# ── 检索链路闸门：/search 与 /search/direct 各含本地 BGE 推理（CPU 密集），
+# 线上压测实测 2 路并发即可在 2 核机器上把事件循环饿死（连 /health 都无响应，
+# 撤载后 30-40s 才恢复）。闸门内限流，闸门外排队，超时回 429。
+_SEARCH_GATE = asyncio.Semaphore(int(os.getenv("SEARCH_MAX_CONCURRENCY", "2")))
+_SEARCH_QUEUE_TIMEOUT = float(os.getenv("SEARCH_QUEUE_TIMEOUT_S", "60"))
+
+
+async def _acquire_with_timeout(gate: asyncio.Semaphore, timeout_s: float, what: str) -> bool:
+    """带排队上限的闸门获取：超时抛 429（Retry-After 5s）。timeout_s<=0 时无限等待。"""
+    if timeout_s <= 0:
+        await gate.acquire()
+        return True
+    try:
+        await asyncio.wait_for(gate.acquire(), timeout=timeout_s)
+        return True
+    except asyncio.TimeoutError:
+        raise HTTPException(
+            429, f"{what}当前繁忙，请稍后重试（排队超时 {timeout_s:.0f}s）",
+            headers={"Retry-After": "5"})
 
 # ── 公网访问门（可选）：.env 设置 ACCESS_TOKEN 后，业务端点要求 X-Access-Token 头。
 #    公开项：前端静态资源、健康检查、用户端配置、API 文档。
@@ -275,6 +299,7 @@ class ChatResponse(BaseModel):
     routing_confidence: float = 0.0
     escalated:   bool
     latency_ms:  float
+    total_ms:    float = 0.0   # 全链路耗时（排队+记忆+意图+RAG+生成）；0=旧版后端未上报
     knowledge_used: bool = False
     entities: Dict[str, List[str]] = Field(default_factory=dict)
     intent_confidence: float = 0.0
@@ -489,11 +514,15 @@ async def chat(req: ChatRequest):
 
     # 对话链路并发闸门：意图+生成全程持锁（记忆读取在内，
     # 20 并发下后到者在 asyncio 层排队，保护检索/统计等轻端点不被 CPU 饿死）
-    async with _CHAT_GATE:
-        return await _chat_core(req, conv_id, OrcReq, MsgRole)
+    await _acquire_with_timeout(_CHAT_GATE, _CHAT_QUEUE_TIMEOUT, "对话")
+    t_start = time.perf_counter()
+    try:
+        return await _chat_core(req, conv_id, OrcReq, MsgRole, t_start)
+    finally:
+        _CHAT_GATE.release()
 
 
-async def _chat_core(req, conv_id: str, OrcReq, MsgRole):
+async def _chat_core(req, conv_id: str, OrcReq, MsgRole, t_start: float):
     # 1. 读取记忆上下文
     mem_ctx = await _memory.get_context(req.user_id, conv_id, query=req.message)
 
@@ -596,6 +625,9 @@ async def _chat_core(req, conv_id: str, OrcReq, MsgRole):
         routing_confidence=result.routing_confidence,
         escalated=result.escalated,
         latency_ms=round(result.latency_ms, 1),
+        # 全链路耗时（含排队/记忆/意图/RAG；latency_ms 只覆盖 orchestrator.run，
+        # 线上实测两者可差 3-4 倍，监控与前端都需要真实总耗时）
+        total_ms=round((time.perf_counter() - t_start) * 1000, 1),
         knowledge_used=knowledge_used,
         entities=intent_result.entities,
         intent_confidence=round(intent_result.confidence, 4),
@@ -608,20 +640,26 @@ async def _build_knowledge_context(message: str, intent=None, top_k: int = 3) ->
     """
     为 /chat 主链路构建 RAG 知识上下文。
 
-    这里复用 MCPToolManager 的查询改写、并行召回、重排、fallback 能力。
+    直连 kb.search_async（bge 嵌入+余弦，实测几十毫秒）：/chat 每多一跳 LLM 都是秒级
+    （限流下单次改写链路可达半分钟），主链路跳过查询改写与 LLM 重排两跳；
+    完整改写链路保留给 /search 演示端点。
     """
     if _tool_manager is None:
         return "", False
     if not _should_use_knowledge(message, intent=intent):
         return "", False
     try:
-        result = await _tool_manager.search_with_rewrite("knowledge_search", message, top_k=top_k)
-        if not result.success or not isinstance(result.data, list) or not result.data:
+        tool = _tool_manager._tools.get("knowledge_search")
+        if tool is None:
+            return "", False
+        kb = tool.handler.__self__
+        result = await kb.search_async(message, top_k=top_k)
+        if not isinstance(result, list) or not result:
             return "", False
 
         parts = ["[知识库检索结果]"]
         used = False
-        for i, item in enumerate(result.data[:top_k], start=1):
+        for i, item in enumerate(result[:top_k], start=1):
             if not isinstance(item, dict):
                 continue
             title = str(item.get("title", "未命名文档"))
@@ -692,7 +730,11 @@ async def search(query: str, top_k: int = 5):
     """
     if _tool_manager is None:
         raise HTTPException(503, "服务未就绪")
-    result = await _tool_manager.search_with_rewrite("knowledge_search", query, top_k=top_k)
+    await _acquire_with_timeout(_SEARCH_GATE, _SEARCH_QUEUE_TIMEOUT, "检索")
+    try:
+        result = await _tool_manager.search_with_rewrite("knowledge_search", query, top_k=top_k)
+    finally:
+        _SEARCH_GATE.release()
     return {"query": query, "results": result.data, "reranked": result.reranked}
 
 
@@ -708,7 +750,11 @@ async def search_direct(query: str, top_k: int = 5):
     if tool is None:
         raise HTTPException(503, "知识库未初始化")
     kb = tool.handler.__self__
-    results = await kb.search_async(query, top_k=top_k)
+    await _acquire_with_timeout(_SEARCH_GATE, _SEARCH_QUEUE_TIMEOUT, "检索")
+    try:
+        results = await kb.search_async(query, top_k=top_k)
+    finally:
+        _SEARCH_GATE.release()
     return {"query": query, "results": results, "reranked": False}
 
 

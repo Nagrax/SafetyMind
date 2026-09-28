@@ -3,6 +3,8 @@
 # 环境开关: SAFETYMIND_BGE=1（默认 off）；SAFETYMIND_BGE_LARGE=1 加载 large 并与 base 0.5/0.5 集成
 import os
 import math
+import threading
+from collections import OrderedDict
 from typing import Callable, Dict, Optional, Tuple
 
 INSTR = ""  # 实测指令前缀有害（dev 82.5 vs 82.9）
@@ -144,6 +146,8 @@ class BGEProtoClassifier:
         os.environ.setdefault("HF_HOME", r"D:\hf_cache")
         import torch
         from transformers import AutoTokenizer, AutoModel
+        from core.bge_embedding import _apply_torch_thread_limit
+        _apply_torch_thread_limit()  # 小核机器并发推理保护（与知识库嵌入同一全局限制）
         from core.intent_recognizer import _TEMPLATES, IntentCategory
         from core.laya_recognizer import ZH_KEY, ZH_SHORT
         bank = build_bank(IntentCategory, _TEMPLATES, ZH_KEY, ZH_SHORT, self._definitions())
@@ -206,8 +210,28 @@ class BGEProtoClassifier:
                 outs.append(torch.nn.functional.normalize(emb, dim=-1))
         return torch.cat(outs)
 
+    # 意图推理串行闸门 + 消息级缓存：try_recognize 在 to_thread 线程里被并发调用，
+    # 多路 torch 推理在小核机器上互相拖死（线上压测实测），串行化后宁可排队。
+    _probs_lock = threading.Lock()
+    _probs_cache: "OrderedDict[str, Dict[str, float]]" = OrderedDict()
+    _PROBS_CACHE_MAX = 512
+
     def probs(self, message: str) -> Dict[str, float]:
         """集成概率 {intent_value: prob}。"""
+        with self._probs_lock:
+            hit = self._probs_cache.get(message)
+            if hit is not None:
+                self._probs_cache.move_to_end(message)
+                return dict(hit)
+        with self._probs_lock:
+            ens = self._probs_uncached(message)
+            self._probs_cache[message] = ens
+            self._probs_cache.move_to_end(message)
+            while len(self._probs_cache) > self._PROBS_CACHE_MAX:
+                self._probs_cache.popitem(last=False)
+        return dict(ens)
+
+    def _probs_uncached(self, message: str) -> Dict[str, float]:
         models = self._get_models()
         if not models:
             return {}  # 引擎不可用：返回空概率而非 None，交由调用方降级
