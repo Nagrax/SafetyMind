@@ -222,6 +222,11 @@ app.add_middleware(
 )
 
 
+# 对话链路并发闸门：免费 LLM + 2 核 torch 推理下，20 路并发对话会吃满 CPU
+# 把毫秒级检索也饿死（压测实测 search p50 6.5s）。限制同时 4 路进对话链路，
+# 其余请求在 asyncio 层排队——LLM 是外部瓶颈，排队比雪崩好。
+_CHAT_GATE = asyncio.Semaphore(int(os.getenv("CHAT_MAX_CONCURRENCY", "4")))
+
 # ── 公网访问门（可选）：.env 设置 ACCESS_TOKEN 后，业务端点要求 X-Access-Token 头。
 #    公开项：前端静态资源、健康检查、用户端配置、API 文档。
 #    管理端点另有 ADMIN_TOKEN 双重门。留空 = 不启用（本地单人形态）。
@@ -482,6 +487,13 @@ async def chat(req: ChatRequest):
 
     conv_id = req.conv_id or str(uuid.uuid4())
 
+    # 对话链路并发闸门：意图+生成全程持锁（记忆读取在内，
+    # 20 并发下后到者在 asyncio 层排队，保护检索/统计等轻端点不被 CPU 饿死）
+    async with _CHAT_GATE:
+        return await _chat_core(req, conv_id, OrcReq, MsgRole)
+
+
+async def _chat_core(req, conv_id: str, OrcReq, MsgRole):
     # 1. 读取记忆上下文
     mem_ctx = await _memory.get_context(req.user_id, conv_id, query=req.message)
 
