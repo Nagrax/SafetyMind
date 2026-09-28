@@ -313,9 +313,13 @@ async def delete_conversation(conv_id: str, user_id: str = "anonymous"):
 
 # ── 审计 / 升级 / 工单（管理端点）────────────────────────────────────────────
 def _admin_auth_required() -> bool:
-    """管理密码只保护一种场景：服务以网络形态部署、可能有多人访问。
-    本地单人形态（回环监听）永远免密——这是对"本机自用无需密码"承诺的兑现；
-    此前"设了 ADMIN_TOKEN 本地也要输"的规则会造成 bootstrap 与输入互相堵死的死锁，已废弃。"""
+    """管理密码何时必须：
+    - .env 显式设 SAFETYMIND_DEPLOYED=1（服务器反代部署）→ 必须，即使 uvicorn 只绑回环
+      （公网经反代可达，鉴权判定不能被绑定地址欺骗）；
+    - 否则按 API_HOST 判定：非回环 = 网络暴露 = 必须；回环（桌面/手机窗口）= 免密，
+      兑现"本机自用无需密码"，也避免 bootstrap 与输入互相堵死的死锁。"""
+    if os.getenv("SAFETYMIND_DEPLOYED", "").strip() == "1":
+        return True
     host = os.getenv("API_HOST", "0.0.0.0").strip().lower()  # 与 uvicorn 绑定默认值一致：未声明视为网络暴露
     return host not in ("127.0.0.1", "localhost", "::1")
 
