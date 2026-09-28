@@ -194,7 +194,7 @@ class MemoryManager:
         kwargs: Dict[str, Any] = {"api_key": api_key}
         if base_url:
             kwargs["base_url"] = base_url
-        self._client = AsyncAnthropic(**kwargs)
+        self._client = AsyncAnthropic(**kwargs, max_retries=1)  # 免费模型 529 限流时快速失败，避免重试风暴拖长延迟
         self._model  = model
 
         self._redis = redis.from_url(redis_url, decode_responses=True)
