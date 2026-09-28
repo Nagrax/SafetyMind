@@ -407,8 +407,9 @@ async def admin_config_bootstrap():
     """首次设置：ADMIN_TOKEN 未配置时一键生成管理密码（仅未配置时可用，先到先得）。
     已配置后此端点永久失效——改密码必须凭现有密码走 /config/admin。"""
     from core.env_config import EnvConfigManager
+    _deployed = os.getenv("SAFETYMIND_DEPLOYED", "").strip() == "1"
     _h = os.getenv("API_HOST", "0.0.0.0").strip().lower()
-    if _h not in ("127.0.0.1", "localhost", "::1"):
+    if _deployed or _h not in ("127.0.0.1", "localhost", "::1"):
         raise HTTPException(403, "网络部署形态禁止远程 bootstrap：请管理员在服务器 .env 预设 ADMIN_TOKEN 后重启")
     if os.getenv("ADMIN_TOKEN", "").strip():
         raise HTTPException(409, "管理密码已配置；修改需凭现有密码在设置页操作")
