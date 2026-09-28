@@ -1339,6 +1339,19 @@ button:disabled { opacity: 0.5; cursor: not-allowed; }
 .pw-eye { min-width: 34px !important; }
 .pw-logout { color: var(--text-3) !important; }
 
+/* 手机 ≤480px 设置面板适配：
+   1) 管理密码行两段式（输入+眼睛一行，操作按钮另起一行）——修复"重新加载"被挤成竖排三字、
+      pw-logout 溢出 415px 的布局破坏；
+   2) 输入控件 16px——低于 16px 时 iOS 聚焦会强制放大页面（经典移动坑）。 */
+@media (max-width: 480px) {
+  .cfg-sheet input, .cfg-sheet select { font-size: 16px; }
+  .cfg-token { flex-wrap: wrap; }
+  .cfg-token input { flex: 1 1 100%; }
+  .cfg-token .pw-eye, .cfg-token button { flex: none; }
+  .cfg-token button { padding: 9px 12px; font-size: 13px; }
+  .cfg-generated button { font-size: 14px; }
+}
+
 /* 桌面端：设置从"底部长条"变为居中紧凑卡片，表单双列压短高度 */
 .cfg-first { display: flex; flex-direction: column; gap: 8px; }
 .cfg-first button {
