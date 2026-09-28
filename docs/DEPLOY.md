@@ -47,6 +47,7 @@ cp .env.example .env && nano .env
 | `ESCALATION_PHONE` / `ESCALATION_WEBHOOK_URL` | 值班电话 / 值班群机器人 |
 | `HF_HOME` | 指向数据盘目录，如 `/opt/safetymind/hf_cache` |
 | `API_HOST` | 保持 `127.0.0.1`（由 Caddy 对外；**不要**改成 0.0.0.0 绕过反代） |
+| `SAFETYMIND_DEPLOYED` | **必须设 `1`**：反代部署标记，管理端点强制鉴权（防止绑定地址被误判为本地而免密暴露） |
 
 ## 4. systemd 守护
 

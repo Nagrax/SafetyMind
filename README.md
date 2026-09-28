@@ -174,28 +174,26 @@ docker compose up -d    # 首次启动会导入 7 篇默认安全知识库文档
 
 ```
 SafetyMind/
-├── desktop.pyw              # 桌面启动器（pywebview 原生窗口）
+├── desktop.pyw              # 桌面启动器（pywebview 原生窗口，单实例锁 + 启动日志 + 90s 保底）
+├── mobile.pyw               # 手机版启动器（390×844 窗口，复用 desktop 自举）
 ├── start_web.bat            # Web 一键启动
-├── api/main.py              # FastAPI 入口（同源伺服前端 + API 别名）
-├── core/                    # 意图识别 / Skill 加载器
-├── agents/                  # 4 Agent + 编排路由
-├── memory/                  # 三级记忆（含桌面降级）
+├── api/main.py              # FastAPI 入口（同源伺服前端 + API 别名 + 访问门/并发闸门）
+├── core/                    # 意图识别（BGE 原型分类器/laya）/ Skill 加载器
+│   ├── audit_store.py       # 审计/升级/工单（SQLite，升级自动建单）
+│   ├── chroma_utils.py      # chroma 本地库损坏自愈（归档重建）
+│   ├── env_config.py        # .env 白名单可视化配置（掩码/原子写）
+│   └── bge_embedding.py     # BGE 语义嵌入（惰性导入，缺失回退 n-gram）
+├── agents/                  # 4 Agent + 编排路由（CRITICAL 模板化应急）
+├── memory/                  # 三级记忆 + conversation_store.py（会话历史持久化）
 ├── mcp/                     # 工具治理（熔断/缓存/改写/重排）+ RAG 知识库
 ├── evaluation/              # 意图 F1 + LLM-as-Judge + 回归
 ├── monitor/                 # Prometheus + 异常检测 + 路由反馈
 ├── skills/                  # 3 篇安全处置 SOP（SKILL.md，热加载）
-├── frontend/                # Vue 3 前端（src + 预构建 dist）
+├── frontend/                # Vue 3 前端（移动优先 + 桌面三栏，预构建 dist）
 ├── config/                  # Nginx / Prometheus
+├── deploy/                  # 服务器部署工程件（systemd unit + Caddyfile）
 ├── benchmarks/intent/       # 意图基准（2453 条数据集 + 复现脚本 + 盲测工具包）
-├── tests/test_adversarial.py # 对抗/降级场景门禁（LLM 死端点 / 本地引擎失败 / 记忆持久化）
-├── tests/test_frontend_endpoints.py # 前端-后端接线测试（关键端点真实可用）
-├── docs/BENCHMARK.md        # 基准完整报告（方法/主结果/负结果/延迟）
+├── tests/                   # 7 个测试套件（单测×2 / 对抗 / 前端接线 / 审计工单 / 配置管理 / 访问门）
+├── docs/                    # BENCHMARK.md（基准报告）+ DEPLOY.md（部署指南）
 └── docker-compose.yml       # 生产编排
 ```
-
-## 路线图
-
-- **外部工具动作**：工单创建、DCS 实时报警订阅、作业票状态查询——需要对接客户侧系统，当前升级流为接待 + 标志位；
-- **更强 LLM 对照**：以强模型（v4-pro / DeepSeek 级）复测三路融合与两级终判的对照实验（免费档 flash 的对照已完成，见 BENCHMARK.md）；
-- **人工盲测回填**：盲测工具包已随仓库提供（`benchmarks/intent/blind_test/`，50 条分层样本），人工一致率待回填基准文档；
-- **RAG 嵌入升级**：嵌入式模式已默认启用 BGE 语义嵌入（检索命中 7/7 vs n-gram 4/7，见 BENCHMARK.md），服务器模式与更大规模语料的验证待做。
