@@ -1553,11 +1553,14 @@ button:disabled { opacity: 0.5; cursor: not-allowed; }
 /* 手机窄屏（≤480px）顶栏精简：品牌名与"文档库"文字收起（图标仍可点），
    根治 390px 视口下顶栏 435px 溢出导致的横向滚动 */
 @media (max-width: 480px) {
-  .m-brand > span:last-child { display: none; }
+  /* 品牌名保留（用户要求突出系统标识）：图标化"文档库"文字 + 收紧间距即可容纳，
+     实测 390px 视口零溢出 */
   .m-lib-btn > span:last-child { display: none; }
   .m-lib-btn { padding: 0 11px; }
-  .m-header { padding: 10px 10px; padding-top: calc(10px + env(safe-area-inset-top, 0px)); }
-  .m-header-right { gap: 7px; }
+  .m-brand { font-size: 14.5px; gap: 7px; }
+  .m-logo { width: 25px; height: 25px; font-size: 13px; }
+  .m-header { padding: 9px 10px; padding-top: calc(9px + env(safe-area-inset-top, 0px)); }
+  .m-header-right { gap: 6px; }
   .m-quick { padding: 8px 10px 2px; }
 }
 
