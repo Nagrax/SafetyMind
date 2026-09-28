@@ -55,15 +55,18 @@ export function parseMarkdown(text) {
   return blocks
 }
 
-// 行内解析：**加粗** / `行内代码`，换行输出 br 占位 token。
-// 返回 [{t:'b'|'c'|'br'|'text', v?}]，文本一律交由 {{ }} 插值转义。
+// 行内解析：**加粗** / `行内代码` / *斜体*，换行输出 br 占位 token。
+// 斜体内容不允许以空格开头/结尾（避免误吞 "2 * 3" 类文本；加粗分支在前，** 不受影响）。
+// 返回 [{t:'b'|'c'|'i'|'br'|'text', v?}]，文本一律交由 {{ }} 插值转义。
 function lineTokens(text) {
   const tokens = []
-  const re = /\*\*([^*]+)\*\*|`([^`]+)`/g
+  const re = /\*\*([^*]+)\*\*|`([^`]+)`|\*(\S(?:[^*]*\S)?)\*/g
   let last = 0, m
   while ((m = re.exec(text))) {
     if (m.index > last) tokens.push({ t: 'text', v: text.slice(last, m.index) })
-    tokens.push(m[1] !== undefined ? { t: 'b', v: m[1] } : { t: 'c', v: m[2] })
+    if (m[1] !== undefined) tokens.push({ t: 'b', v: m[1] })
+    else if (m[2] !== undefined) tokens.push({ t: 'c', v: m[2] })
+    else tokens.push({ t: 'i', v: m[3] })
     last = m.index + m[0].length
   }
   if (last < text.length) tokens.push({ t: 'text', v: text.slice(last) })

@@ -534,6 +534,78 @@ async def _chat_core(req, conv_id: str, OrcReq, MsgRole, t_start: float):
 
     intent_result = await _orchestrator.recognize_intent(req.message, history=history)
 
+    # 澄清式反问（SAFETYMIND_CLARIFY，默认开）：BGE 直出落在低置信带 [tau, 上限) 时，
+    # 该带实测判对率仅 77-87%（test 全量分带统计），用一个本地模板反问替代可能答非所问的
+    # 完整生成。次轮用户重述/选边后重走识别（重述通常置信度升高直达；简答 A/B 时因置信
+    # 不足落入 LLM 链且带 history，可正确解析）。紧急消息与交互类意图永不反问。
+    _CLARIFY_SPECIFIC = {
+        "equipment_alarm", "equipment_maintenance", "hazard_report",
+        "hazard_inspection", "incident_report", "emergency_response",
+        "work_permit", "regulation_query", "chemical_safety", "training_cert",
+        "inspection_audit", "occupational_health", "ppe_inquiry", "safety_document",
+    }
+    _clarify_on = os.getenv("SAFETYMIND_CLARIFY", "1") == "1"
+    _clarify_hi = float(os.getenv("SAFETYMIND_CLARIFY_MAX_CONF", "0.55"))
+    _tau_now = float(os.getenv("SAFETYMIND_BGE_TAU", "0.80"))
+    from core.intent_recognizer import UrgencyLevel as _UL
+    if (
+        _clarify_on
+        and intent_result.source_scores.get("laya_fused")
+        and _tau_now <= intent_result.confidence < _clarify_hi
+        and intent_result.urgency != _UL.CRITICAL
+        and intent_result.intent.value in _CLARIFY_SPECIFIC
+        and (intent_result.alt_intent or "") in _CLARIFY_SPECIFIC
+        and intent_result.alt_confidence >= 0.30
+    ):
+        from core.laya_recognizer import ZH_KEY
+        _v2zh = {v: k for k, v in ZH_KEY.items()}
+        a_zh = _v2zh.get(intent_result.intent.value, intent_result.intent.value)
+        b_zh = _v2zh.get(intent_result.alt_intent, intent_result.alt_intent)
+        clarify_text = (
+            f"您的问题可能涉及两类场景，为了答复准确请确认：\n\n"
+            f"**A. {a_zh}** —— 关于「{req.message[:30]}」按 {a_zh} 处理流程回答；\n"
+            f"**B. {b_zh}** —— 按 {b_zh} 的要求与规范回答。\n\n"
+            f"回复 A 或 B，或直接补充一句说明（例如具体场所/作业/环节）。"
+        )
+        _rid = f"clr-{uuid.uuid4().hex[:12]}"
+        await _memory.add_message(req.user_id, conv_id, MsgRole.USER, req.message)
+        await _memory.add_message(req.user_id, conv_id, MsgRole.ASSISTANT, clarify_text)
+        if _conv_store is not None:
+            try:
+                _conv_store.append_message(req.user_id, conv_id, "user", req.message)
+                _conv_store.append_message(req.user_id, conv_id, "assistant", clarify_text)
+            except Exception as ex:
+                logger.warning(f"澄清轮会话落盘失败: {ex}")
+        if _audit is not None:
+            try:
+                _audit.audit_request(_rid, req.user_id, conv_id, req.message,
+                                     intent_result.intent.value, intent_result.urgency.value,
+                                     False, (time.perf_counter() - t_start) * 1000,
+                                     degraded=False, knowledge_used=False)
+            except Exception as ex:
+                logger.warning(f"澄清轮审计留痕失败: {ex}")
+        return ChatResponse(
+            conv_id=conv_id,
+            response=clarify_text,
+            intent=intent_result.intent.value,
+            intent_group=intent_result.intent_group,
+            agent_type="general",
+            agent_types=["general"],
+            primary_agent="general",
+            supporting_agents=[],
+            routing_reason=f"意图歧义澄清（置信 {intent_result.confidence:.2f}，次选 {intent_result.alt_intent} {intent_result.alt_confidence:.2f}）",
+            routing_confidence=intent_result.confidence,
+            escalated=False,
+            latency_ms=round((time.perf_counter() - t_start) * 1000, 1),
+            total_ms=round((time.perf_counter() - t_start) * 1000, 1),
+            knowledge_used=False,
+            entities=intent_result.entities,
+            intent_confidence=round(intent_result.confidence, 4),
+            intent_source_scores={**intent_result.source_scores,
+                                  "clarify_alt": intent_result.alt_confidence},
+            request_id=_rid,
+        )
+
     # RAG 门控（意图级 + 紧急度级）：寒暄/反馈/转人工/无关意图不检索；
     # CRITICAL 且应急模板开启时同样跳过 RAG——模板不使用知识库。
     # 注意与 SAFETYMIND_CRITICAL_TEMPLATE 联动：模板关闭时紧急消息仍需 RAG 上下文走 LLM。

@@ -7,11 +7,21 @@ const DEFAULT_BACKENDS = {
   }
 }
 
+// 每浏览器唯一匿名身份：绝不共享默认值（曾因全体默认 u1001 导致内测用户互相看到彼此会话）。
+// crypto.randomUUID 仅安全上下文可用（线上纯 HTTP 部署没有），必须带兜底。
+function newUserId() {
+  if (typeof crypto !== 'undefined' && typeof crypto.randomUUID === 'function') {
+    return 'u-' + crypto.randomUUID().slice(0, 8)
+  }
+  return 'u-' + 'xxxxxxxx'.replace(/x/g, () => ((Math.random() * 16) | 0).toString(16))
+}
+
 export function createInitialSettings() {
   const saved = readSettings()
   return {
     backend: 'python',
-    userId: saved.userId || 'u1001',
+    // 已保存的（含遗留的 u1001）不动——保留老浏览器的历史归属；只有"从未设置过"才生成唯一 ID
+    userId: saved.userId || newUserId(),
     conversationId: saved.conversationId || '',
     endpoints: {
       python: saved.endpoints?.python || DEFAULT_BACKENDS.python.baseUrl
