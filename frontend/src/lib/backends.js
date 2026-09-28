@@ -90,6 +90,14 @@ export async function requestSkills(type, settings) {
   return requestJson(backendMeta(type, settings).baseUrl, '/skills')
 }
 
+export async function requestFeedback(type, settings, payload) {
+  return requestJson(backendMeta(type, settings).baseUrl, '/feedback', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify(payload)
+  })
+}
+
 export async function reloadSkills(type, settings) {
   return requestJson(backendMeta(type, settings).baseUrl, '/skills/reload', { method: 'POST' })
 }

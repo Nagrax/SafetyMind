@@ -47,6 +47,7 @@ _tool_manager = None
 _monitor      = None
 _evaluator    = None
 _skill_manager = None
+_skill_evolution = None
 _conv_store   = None
 _audit        = None
 
@@ -66,7 +67,7 @@ def _anthropic_cfg() -> Dict[str, Any]:
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    global _orchestrator, _memory, _tool_manager, _monitor, _evaluator, _skill_manager, _conv_store, _audit
+    global _orchestrator, _memory, _tool_manager, _monitor, _evaluator, _skill_manager, _conv_store, _audit, _skill_evolution
 
     print(BANNER, flush=True)
 
@@ -98,6 +99,11 @@ async def lifespan(app: FastAPI):
         max_prompt_chars=int(os.getenv("SAFETYMIND_SKILLS_MAX_PROMPT_CHARS", "5000")),
     )
     _skill_manager.load()
+
+    # Skill 自进化一期：反馈采集 → 候选抽取 → 人工审批落盘（core/skill_evolution.py）
+    from core.skill_evolution import SkillEvolution
+    _skill_evolution = SkillEvolution(skills_root=skills_dir)
+    logger.info(f"Skill 自进化已启用: 反馈={_skill_evolution.feedback_path}")
 
     # Agent 编排器
     _orchestrator = AgentOrchestrator(
@@ -496,6 +502,76 @@ async def reload_skills():
     if _orchestrator is not None:
         _orchestrator.set_skill_manager(_skill_manager)
     return _skill_manager.summary()
+
+
+class FeedbackRequest(BaseModel):
+    """用户对回答的反馈（👍/👎/评语）。负反馈或带评语时后台提炼 skill 候选。"""
+    request_id: str
+    rating: str                      # "up" | "down"
+    comment: str = ""
+    user_id: str = ""
+    conv_id: str = ""
+    message_head: str = ""
+    answer_head: str = ""
+
+
+@app.post("/feedback", tags=["Skills"])
+async def submit_feedback(fb: FeedbackRequest):
+    """记录用户反馈；负反馈/评语触发后台候选抽取（不阻塞响应，SAFETYMIND_SKILL_EVOLUTION=0 关闭）。"""
+    if _skill_evolution is None:
+        raise HTTPException(503, "Skill 自进化未初始化")
+    if fb.rating not in ("up", "down"):
+        raise HTTPException(422, "rating 必须是 up/down")
+    rec = _skill_evolution.record_feedback(
+        request_id=fb.request_id, rating=fb.rating, comment=fb.comment,
+        user_id=fb.user_id, conv_id=fb.conv_id,
+        message_head=fb.message_head, answer_head=fb.answer_head)
+    if fb.rating == "down" or fb.comment.strip():
+        from core.skill_evolution import spawn_extraction
+        skills_meta = [{
+            "name": s.name, "keywords": s.keywords,
+            "content": s.content, "path": s.path,
+        } for s in _skill_manager.skills] if _skill_manager else []
+        spawn_extraction(_skill_evolution, rec, skills_meta,
+                         api_key=os.getenv("ANTHROPIC_API_KEY", ""),
+                         base_url=os.getenv("ANTHROPIC_BASE_URL", ""),
+                         model=os.getenv("ANTHROPIC_MODEL", "glm-4.7-flash"))
+    return {"ok": True, "recorded": True}
+
+
+@app.get("/skills/candidates", tags=["Skills"])
+async def list_skill_candidates(status: str = "pending", _: None = Depends(require_admin)):
+    """Skill 自进化候选清单（管理端点，X-Admin-Token）。status=all 看全部。"""
+    if _skill_evolution is None:
+        raise HTTPException(503, "Skill 自进化未初始化")
+    return {"candidates": _skill_evolution.list_candidates(
+        None if status == "all" else status)}
+
+
+@app.post("/skills/candidates/{cand_id}/approve", tags=["Skills"])
+async def approve_skill_candidate(cand_id: str, _: None = Depends(require_admin)):
+    """批准候选：add=新建 skills/evolved_*/SKILL.md；merge=追加修订段（先存快照）。落盘后自动热加载。"""
+    if _skill_evolution is None:
+        raise HTTPException(503, "Skill 自进化未初始化")
+    result = _skill_evolution.approve(cand_id)
+    if not result.get("ok"):
+        raise HTTPException(404, result.get("error", "审批失败"))
+    _skill_manager.reload()
+    if _orchestrator is not None:
+        _orchestrator.set_skill_manager(_skill_manager)
+    return {"ok": True, "written": result.get("written"),
+            "skills_count": len(_skill_manager.skills)}
+
+
+@app.post("/skills/candidates/{cand_id}/reject", tags=["Skills"])
+async def reject_skill_candidate(cand_id: str, _: None = Depends(require_admin)):
+    """拒绝候选（记录在案，反馈不删）。"""
+    if _skill_evolution is None:
+        raise HTTPException(503, "Skill 自进化未初始化")
+    result = _skill_evolution.reject(cand_id)
+    if not result.get("ok"):
+        raise HTTPException(404, "候选不存在或已处理")
+    return {"ok": True}
 
 
 @app.post("/chat", response_model=ChatResponse)
