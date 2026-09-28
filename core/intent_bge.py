@@ -145,8 +145,7 @@ class BGEProtoClassifier:
         os.environ.setdefault("HF_ENDPOINT", "https://hf-mirror.com")
         os.environ.setdefault("HF_HOME", r"D:\hf_cache")
         import torch
-        from transformers import AutoTokenizer, AutoModel
-        from core.bge_embedding import _apply_torch_thread_limit
+        from core.bge_embedding import _apply_torch_thread_limit, get_shared_bge
         _apply_torch_thread_limit()  # 小核机器并发推理保护（与知识库嵌入同一全局限制）
         from core.intent_recognizer import _TEMPLATES, IntentCategory
         from core.laya_recognizer import ZH_KEY, ZH_SHORT
@@ -156,8 +155,8 @@ class BGEProtoClassifier:
         self._models = []
         self._protos = []
         for name in names:
-            tok = AutoTokenizer.from_pretrained(name)
-            mdl = AutoModel.from_pretrained(name); mdl.eval(); mdl.to(self.device)
+            # 进程级共享单例：与知识库嵌入器共用同一份 bge 权重（省 ~450MB，二次加载零成本）
+            tok, mdl = get_shared_bge(name, self.device)
             texts, pcls = [], []
             for v, lst in bank.items():
                 for t in lst:
