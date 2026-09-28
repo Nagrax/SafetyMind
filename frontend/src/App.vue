@@ -387,6 +387,8 @@ async function loadAdminConfig() {
     const data = await requestAdminConfig(settings.backend, settings, adminToken.value)
     adminCfg.value = data.config || []
     for (const c of adminCfg.value) cfgDraft[c.key] = c.secret ? '' : c.value
+    // 加载成功即记住口令（与"退出管理"清除对称），下次打开免重输
+    if (adminToken.value) localStorage.setItem('safetymind.adminToken', adminToken.value)
   } catch (e) {
     adminCfg.value = []
     const m = e.message || ''
@@ -416,7 +418,12 @@ async function bootstrapAdmin() {
   } catch (e) {
     const m = e.message || ''
     if (m.includes('409')) showToast('已配置过管理密码，请直接输入')
-    else if (m.includes('403')) showToast(m.split(':').slice(1).join(':').slice(0, 80) || '本机首次使用才可一键生成；线上部署请向管理员索取口令')
+    else if (m.includes('403')) {
+      // 服务端 detail 是明文原因（如"网络部署形态禁止远程 bootstrap…"），从 JSON 里解出来展示
+      let reason = ''
+      try { reason = JSON.parse(m.slice(m.indexOf('{'))).detail || '' } catch { reason = m.split(':').slice(1).join(':') }
+      showToast(reason.slice(0, 80) || '本机首次使用才可一键生成；线上部署请向管理员索取口令')
+    }
     else showToast('生成失败：' + m.slice(0, 60))
   }
   finally { busy.value = false }
