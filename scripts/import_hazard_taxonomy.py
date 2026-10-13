@@ -50,7 +50,8 @@ MAJOR_LEAN = ["易燃易爆危险作业", "易燃易爆设施及场所", "热工
 
 
 def main() -> None:
-    xlsx = pathlib.Path(sys.argv[1]) if len(sys.argv) > 1 else _ROOT / "2026《隐患排查依据大全》查找版 (1).xlsx"
+    xlsx = pathlib.Path(sys.argv[1]) if len(sys.argv) > 1 else \
+        _ROOT / "data" / "sources" / "2026《隐患排查依据大全》查找版 (1).xlsx"
     wb = openpyxl.load_workbook(xlsx, read_only=True)
     ws = wb.worksheets[0]
     # 聚合结构：大类 → 中类 → {major, general, basis Counter}
