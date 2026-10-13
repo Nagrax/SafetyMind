@@ -1,9 +1,20 @@
 """
-亮点：多 Agent 路由与编排（安全生产域）
+亮点：多 Agent 路由与编排（安全生产域）——OCTO 式"员工/专家"解耦
 
-核心问题：多 Agent 情况下如何做 Routing？
+架构（借鉴 OCTO：Employee Agent 有记忆的编排者 / Expert Agent 无状态执行者）：
+  - EmployeeAgent（员工层编排者）：
+      代表一线员工，读取 MemoryContext（会话摘要/相关历史/人员安全画像/最近对话），
+      统一负责上下文装配（ExpertTask 任务包，一次装配、全部专家共享）与路由决策
+      （CRITICAL 模板短路 → 澄清检查 → 领域评分路由 → 单/并行派发 → 升级检查）。
+  - 领域专家（设备/合规/综合/升级，BaseAgent 子类）：
+      无状态执行者。不再各自拼装 [背景信息]/[结构化实体]，只接收员工层装配好的
+      任务包，叠加自身 system prompt 与动态 Skills 后调 LLM。
+      专家保持可池化（_pool）、可并行（run_parallel 输出块格式不变）。
+  - AgentOrchestrator（对外门面）：
+      持有专家池与意图识别器，run() 仍是唯一入口——api 层与
+      evaluation/evaluator.py 直调 orchestrator.run() 的用法不受影响。
 
-路由策略（三层决策）：
+路由策略（三层决策，与解耦前语义一致）：
   1. 意图路由 —— 根据 IntentCategory 直接映射到专属 Agent
      （设备工艺安全 / 安全合规应急 / 安全生产协调 / 人工升级接待）
   2. 性能路由 —— 同类 Agent 有多个时，选成功率最高、延迟最低的
@@ -11,7 +22,7 @@
 
 并行协作：
   - 复杂问题（如"设备报警 + 作业票办理"）可同时派发给多个 Agent
-  - 结果由 Orchestrator 合并后返回
+  - 结果由员工层合并后返回（[agent - 主处理/辅助处理] 块格式不变）
 
 升级机制：
   - CRITICAL 紧急度 / 转人工意图 / Agent 输出建议升级 → 路由到 EscalationAgent
@@ -24,12 +35,15 @@ import time
 import uuid
 from dataclasses import dataclass, field
 from enum import Enum
-from typing import Any, Dict, List, Optional
+from typing import TYPE_CHECKING, Any, Dict, List, Optional
 
 from anthropic import AsyncAnthropic
 
 from core.intent_recognizer import IntentCategory, IntentRecognizer, UrgencyLevel
 from core.llm_utils import extract_text_content
+
+if TYPE_CHECKING:  # 仅类型标注：agents 层不依赖 memory 模块运行时导入（chromadb/redis 重）
+    from memory.conversation_memory import MemoryContext
 
 logger = logging.getLogger(__name__)
 
@@ -81,7 +95,7 @@ class Request:
     message:     str
     user_id:     str
     conv_id:     str
-    context:     str = ""        # 来自 MemoryManager 的格式化上下文
+    context:     str = ""        # 调用方已格式化的文本上下文（评测/CLI 兜底链路）
     history:     Optional[List[Dict[str, str]]] = None  # 对话历史，传给意图识别
     entities:    Dict[str, List[str]] = field(default_factory=dict)
     intent:      Optional[IntentCategory] = None
@@ -89,6 +103,25 @@ class Request:
     urgency:     Optional[UrgencyLevel]   = None
     intent_confidence: float = 1.0
     request_id:  str = field(default_factory=lambda: str(uuid.uuid4())[:8])
+    # 员工层新增（可选，向后兼容）：结构化 MemoryContext（会话摘要/相关历史/
+    # 人员安全画像/最近对话）。给出时由 EmployeeAgent 统一渲染装配，优先于 context。
+    memory_context: Optional["MemoryContext"] = None
+    # RAG 知识块（api 层检索结果），同样交由员工层统一拼装进任务包。
+    knowledge:   str = ""
+
+
+@dataclass
+class ExpertTask:
+    """员工层装配好的一次性任务包：专家只执行，不再自行装配上下文。
+
+    messages 已包含 [背景信息]/[结构化实体]/用户消息的完整 LLM 消息序列，
+    全部（并行）专家共享同一份——与解耦前各专家自拼的结果逐字节一致。
+    """
+    request_id: str
+    message:    str
+    context:    str = ""
+    entities:   Dict[str, List[str]] = field(default_factory=dict)
+    messages:   List[Dict[str, str]] = field(default_factory=list)
 
 
 @dataclass
@@ -123,10 +156,14 @@ class RoutingDecision:
         return bool(self.supporting_agents)
 
 
-# ── 基础 Agent ────────────────────────────────────────────────────────────────
+# ── 专家层（无状态执行者）─────────────────────────────────────────────────────
 
 class BaseAgent:
-    """所有 Agent 的基类，封装 LLM 调用和统计。"""
+    """领域专家基类：无状态、可池化、可并行。
+
+    只负责执行本身——计时/统计/升级检查与 LLM 调用；上下文装配已上移到
+    员工层（EmployeeAgent.assemble_task），专家收到的 task.messages 即可直接发。
+    """
 
     agent_type: AgentType
     system_prompt: str
@@ -137,11 +174,11 @@ class BaseAgent:
         self._skill_manager = skill_manager
         self.stats   = AgentStats()
 
-    async def handle(self, req: Request) -> AgentResponse:
+    async def handle(self, task: ExpertTask) -> AgentResponse:
         t0 = time.monotonic()
         self.stats.total += 1
         try:
-            content = await self._call_llm(req)
+            content = await self._call_llm(task)
             ms = (time.monotonic() - t0) * 1000
             self.stats.success += 1
             self.stats.total_ms += ms
@@ -164,33 +201,21 @@ class BaseAgent:
                 latency_ms=ms,
             )
 
-    async def _call_llm(self, req: Request) -> str:
-        def _clean(s: str) -> str:
-            return s.encode("utf-8", errors="ignore").decode("utf-8")
-
-        messages = []
-        if req.context:
-            messages.append({"role": "user", "content": f"[背景信息]\n{_clean(req.context)}"})
-            messages.append({"role": "assistant", "content": "好的，我已了解背景信息。"})
-        if req.entities:
-            entities_text = json.dumps(req.entities, ensure_ascii=False)
-            messages.append({"role": "user", "content": f"[结构化实体]\n{_clean(entities_text)}"})
-            messages.append({"role": "assistant", "content": "好的，我会结合这些结构化实体处理。"})
-        messages.append({"role": "user", "content": _clean(req.message)})
-
+    async def _call_llm(self, task: ExpertTask) -> str:
+        # 专家不再注入背景：task.messages 由员工层装配（含 [背景信息]/[结构化实体]）。
         resp = await self._client.messages.create(
             model=self._model,
             max_tokens=1024,
-            system=self._build_system_prompt(req),
-            messages=messages,
+            system=self._build_system_prompt(task.message),
+            messages=task.messages,
         )
         return extract_text_content(resp.content)
 
-    def _build_system_prompt(self, req: Request) -> str:
+    def _build_system_prompt(self, message: str) -> str:
         """把动态加载的 Skills 拼入 system prompt，让业务规则随请求生效。"""
         if self._skill_manager is None:
             return self.system_prompt
-        skill_prompt = self._skill_manager.prompt_for(req.message, self.agent_type.value)
+        skill_prompt = self._skill_manager.prompt_for(message, self.agent_type.value)
         if not skill_prompt:
             return self.system_prompt
         return f"{self.system_prompt}\n\n[动态 Skills]\n{skill_prompt}"
@@ -240,71 +265,73 @@ class EscalationAgent(BaseAgent):
     )
 
 
-# ── 编排器 ────────────────────────────────────────────────────────────────────
+# ── 员工层（有记忆的编排者）───────────────────────────────────────────────────
 
-class AgentOrchestrator:
+class EmployeeAgent:
     """
-    多 Agent 编排器。
+    一线员工侧的编排者（OCTO 式解耦的唯一有状态编排层）。
 
-    路由逻辑（三层）：
-      1. 意图 → Agent 类型映射
-      2. 同类多实例时按 routing_score() 选最优
-      3. 专属 Agent 失败时降级到 GeneralAgent
+    职责：
+      1. 上下文装配 —— 读取 MemoryContext（会话摘要/相关历史/人员安全画像/
+         最近对话）与 RAG 知识块，装配成一次性的 ExpertTask 任务包；
+         无结构化记忆时退回调用方传入的文本 context（评测/CLI 链路行为不变）。
+      2. 路由决策 —— CRITICAL 模板短路（先于澄清，AGENTS.md 铁律 3）→
+         低置信澄清 → 领域评分选主/辅专家 → 派发执行（单/并行）→ 升级检查。
+
+    领域专家（BaseAgent 子类）无状态：从池中按 routing_score 选优，
+    失败自动降级到 General 专家。
     """
 
-    # 意图 → Agent 类型的静态映射（路由表）
-    _INTENT_ROUTING: Dict[IntentCategory, AgentType] = {
-        IntentCategory.EQUIPMENT_ALARM: AgentType.EQUIPMENT,
-        IntentCategory.EQUIPMENT_MAINT: AgentType.EQUIPMENT,
-        IntentCategory.HAZARD_REPORT:      AgentType.COMPLIANCE,
-        IntentCategory.WORK_PERMIT:        AgentType.COMPLIANCE,
-        IntentCategory.INCIDENT_REPORT:    AgentType.COMPLIANCE,
-        IntentCategory.CHEMICAL_SAFETY:    AgentType.COMPLIANCE,
-        IntentCategory.TRAINING_CERT:      AgentType.COMPLIANCE,
-        IntentCategory.INSPECTION_AUDIT:   AgentType.COMPLIANCE,
-        IntentCategory.OCC_HEALTH:         AgentType.COMPLIANCE,
-        IntentCategory.ESCALATION:         AgentType.ESCALATION,
-        # 其余意图（隐患排查/法规/防护/规程/一般咨询/问候等）→ GENERAL（默认）
-    }
+    def __init__(self, pool: Dict[AgentType, List[BaseAgent]]):
+        self._pool = pool   # 与门面共享同一份专家池（统计/惩罚回路读写同源）
 
-    def __init__(
-        self,
-        api_key:  str,
-        base_url: Optional[str] = None,
-        model:    str = "claude-3-5-sonnet-20241022",
-        skill_manager: Optional[Any] = None,
-    ):
-        kwargs: Dict[str, Any] = {"api_key": api_key}
-        if base_url:
-            kwargs["base_url"] = base_url
-        from core.llm_utils import llm_client_kwargs
-        client = AsyncAnthropic(**kwargs, **llm_client_kwargs())
+    # ── 上下文装配（员工层职责之一）──────────────────────────────────────────
 
-        self._intent_recognizer = IntentRecognizer(api_key=api_key, base_url=base_url, model=model)
-        self._skill_manager = skill_manager
+    @staticmethod
+    def _clean(s: str) -> str:
+        return s.encode("utf-8", errors="ignore").decode("utf-8")
 
-        # Agent 池：每种类型可有多个实例（水平扩展）
-        self._pool: Dict[AgentType, List[BaseAgent]] = {
-            AgentType.GENERAL:    [SafetyCoordinationAgent(client, model, skill_manager)],
-            AgentType.EQUIPMENT:  [EquipmentSafetyAgent(client, model, skill_manager)],
-            AgentType.COMPLIANCE: [ComplianceEmergencyAgent(client, model, skill_manager)],
-            AgentType.ESCALATION: [EscalationAgent(client, model, skill_manager)],
-        }
+    def _memory_block(self, req: Request) -> str:
+        """读取记忆：优先结构化 MemoryContext（员工代表用户读过记忆再说话）；
+        渲染失败降级回文本 context，绝不阻塞对话。"""
+        if req.memory_context is not None:
+            try:
+                return req.memory_context.to_prompt_text() or ""
+            except Exception as ex:
+                logger.warning(f"请求 {req.request_id} MemoryContext 渲染失败，退回文本上下文: {ex}")
+        return req.context or ""
 
-    def set_skill_manager(self, skill_manager: Optional[Any]) -> None:
-        """更新 SkillManager 引用，供运行时重载或测试替换使用。"""
-        self._skill_manager = skill_manager
-        for agents in self._pool.values():
-            for agent in agents:
-                agent._skill_manager = skill_manager
+    def assemble_task(self, req: Request) -> ExpertTask:
+        """统一装配任务包：记忆块 + 知识块 → [背景信息]；实体 → [结构化实体]。
 
-    async def recognize_intent(
-        self,
-        message: str,
-        history: Optional[List[Dict[str, str]]] = None,
-    ):
-        """对外暴露意图识别，供 API 层先判断是否需要 RAG 等前置能力。"""
-        return await self._intent_recognizer.recognize(message, history=history)
+        消息序列一次装配、全部（并行）专家共享——与解耦前每个专家各自
+        拼装的内容逐字节一致（等价重构）。
+        """
+        parts = []
+        memory_block = self._memory_block(req)
+        if memory_block:
+            parts.append(memory_block)
+        if req.knowledge:
+            parts.append(req.knowledge)
+        context = "\n\n".join(part for part in parts if part)
+
+        messages = []
+        if context:
+            messages.append({"role": "user", "content": f"[背景信息]\n{self._clean(context)}"})
+            messages.append({"role": "assistant", "content": "好的，我已了解背景信息。"})
+        if req.entities:
+            entities_text = json.dumps(req.entities, ensure_ascii=False)
+            messages.append({"role": "user", "content": f"[结构化实体]\n{self._clean(entities_text)}"})
+            messages.append({"role": "assistant", "content": "好的，我会结合这些结构化实体处理。"})
+        messages.append({"role": "user", "content": self._clean(req.message)})
+
+        return ExpertTask(
+            request_id=req.request_id,
+            message=req.message,
+            context=context,
+            entities=dict(req.entities or {}),
+            messages=messages,
+        )
 
     # ── 主入口 ────────────────────────────────────────────────────────────────
 
@@ -339,20 +366,13 @@ class AgentOrchestrator:
 重要提示：现场处置以本单位应急预案和应急指挥指令为准。"""
     )
 
-    async def run(self, req: Request) -> OrchestratorResult:
+    async def handle(self, req: Request, t0: Optional[float] = None) -> OrchestratorResult:
         """
-        处理一次请求的完整流程：
-          意图识别 → 路由选 Agent → 执行 → 检查升级 → 返回结果
+        员工层处理一次请求：路由决策 → 装配任务包 → 派发专家 → 升级检查。
+        t0 由门面（AgentOrchestrator.run）传入，保证 latency_ms 口径与
+        解耦前一致（含意图识别耗时）。
         """
-        t0 = time.monotonic()
-
-        # 1. 意图识别（如果调用方已识别则跳过）
-        if req.intent is None:
-            intent_result = await self._intent_recognizer.recognize(req.message, history=req.history)
-            req.intent  = intent_result.intent
-            req.intent_group = intent_result.intent_group
-            req.urgency = intent_result.urgency
-            req.intent_confidence = intent_result.confidence
+        t0 = t0 or time.monotonic()
 
         # CRITICAL 紧急事态：模板化应急响应（零 LLM 依赖）。
         # 设计依据：紧急情况的秒级确定性响应优于生成式回答（更快、无幻觉、
@@ -396,10 +416,11 @@ class AgentOrchestrator:
         if decision.multi_agent:
             return await self.run_parallel(req, decision)
 
-        # 2. 执行主 Agent（含降级）
-        response = await self._execute(req, decision.primary_agent)
+        # 执行主专家（员工层装配任务包，含降级）
+        task = self.assemble_task(req)
+        response = await self._execute(task, decision.primary_agent)
 
-        # 4. 升级检查
+        # 升级检查
         escalated = False
         if response.escalate or req.urgency == UrgencyLevel.CRITICAL or req.intent == IntentCategory.ESCALATION:
             escalated = True
@@ -422,12 +443,14 @@ class AgentOrchestrator:
 
     async def run_parallel(self, req: Request, decision: RoutingDecision) -> OrchestratorResult:
         """
-        并行派发给多个 Agent，合并结果。
+        并行派发给多个专家，合并结果。
         适用于复杂问题（如同时涉及设备处置和作业票合规）。
+        任务包由员工层装配一次，全部并行专家共享。
         """
         t0 = time.monotonic()
         agent_types = decision.agent_types
-        tasks = [self._execute(req, at) for at in agent_types]
+        task = self.assemble_task(req)
+        tasks = [self._execute(task, at) for at in agent_types]
         responses = await asyncio.gather(*tasks, return_exceptions=True)
 
         # 合并：主 Agent 在前，辅助 Agent 在后。
@@ -458,6 +481,21 @@ class AgentOrchestrator:
         )
 
     # ── 路由逻辑 ──────────────────────────────────────────────────────────────
+
+    # 意图 → Agent 类型的静态映射（路由表）
+    _INTENT_ROUTING: Dict[IntentCategory, AgentType] = {
+        IntentCategory.EQUIPMENT_ALARM: AgentType.EQUIPMENT,
+        IntentCategory.EQUIPMENT_MAINT: AgentType.EQUIPMENT,
+        IntentCategory.HAZARD_REPORT:      AgentType.COMPLIANCE,
+        IntentCategory.WORK_PERMIT:        AgentType.COMPLIANCE,
+        IntentCategory.INCIDENT_REPORT:    AgentType.COMPLIANCE,
+        IntentCategory.CHEMICAL_SAFETY:    AgentType.COMPLIANCE,
+        IntentCategory.TRAINING_CERT:      AgentType.COMPLIANCE,
+        IntentCategory.INSPECTION_AUDIT:   AgentType.COMPLIANCE,
+        IntentCategory.OCC_HEALTH:         AgentType.COMPLIANCE,
+        IntentCategory.ESCALATION:         AgentType.ESCALATION,
+        # 其余意图（隐患排查/法规/防护/规程/一般咨询/问候等）→ GENERAL（默认）
+    }
 
     def _route(self, intent: Optional[IntentCategory], urgency: Optional[UrgencyLevel]) -> AgentType:
         """
@@ -676,8 +714,8 @@ class AgentOrchestrator:
             return None
         return max(agents, key=lambda a: a.stats.routing_score())
 
-    async def _execute(self, req: Request, agent_type: AgentType) -> AgentResponse:
-        """执行 Agent，失败时降级到 GeneralAgent。"""
+    async def _execute(self, task: ExpertTask, agent_type: AgentType) -> AgentResponse:
+        """执行专家，失败时降级到 GeneralAgent。"""
         agent = self._best_agent(agent_type)
         if agent is None:
             agent = self._best_agent(AgentType.GENERAL)
@@ -688,16 +726,94 @@ class AgentOrchestrator:
                 success=False,
             )
 
-        response = await agent.handle(req)
+        response = await agent.handle(task)
 
         # 专属 Agent 失败时降级到 GeneralAgent
         if not response.success and agent_type != AgentType.GENERAL:
             logger.warning(f"{agent_type.value} 失败，降级到 GeneralAgent")
             fallback = self._best_agent(AgentType.GENERAL)
             if fallback:
-                response = await fallback.handle(req)
+                response = await fallback.handle(task)
 
         return response
+
+
+# ── 编排门面（对外契约入口）───────────────────────────────────────────────────
+
+class AgentOrchestrator:
+    """
+    多 Agent 编排门面。
+
+    持有专家池与意图识别器，把请求交给员工层（EmployeeAgent）完成
+    上下文装配与路由。对外 run()/run_parallel()/recognize_intent()/
+    get_stats()/update_routing_penalties() 的签名与返回结构与解耦前一致，
+    api 层（_chat_core）与评测器（evaluation/evaluator.py 直调 run()）
+    不受影响。
+    """
+
+    def __init__(
+        self,
+        api_key:  str,
+        base_url: Optional[str] = None,
+        model:    str = "claude-3-5-sonnet-20241022",
+        skill_manager: Optional[Any] = None,
+    ):
+        kwargs: Dict[str, Any] = {"api_key": api_key}
+        if base_url:
+            kwargs["base_url"] = base_url
+        from core.llm_utils import llm_client_kwargs
+        client = AsyncAnthropic(**kwargs, **llm_client_kwargs())
+
+        self._intent_recognizer = IntentRecognizer(api_key=api_key, base_url=base_url, model=model)
+        self._skill_manager = skill_manager
+
+        # 专家池：每种类型可有多个实例（水平扩展）；员工层与门面共享同一份
+        self._pool: Dict[AgentType, List[BaseAgent]] = {
+            AgentType.GENERAL:    [SafetyCoordinationAgent(client, model, skill_manager)],
+            AgentType.EQUIPMENT:  [EquipmentSafetyAgent(client, model, skill_manager)],
+            AgentType.COMPLIANCE: [ComplianceEmergencyAgent(client, model, skill_manager)],
+            AgentType.ESCALATION: [EscalationAgent(client, model, skill_manager)],
+        }
+        self._employee = EmployeeAgent(self._pool)
+
+    def set_skill_manager(self, skill_manager: Optional[Any]) -> None:
+        """更新 SkillManager 引用，供运行时重载或测试替换使用。"""
+        self._skill_manager = skill_manager
+        for agents in self._pool.values():
+            for agent in agents:
+                agent._skill_manager = skill_manager
+
+    async def recognize_intent(
+        self,
+        message: str,
+        history: Optional[List[Dict[str, str]]] = None,
+    ):
+        """对外暴露意图识别，供 API 层先判断是否需要 RAG 等前置能力。"""
+        return await self._intent_recognizer.recognize(message, history=history)
+
+    # ── 主入口 ────────────────────────────────────────────────────────────────
+
+    async def run(self, req: Request) -> OrchestratorResult:
+        """
+        处理一次请求的完整流程：
+          意图识别（未识别时补全）→ 员工层装配任务包 + 路由决策 → 执行 → 结果
+        """
+        t0 = time.monotonic()
+
+        # 意图识别（如果调用方已识别则跳过）
+        if req.intent is None:
+            intent_result = await self._intent_recognizer.recognize(req.message, history=req.history)
+            req.intent  = intent_result.intent
+            req.intent_group = intent_result.intent_group
+            req.urgency = intent_result.urgency
+            req.intent_confidence = intent_result.confidence
+
+        # t0 传入员工层：latency_ms 口径不变（含意图识别耗时）
+        return await self._employee.handle(req, t0=t0)
+
+    async def run_parallel(self, req: Request, decision: RoutingDecision) -> OrchestratorResult:
+        """并行派发给多个专家，合并结果（员工层实现，门面转发保持原签名）。"""
+        return await self._employee.run_parallel(req, decision)
 
     # ── 统计（供 Monitor 读取）────────────────────────────────────────────────
 

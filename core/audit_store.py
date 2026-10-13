@@ -5,13 +5,27 @@
     可统计（闭环时长/升级次数/超期数）——向量库和缓存都不具备这个形状；
   - 不存对话原文，只存摘要与指标（原文已在 ConversationStore，按需联动）；
   - 单进程假设（与 SafetyMind 部署形态一致），写操作加线程锁；
-  - 表结构变更走手动迁移（一期不做自动 migration）。
+  - 表结构变更走非破坏迁移：__init__ 里 PRAGMA table_info 探测缺列后 ALTER TABLE
+    ADD COLUMN + 回填（借鉴 OCTO Loop 的五阶段回路，2026-10）。
+
+工单五阶段回路（ticket loop）：
+    brief（需求简报）→ discuss（过程研讨）→ execute（执行产出）
+      → feedback（多轮反馈）→ accept / reject（验收批注）
+  - 顺序流转按 _STAGE_TRANSITIONS 白名单校验，accept/reject 可回退到 feedback；
+  - 每次流转在 ticket_timeline 留操作者/批注/时间戳，非法跳转直接拒绝；
+  - 旧数据兼容：status 两态保留为派生兼容字段（brief..feedback→open，
+    accept/reject→closed），存量 open 工单视同 execute、closed 视同 accept，
+    迁移只加列回填，不改写既有数据。
 """
+import json
+import logging
 import os
 import sqlite3
 import threading
 import time
 from typing import Any, Dict, List, Optional
+
+logger = logging.getLogger(__name__)
 
 _DEFAULT_DDL = """
 CREATE TABLE IF NOT EXISTS audit_log (
@@ -42,12 +56,46 @@ CREATE TABLE IF NOT EXISTS tickets (
     assignee TEXT DEFAULT '',
     source_request_id TEXT DEFAULT '',
     due_ts REAL,
-    closed_ts REAL
+    closed_ts REAL,
+    stage TEXT DEFAULT '',
+    intent TEXT DEFAULT '',
+    urgency TEXT DEFAULT '',
+    entities TEXT DEFAULT '',
+    message_digest TEXT DEFAULT '',
+    routing_reason TEXT DEFAULT ''
+);
+CREATE TABLE IF NOT EXISTS ticket_timeline (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    ticket_id INTEGER NOT NULL,
+    ts REAL NOT NULL,
+    action TEXT NOT NULL,
+    from_stage TEXT DEFAULT '',
+    to_stage TEXT DEFAULT '',
+    actor TEXT DEFAULT '',
+    note TEXT DEFAULT '',
+    detail TEXT DEFAULT ''
 );
 CREATE INDEX IF NOT EXISTS idx_audit_ts ON audit_log(ts);
 CREATE INDEX IF NOT EXISTS idx_upg_ts ON upgrade_events(ts);
 CREATE INDEX IF NOT EXISTS idx_ticket_status ON tickets(status);
+CREATE INDEX IF NOT EXISTS idx_ttimeline_ticket ON ticket_timeline(ticket_id);
 """
+
+# ── 五阶段回路定义（新库建表即带列；旧库由 _migrate 非破坏补列）────────────────
+TICKET_STAGES = ("brief", "discuss", "execute", "feedback", "accept", "reject")
+STAGE_LABELS = {
+    "brief": "需求简报", "discuss": "过程研讨", "execute": "执行产出",
+    "feedback": "多轮反馈", "accept": "验收通过", "reject": "验收驳回",
+}
+# 合法流转白名单：顺序前进 + 验收两态可回退到反馈阶段（驳回重做/验收后追加反馈轮）。
+_STAGE_TRANSITIONS: Dict[str, set] = {
+    "brief":   {"discuss"},
+    "discuss": {"execute"},
+    "execute": {"feedback"},
+    "feedback": {"accept", "reject"},
+    "accept":  {"feedback"},
+    "reject":  {"feedback"},
+}
 
 
 def _preview(text: str, limit: int = 80) -> str:
@@ -68,7 +116,59 @@ class AuditStore:
         with self._lock:
             self._con.execute("PRAGMA journal_mode=WAL")
             self._con.executescript(_DEFAULT_DDL)
+            self._migrate_locked()
             self._con.commit()
+
+    def _migrate_locked(self) -> None:
+        """非破坏迁移：缺列则 ALTER ADD COLUMN；存量两态工单按旧语义回填阶段并留痕。
+        只加列/回填新增列，不改写既有数据，失败仅回滚本次（审计主表不受影响）。"""
+        try:
+            cols = {r[1] for r in self._con.execute("PRAGMA table_info(tickets)")}
+            for col, ddl in (
+                ("stage", "TEXT DEFAULT ''"),
+                ("intent", "TEXT DEFAULT ''"),
+                ("urgency", "TEXT DEFAULT ''"),
+                ("entities", "TEXT DEFAULT ''"),
+                ("message_digest", "TEXT DEFAULT ''"),
+                ("routing_reason", "TEXT DEFAULT ''"),
+            ):
+                if col not in cols:
+                    self._con.execute(f"ALTER TABLE tickets ADD COLUMN {col} {ddl}")
+            # 旧数据兼容（设计要求 3）：open 视为执行产出阶段，closed 视为验收完成。
+            legacy = self._con.execute(
+                "SELECT id, status FROM tickets WHERE stage='' OR stage IS NULL").fetchall()
+            now = time.time()
+            for r in legacy:
+                stage = "accept" if r["status"] == "closed" else "execute"
+                self._con.execute("UPDATE tickets SET stage=? WHERE id=?", (stage, r["id"]))
+                self._con.execute(
+                    "INSERT INTO ticket_timeline (ticket_id, ts, action, from_stage,"
+                    " to_stage, actor, note, detail) VALUES (?,?,?,?,?,?,?,?)",
+                    (r["id"], now, "legacy_stage", "", stage, "system",
+                     "旧数据兼容：open→execute / closed→accept" if r["status"] != "closed"
+                     else "旧数据兼容：closed 视同验收完成", ""))
+        except sqlite3.Error as ex:  # pragma: no cover - 迁移失败不拖垮审计存储
+            self._con.rollback()
+            logger.warning(f"工单五阶段迁移失败（沿用两态读取）: {ex}")
+
+    def _norm_stage(self, stage: str, status: str) -> str:
+        """阶段归一：stage 列缺失（理论上 _migrate 后不再出现）时按旧两态推导。"""
+        return stage if stage else ("accept" if status == "closed" else "execute")
+
+    def _ticket_dict(self, row: sqlite3.Row) -> Dict[str, Any]:
+        """行 → 对外字典：补 stage 派生、解析实体 JSON、保留 overdue/closure_hours。"""
+        d = dict(row)
+        d["stage"] = self._norm_stage(d.get("stage", ""), d.get("status", ""))
+        d["stage_label"] = STAGE_LABELS.get(d["stage"], d["stage"])
+        try:
+            d["entities"] = json.loads(d["entities"]) if d.get("entities") else {}
+        except (ValueError, TypeError):
+            d["entities"] = {}
+        now = time.time()
+        d["overdue"] = bool(d.get("due_ts") and d["status"] != "closed" and d["due_ts"] < now)
+        if d.get("closed_ts"):
+            d["closure_hours"] = round((d["closed_ts"] - d["created_ts"]) / 3600, 1)
+        return d
 
     # ── 审计日志 ──────────────────────────────────────────────────────────
     def audit_request(self, request_id: str, user_id: str, conv_id: str,
@@ -129,18 +229,184 @@ class AuditStore:
             self._con.commit()
             return cur.rowcount > 0
 
-    # ── 工单 ──────────────────────────────────────────────────────────────
+    # ── 工单（五阶段回路）───────────────────────────────────────────────────
     def create_ticket(self, title: str, type_: str = "hazard",
                       priority: str = "normal", assignee: str = "",
-                      source_request_id: str = "", due_ts: Optional[float] = None) -> int:
+                      source_request_id: str = "", due_ts: Optional[float] = None,
+                      brief: Optional[Dict[str, Any]] = None,
+                      actor: str = "system") -> int:
+        """建单并落入需求简报（brief）阶段。brief 缺省时（管理端手动建单）
+        以标题生成最小简报；request_id 经 source_request_id 落库。
+        简报字段：intent / urgency / entities(实体) / message_digest(消息摘要) /
+        routing_reason / request_id —— 全部与本行一起落库。"""
+        if brief is None:
+            brief = {"intent": "", "urgency": "", "entities": {},
+                     "message_digest": _preview(title, 80),
+                     "routing_reason": "管理员手动建单", "request_id": source_request_id}
         with self._lock:
             cur = self._con.execute(
                 "INSERT INTO tickets (created_ts, title, type, priority, assignee,"
-                " source_request_id, due_ts) VALUES (?,?,?,?,?,?,?)",
+                " source_request_id, due_ts, stage, intent, urgency, entities,"
+                " message_digest, routing_reason)"
+                " VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?)",
                 (time.time(), _preview(title, 120), type_, priority, assignee,
-                 source_request_id, due_ts))
+                 source_request_id, due_ts, "brief",
+                 str(brief.get("intent", "")), str(brief.get("urgency", "")),
+                 json.dumps(brief.get("entities") or {}, ensure_ascii=False),
+                 _preview(str(brief.get("message_digest", "")), 120),
+                 _preview(str(brief.get("routing_reason", "")), 120)))
+            tid = cur.lastrowid
+            brief_store = dict(brief)
+            brief_store["request_id"] = brief_store.get("request_id") or source_request_id
+            self._con.execute(
+                "INSERT INTO ticket_timeline (ticket_id, ts, action, from_stage,"
+                " to_stage, actor, note, detail) VALUES (?,?,?,?,?,?,?,?)",
+                (tid, time.time(), "create", "", "brief", actor, _preview(title, 80),
+                 json.dumps(brief_store, ensure_ascii=False)))
             self._con.commit()
-            return cur.lastrowid
+            return tid
+
+    def _ticket_row_locked(self, ticket_id: int) -> Optional[sqlite3.Row]:
+        return self._con.execute("SELECT * FROM tickets WHERE id=?", (ticket_id,)).fetchone()
+
+    def get_ticket(self, ticket_id: int) -> Optional[Dict[str, Any]]:
+        with self._lock:
+            row = self._ticket_row_locked(ticket_id)
+        return self._ticket_dict(row) if row else None
+
+    def transition_ticket(self, ticket_id: int, to_stage: str,
+                          actor: str = "", note: str = "",
+                          detail: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
+        """五阶段流转：白名单校验（顺序前进 + accept/reject 回退 feedback），
+        非法跳转/未知阶段/重复同阶段一律拒绝；成功则更新 stage 与派生 status，
+        并把 操作者/批注/时间戳 写入 ticket_timeline。持同一把线程锁保证原子。"""
+        with self._lock:
+            row = self._ticket_row_locked(ticket_id)
+            if row is None:
+                return {"ok": False, "kind": "not_found",
+                        "error": f"工单不存在: {ticket_id}"}
+            from_stage = self._norm_stage(row["stage"], row["status"])
+            if to_stage not in _STAGE_TRANSITIONS:
+                return {"ok": False, "kind": "bad_stage", "from_stage": from_stage,
+                        "error": f"未知阶段: {to_stage}"}
+            if to_stage == from_stage:
+                return {"ok": False, "kind": "bad_transition", "from_stage": from_stage,
+                        "error": f"已处于 {STAGE_LABELS.get(from_stage, from_stage)} 阶段"}
+            if to_stage not in _STAGE_TRANSITIONS[from_stage]:
+                return {"ok": False, "kind": "bad_transition", "from_stage": from_stage,
+                        "error": f"非法流转: {STAGE_LABELS.get(from_stage, from_stage)}"
+                                 f" → {STAGE_LABELS.get(to_stage, to_stage)}"}
+            now = time.time()
+            closing = to_stage in ("accept", "reject")
+            if closing:
+                self._con.execute(
+                    "UPDATE tickets SET stage=?, status='closed', closed_ts=? WHERE id=?",
+                    (to_stage, now, ticket_id))
+            else:  # 回退/推进到中间阶段：恢复在办态，闭环时长随之失效
+                self._con.execute(
+                    "UPDATE tickets SET stage=?, status='open', closed_ts=NULL WHERE id=?",
+                    (to_stage, ticket_id))
+            self._con.execute(
+                "INSERT INTO ticket_timeline (ticket_id, ts, action, from_stage,"
+                " to_stage, actor, note, detail) VALUES (?,?,?,?,?,?,?,?)",
+                (ticket_id, now, "stage_change", from_stage, to_stage,
+                 actor, note, json.dumps(detail or {}, ensure_ascii=False)))
+            self._con.commit()
+            new_row = self._ticket_row_locked(ticket_id)
+            return {"ok": True, "from_stage": from_stage, "to_stage": to_stage,
+                    "ticket": self._ticket_dict(new_row)}
+
+    def record_ticket_event(self, ticket_id: int, action: str, actor: str = "",
+                            note: str = "", from_stage: str = "", to_stage: str = "",
+                            detail: Optional[Dict[str, Any]] = None) -> bool:
+        """追加时间线事件（如 webhook 通知实收），不改 stage。工单不存在返回 False。"""
+        with self._lock:
+            if self._ticket_row_locked(ticket_id) is None:
+                return False
+            self._con.execute(
+                "INSERT INTO ticket_timeline (ticket_id, ts, action, from_stage,"
+                " to_stage, actor, note, detail) VALUES (?,?,?,?,?,?,?,?)",
+                (ticket_id, time.time(), action, from_stage, to_stage,
+                 actor, note, json.dumps(detail or {}, ensure_ascii=False)))
+            self._con.commit()
+        return True
+
+    def get_ticket_timeline(self, ticket_id: int) -> Optional[List[Dict[str, Any]]]:
+        """完整时间线（按发生顺序）。工单不存在返回 None（端点据此回 404）。"""
+        with self._lock:
+            if self._ticket_row_locked(ticket_id) is None:
+                return None
+            rows = self._con.execute(
+                "SELECT * FROM ticket_timeline WHERE ticket_id=? ORDER BY id ASC",
+                (ticket_id,)).fetchall()
+        out = []
+        for r in rows:
+            d = dict(r)
+            try:
+                d["detail"] = json.loads(d["detail"]) if d["detail"] else {}
+            except (ValueError, TypeError):
+                d["detail"] = {}
+            out.append(d)
+        return out
+
+    def get_ticket_progress(self, request_id: str) -> Optional[Dict[str, Any]]:
+        """工单进度查询（用户端升级卡片数据源，克制暴露）：按 source_request_id 取
+        最近一张关联工单，回五阶段进度骨架 + 最新一条带批注事件。
+        刻意不下发完整时间线与简报细节（entities/message_digest/routing_reason
+        仍只在管理端 GET /tickets/{id}/timeline）；无关联工单返回 None
+        （端点据此回 found=false，前端降级为"工单生成中"空态）。"""
+        with self._lock:
+            row = self._con.execute(
+                "SELECT * FROM tickets WHERE source_request_id=? ORDER BY id DESC LIMIT 1",
+                (request_id,)).fetchone()
+            if row is None:
+                return None
+            events = self._con.execute(
+                "SELECT * FROM ticket_timeline WHERE ticket_id=? ORDER BY id ASC",
+                (row["id"],)).fetchall()
+        ticket = self._ticket_dict(row)
+        stage = ticket["stage"]
+        # 各阶段首次到达时间（create/stage_change/legacy_*，webhook 等旁路事件不计入）
+        visited = {}
+        latest_note = None
+        for e in events:
+            to_stage = e["to_stage"] or ""
+            if e["action"] in ("create", "stage_change", "legacy_close", "legacy_stage") \
+                    and to_stage in STAGE_LABELS:
+                visited.setdefault(to_stage, e["ts"])
+            if e["note"]:
+                latest_note = {"action": e["action"], "actor": e["actor"], "note": e["note"],
+                               "to_stage": to_stage, "ts": e["ts"]}
+        # 进度骨架：brief→discuss→execute→feedback 顺序推进，accept/reject 归并为验收结论。
+        # 走到后面的阶段即视前面全部完成（旧数据迁移单只有 legacy 一条时间线也自洽）。
+        order = ("brief", "discuss", "execute", "feedback")
+        cur_idx = order.index(stage) if stage in order else len(order)
+        steps = []
+        for i, s in enumerate(order):
+            steps.append({
+                "stage": s, "label": STAGE_LABELS[s],
+                "state": "current" if s == stage else ("done" if i < cur_idx else "pending"),
+                "ts": visited.get(s),
+            })
+        verdict_stage = stage if stage in ("accept", "reject") else ""
+        return {
+            "found": True,
+            "ticket_id": ticket["id"],
+            "title": ticket["title"],
+            "status": ticket["status"],
+            "stage": stage,
+            "stage_label": ticket["stage_label"],
+            "created_ts": ticket["created_ts"],
+            "closed_ts": ticket.get("closed_ts"),
+            "steps": steps,
+            "verdict": {
+                "stage": verdict_stage,
+                "label": STAGE_LABELS.get(verdict_stage, "验收"),
+                "state": "done" if verdict_stage else "pending",
+                "ts": visited.get(verdict_stage) if verdict_stage else None,
+            },
+            "latest_event": latest_note,
+        }
 
     def list_tickets(self, status: Optional[str] = None, limit: int = 100) -> List[Dict[str, Any]]:
         with self._lock:
@@ -151,23 +417,26 @@ class AuditStore:
             else:
                 rows = self._con.execute(
                     "SELECT * FROM tickets ORDER BY id DESC LIMIT ?", (limit,)).fetchall()
-        out = []
-        now = time.time()
-        for r in rows:
-            d = dict(r)
-            d["overdue"] = bool(d["due_ts"] and d["status"] != "closed" and d["due_ts"] < now)
-            if d["closed_ts"]:
-                d["closure_hours"] = round((d["closed_ts"] - d["created_ts"]) / 3600, 1)
-            out.append(d)
-        return out
+        return [self._ticket_dict(r) for r in rows]
 
     def close_ticket(self, ticket_id: int) -> bool:
+        """旧两态闭环接口（POST /tickets/{id}/close），行为不回退：status 置 closed，
+        stage 视同验收完成（accept），并在时间线留痕。对任何阶段可用（旧语义）。"""
         with self._lock:
-            cur = self._con.execute(
-                "UPDATE tickets SET status='closed', closed_ts=? WHERE id=? AND status!='closed'",
-                (time.time(), ticket_id))
+            row = self._ticket_row_locked(ticket_id)
+            if row is None or row["status"] == "closed":
+                return False
+            now = time.time()
+            self._con.execute(
+                "UPDATE tickets SET status='closed', closed_ts=?, stage='accept' WHERE id=?",
+                (now, ticket_id))
+            self._con.execute(
+                "INSERT INTO ticket_timeline (ticket_id, ts, action, from_stage,"
+                " to_stage, actor, note, detail) VALUES (?,?,?,?,?,?,?,?)",
+                (ticket_id, now, "legacy_close", self._norm_stage(row["stage"], row["status"]),
+                 "accept", "admin", "旧接口闭环，视同验收完成", ""))
             self._con.commit()
-            return cur.rowcount > 0
+            return True
 
     # ── 报表（安环部周报的数据源）─────────────────────────────────────────
     def stats(self) -> Dict[str, Any]:
