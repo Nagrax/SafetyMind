@@ -54,6 +54,9 @@ class MemoryContext:
     relevant_history: List[str]       # 情景记忆：语义相关的历史片段
     user_profile:     Dict[str, Any]  # 用户画像：偏好、常用实体
     summary:          str             # 当前会话摘要（压缩后）
+    # 偏好卡片（第四级·资产沉淀，OCTO 式）：已按命中度+新近排序，带默认值保证
+    # 旧调用方（评测器/测试直接构造 4 字段）不受影响
+    preference_cards: List[Dict[str, Any]] = field(default_factory=list)
 
     @staticmethod
     def _clean(text: str) -> str:
@@ -69,6 +72,21 @@ class MemoryContext:
             parts.append("[相关历史]\n" + "\n".join(f"- {self._clean(h)}" for h in self.relevant_history[:3]))
         if self.user_profile:
             parts.append(f"[人员安全画像]\n{json.dumps(self.user_profile, ensure_ascii=True)}")
+        if self.preference_cards:
+            # 降级铁律：偏好块渲染失败只丢偏好块，摘要/历史/画像/最近对话不受影响
+            try:
+                lines = []
+                for c in self.preference_cards[:5]:   # 防御性上限 5；3-5 张的截断由上游 rank_for(INJECT_LIMIT) 完成
+                    if not isinstance(c, dict):
+                        continue
+                    title = self._clean(str(c.get("title", "")).strip())
+                    content = self._clean(str(c.get("content", "")).strip())
+                    if title or content:
+                        lines.append(f"- {title}：{content}" if content else f"- {title}")
+                if lines:
+                    parts.append("[偏好卡片]\n" + "\n".join(lines))
+            except Exception:
+                pass
         if self.recent_messages:
             parts.append("[最近对话]")
             for m in self.recent_messages:
@@ -239,6 +257,16 @@ class MemoryManager:
         # 用户画像：存储提炼出的偏好和实体
         self._profile  = chroma.get_or_create_collection("user_profile" + suffix, embedding_function=embedding_function)
 
+        # 偏好卡片子系统（第四级·资产沉淀，OCTO 式）：SQLite 独立库，任何失败
+        # 只告警降级为 None（无偏好注入），绝不阻断三级记忆与对话主链路。
+        self._pref = None
+        try:
+            from memory.preference_cards import PreferenceCardManager
+            self._pref = PreferenceCardManager()
+            logger.info(f"偏好卡片子系统已启用: {self._pref._path}")
+        except Exception as ex:
+            logger.warning(f"偏好卡片子系统不可用（对话不受影响，无偏好注入）: {ex}")
+
     # ── Redis 访问（失败自动降级进程内存储）────────────────────────────────────
 
     async def _redis_op(self, op: str, *args, **kwargs):
@@ -307,6 +335,7 @@ class MemoryManager:
 返回格式: {{"duty": "岗位/职责（未提及则空字符串）", "site": "常涉装置/车间（未提及则空字符串）", "entities": {{"设备编号": [], "风险类型": [], "化学品": []}}, "safety_history": ["历史隐患上报/培训取证/违章整改等条目，没有则空数组"]}}"""
         prompt = self._safe_text(prompt)
 
+        profile_data: Optional[Dict[str, Any]] = None
         try:
             resp = await self._client.messages.create(
                 model=self._model, max_tokens=512, temperature=0.0,
@@ -334,7 +363,38 @@ class MemoryManager:
             )
             logger.info(f"用户画像已更新: {user_id}")
         except Exception as ex:
-            logger.warning(f"更新用户画像失败: {ex}")
+            # 无 LLM/LLM 故障：画像落库跳过（保持原语义），偏好卡片走规则抽取兜底
+            logger.warning(f"更新用户画像失败（偏好卡片降级为规则抽取）: {ex}")
+
+        # 偏好卡片沉淀（独立降级块）：LLM 画像成功→按结构化画像沉淀；
+        # 失败→按对话原文规则抽取。任何失败只告警，不影响画像/对话。
+        if self._pref is not None:
+            try:
+                if profile_data:
+                    await asyncio.to_thread(
+                        self._pref.absorb_profile, user_id, profile_data,
+                        f"profile:{conv_id}")
+                else:
+                    await asyncio.to_thread(
+                        self._pref.absorb_conversation, user_id, text,
+                        f"rule:{conv_id}")
+            except Exception as ex:
+                logger.warning(f"偏好卡片沉淀失败（不影响画像与对话）: {ex}")
+
+    async def absorb_feedback(self, user_id: str, *, request_id: str, rating: str,
+                              comment: str = "", message_head: str = "",
+                              answer_head: str = "") -> None:
+        """反馈信号（👎/评语及对话上下文）→ 偏好卡片。规则抽取，SQLite 写入极快；
+        偏好子系统不可用或失败时静默降级，绝不阻断 /feedback 响应。"""
+        if self._pref is None:
+            return
+        try:
+            await asyncio.to_thread(
+                self._pref.absorb_feedback, user_id or "anonymous",
+                rating=rating, comment=comment, message_head=message_head,
+                answer_head=answer_head, request_id=request_id)
+        except Exception as ex:
+            logger.warning(f"偏好卡片沉淀失败（不影响反馈）: {ex}")
 
     # ── 读取 ──────────────────────────────────────────────────────────────────
 
@@ -360,11 +420,22 @@ class MemoryManager:
         # 4. 会话摘要（如果已压缩过）
         summary = await self._redis_op("get", self._summary_key(user_id, conv_id)) or ""
 
+        # 5. 偏好卡片（按命中度+新近排序，失败降级为空列表，不阻断上下文构建）
+        pref_cards: List[Dict[str, Any]] = []
+        if self._pref is not None:
+            try:
+                pref_cards = await asyncio.to_thread(
+                    self._pref.rank_for, user_id,
+                    query or (recent[-1].content if recent else ""))
+            except Exception as ex:
+                logger.warning(f"偏好卡片检索失败（降级为无偏好注入）: {ex}")
+
         return MemoryContext(
             recent_messages=recent,
             relevant_history=history,
             user_profile=profile,
             summary=summary,
+            preference_cards=pref_cards,
         )
 
     # ── 压缩（防止 context 爆炸）─────────────────────────────────────────────
@@ -483,6 +554,12 @@ class MemoryManager:
     async def close(self) -> None:
         """关闭异步 Redis 连接。"""
         await self._redis.aclose()
+        if self._pref is not None:
+            try:
+                self._pref.close()
+            except Exception:
+                pass  # 偏好库关闭失败不影响主流程
+            self._pref = None
 
     @staticmethod
     def _wm_key(user_id: str, conv_id: str) -> str:

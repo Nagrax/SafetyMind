@@ -184,6 +184,64 @@ async def lifespan(app: FastAPI):
         fallback=knowledge_fallback,
     ))
 
+    # 结构化资源库（MSDS 化学品 + 安全资料目录），失败不阻断启动
+    try:
+        from mcp.resource_library import ResourceLibrary
+        _reslib = ResourceLibrary()
+        logger.info(f"资源库已加载: {json.dumps(_reslib.stats(), ensure_ascii=False)}")
+
+        def resource_fallback(params: Dict[str, Any], context: Optional[Dict[str, Any]], error: str):
+            return {"error": f"资源库暂时不可用: {error}", "fallback": True}
+
+        _tool_manager.register(Tool(
+            name="msds_lookup",
+            description="查询化学品安全技术说明书（MSDS 16 段结构化数据，支持别名与 CAS 号，可按章节取内容）",
+            handler=_reslib.msds_handler,
+            schema={
+                "type": "object",
+                "properties": {
+                    "action": {"type": "string", "enum": ["lookup", "hot", "stats"]},
+                    "name": {"type": "string", "description": "化学品名称或别名，如 乙醇/烧碱"},
+                    "cas": {"type": "string"},
+                    "section": {"type": "string", "description": "1-16 或章节名，如 泄漏应急处理"},
+                    "top_k": {"type": "integer"},
+                },
+            },
+            cache_ttl=120.0,
+            fallback=resource_fallback,
+        ))
+        _tool_manager.register(Tool(
+            name="resource_search",
+            description="检索安全资料目录（documents=制度台账/培训课件/检查表，videos=事故案例，standards=法规标准）",
+            handler=_reslib.resource_handler,
+            schema={
+                "type": "object",
+                "properties": {
+                    "query": {"type": "string"},
+                    "category": {"type": "string", "enum": ["documents", "videos", "standards"]},
+                    "top_k": {"type": "integer"},
+                },
+            },
+            cache_ttl=120.0,
+            fallback=resource_fallback,
+        ))
+        _tool_manager.register(Tool(
+            name="ledger_checklist",
+            description="给定安全管理台账类型（培训/隐患/危化品/应急/特种设备/作业票/相关方/职业健康/安全投入），生成支撑文件清单并标注资源库中已有哪些、还缺哪些",
+            handler=_reslib.ledger_handler,
+            schema={
+                "type": "object",
+                "properties": {
+                    "action": {"type": "string", "enum": ["checklist", "list"]},
+                    "ledger": {"type": "string", "description": "台账类型，如 危化品台账"},
+                },
+            },
+            cache_ttl=120.0,
+            fallback=resource_fallback,
+        ))
+    except Exception as ex:
+        logger.warning(f"资源库初始化失败（对话不受影响）: {ex}")
+
     # 性能监控（可选启动 Prometheus）
     prom_port = int(os.getenv("PROMETHEUS_PORT", "0")) or None
     _monitor = PerformanceMonitor(
@@ -456,6 +514,56 @@ async def ticket_close(ticket_id: int, _admin: None = Depends(require_admin)):
     return {"closed": _audit.close_ticket(ticket_id)}
 
 
+# ── 工单五阶段回路（brief→discuss→execute→feedback→accept/reject，借鉴 OCTO Loop）──
+class TicketTransitionInput(BaseModel):
+    """阶段流转：to_stage ∈ brief|discuss|execute|feedback|accept|reject；
+    actor/note 作为操作者批注随时间线落库。"""
+    to_stage: str
+    actor: str = "admin"
+    note: str = ""
+
+
+@app.post("/tickets/{ticket_id}/transition", tags=["审计"])
+async def ticket_transition(ticket_id: int, body: TicketTransitionInput,
+                            _admin: None = Depends(require_admin)):
+    """五阶段流转：合法流转返回新状态，非法跳转/未知阶段 400，工单不存在 404。"""
+    if _audit is None:
+        raise HTTPException(503, "审计存储未启用")
+    result = _audit.transition_ticket(ticket_id, body.to_stage,
+                                      actor=body.actor, note=body.note)
+    if not result["ok"]:
+        if result.get("kind") == "not_found":
+            raise HTTPException(404, result["error"])
+        raise HTTPException(400, result["error"])
+    return result
+
+
+@app.get("/tickets/{ticket_id}/timeline", tags=["审计"])
+async def ticket_timeline(ticket_id: int, _admin: None = Depends(require_admin)):
+    """完整时间线：建单简报 → 历次流转（操作者/批注/时间戳）→ 通知/兼容事件。"""
+    if _audit is None:
+        raise HTTPException(503, "审计存储未启用")
+    ticket = _audit.get_ticket(ticket_id)
+    if ticket is None:
+        raise HTTPException(404, f"工单不存在: {ticket_id}")
+    timeline = _audit.get_ticket_timeline(ticket_id)
+    return {"ticket": ticket, "timeline": timeline or []}
+
+
+@app.get("/tickets/progress/{request_id}", tags=["审计"])
+async def ticket_progress(request_id: str):
+    """用户端升级卡片（克制展示）：按上报编号查工单五阶段进度与最新批注。
+    免管理令牌——上报编号本身即凭据（仅上报者可见）；刻意只回进度骨架与
+    最新一条批注，完整时间线/简报细节仍在管理端 GET /tickets/{id}/timeline。
+    无关联工单回 200 + found=false（前端降级为"工单生成中"空态，不当作错误）。"""
+    if _audit is None:
+        raise HTTPException(503, "审计存储未启用")
+    progress = _audit.get_ticket_progress(request_id)
+    if progress is None:
+        return {"found": False}
+    return progress
+
+
 # ── .env 可视化配置（管理端点；白名单 + 掩码 + 原子写）───────────────────────
 @app.post("/config/admin/bootstrap", tags=["审计"])
 async def admin_config_bootstrap():
@@ -545,6 +653,12 @@ async def submit_feedback(fb: FeedbackRequest):
         request_id=fb.request_id, rating=fb.rating, comment=fb.comment,
         user_id=fb.user_id, conv_id=fb.conv_id,
         message_head=fb.message_head, answer_head=fb.answer_head)
+    # 偏好卡片沉淀（OCTO 式资产沉淀，挂在反馈信号上）：规则抽取 + SQLite 极快写入，
+    # 内部全量 try/except 降级，失败只告警绝不阻断反馈响应。
+    if _memory is not None:
+        await _memory.absorb_feedback(
+            fb.user_id, request_id=fb.request_id, rating=fb.rating,
+            comment=fb.comment, message_head=fb.message_head, answer_head=fb.answer_head)
     if fb.rating == "down" or fb.comment.strip():
         from core.skill_evolution import spawn_extraction
         skills_meta = [{
@@ -718,7 +832,9 @@ async def _chat_core(req, conv_id: str, OrcReq, MsgRole, t_start: float):
         message=req.message,
         user_id=req.user_id,
         conv_id=conv_id,
-        context=full_context,
+        context=full_context,      # 兜底文本（评测/CLI 链路同款），员工层在结构化记忆缺失时使用
+        memory_context=mem_ctx,    # 员工层（EmployeeAgent）读取结构化记忆统一装配
+        knowledge=knowledge_text,  # RAG 检索块同样交员工层装配
         history=history,
         entities=intent_result.entities,
         intent=intent_result.intent,
@@ -758,22 +874,43 @@ async def _chat_core(req, conv_id: str, OrcReq, MsgRole, t_start: float):
             if result.escalated:
                 upgrade_id = _audit.add_upgrade(result.request_id, req.user_id, conv_id,
                                                 req.message, intent_result.intent.value or "other")
-                _audit.create_ticket(f"应急升级: {' '.join(req.message.split())[:60]}",
-                                     type_="emergency", priority="critical",
-                                     source_request_id=result.request_id)
+                # 需求简报（五阶段回路 brief 阶段）：升级现场一次性落库，
+                # intent/urgency/实体/消息摘要/routing_reason/request_id 齐备，
+                # 后续研讨/执行/反馈/验收都在此简报之上展开。
+                msg_digest = " ".join(req.message.split())[:80]
+                brief = {
+                    "intent": intent_result.intent.value if intent_result.intent else "other",
+                    # UrgencyLevel.value 是整数（1-4），简报存可读名（critical 等）
+                    "urgency": (intent_result.urgency.name.lower()
+                                if intent_result.urgency else "low"),
+                    "entities": intent_result.entities or {},
+                    "message_digest": msg_digest,
+                    "routing_reason": result.routing_reason,
+                    "request_id": result.request_id,
+                }
+                ticket_id = _audit.create_ticket(
+                    f"应急升级: {msg_digest[:60]}", type_="emergency", priority="critical",
+                    source_request_id=result.request_id, brief=brief)
                 webhook = os.getenv("ESCALATION_WEBHOOK_URL", "").strip()
                 if webhook:
-                    msg_digest = " ".join(req.message.split())[:60]
+                    # webhook 在建单（需求简报）时即发，行为不回退；成功后补一条时间线。
 
-                    async def _notify(upgrade_id=upgrade_id, webhook=webhook,
+                    async def _notify(upgrade_id=upgrade_id, ticket_id=ticket_id, webhook=webhook,
                                       rid=result.request_id, msg_digest=msg_digest):
                         from core.audit_store import notify_escalation_blocking
                         ok = await asyncio.to_thread(notify_escalation_blocking, webhook, {
                             "request_id": rid,
-                            "text": f"【SafetyMind 应急升级】编号 {rid}\n内容: {msg_digest}\n时间: {time.strftime('%m-%d %H:%M:%S')}\n已自动建单并留痕，请值班确认。",
+                            "text": f"【SafetyMind 应急升级】编号 {rid}\n内容: {msg_digest[:60]}\n时间: {time.strftime('%m-%d %H:%M:%S')}\n已自动建单并留痕，请值班确认。",
                         })
                         if ok:
                             _audit.mark_notified(upgrade_id, "webhook")
+                            try:
+                                _audit.record_ticket_event(
+                                    ticket_id, "notify_webhook", actor="system",
+                                    note="值班 webhook 已实收（需求简报建单时发出）",
+                                    to_stage="brief", detail={"request_id": rid})
+                            except Exception as ex:
+                                logger.warning(f"工单通知时间线记录失败: {ex}")
 
                     asyncio.create_task(_notify())
         except Exception as ex:

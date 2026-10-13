@@ -153,6 +153,16 @@ def main():
         r = client.get("/api/python/eval/last")
         record("GET /api/python/eval/last 别名", r.status_code == 200, f"code={r.status_code}")
 
+        # 升级卡片"处理进度"背后的用户端点：免管理令牌、按上报编号查五阶段进度。
+        # 这里只验证接线（200 + found 字段）；语义/克制暴露细节在 tests/test_audit_tickets.py 5.45。
+        r = client.get("/tickets/progress/__no_such_request__")
+        ok = r.status_code == 200 and r.json().get("found") is False
+        record("GET /tickets/progress/{rid} 升级卡片进度(未知编号空态)", ok,
+               f"code={r.status_code} body={r.text[:120]}")
+        r = client.get("/api/python/tickets/progress/__no_such_request__")
+        ok = r.status_code == 200 and r.json().get("found") is False
+        record("GET /api/python/tickets/progress/{rid} 别名", ok, f"code={r.status_code}")
+
         r = client.get("/")
         record("GET / 静态首页(frontend/dist)", r.status_code == 200 and "<div id=" in r.text,
                f"code={r.status_code} len={len(r.text)}")

@@ -18,6 +18,10 @@ os.environ["API_HOST"] = "127.0.0.1"
 os.environ["AUDIT_ENABLED"] = "0"
 os.environ["SAFETYMIND_BGE"] = "0"          # 跳过模型加载，加速启动
 os.environ["ANTHROPIC_BASE_URL"] = "http://127.0.0.1:9"
+# /feedback 钩子会向偏好卡库沉淀（anonymous+sop:动火 等）；两轮即达 MIN_HITS=2 注入
+# 门槛，必须指向临时目录，严禁写真实 data/preference_cards.db 污染生产注入
+os.environ["PREFERENCE_DB_PATH"] = os.path.join(
+    tempfile.mkdtemp(prefix="sk_evo_pref_"), "preference_cards.db")
 
 RESULTS = []
 

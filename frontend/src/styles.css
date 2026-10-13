@@ -1238,6 +1238,44 @@ button:disabled { opacity: 0.5; cursor: not-allowed; }
 .m-action.primary { background: #e5484d; border-color: #e5484d; color: #fff; font-weight: 600; }
 .m-action.muted-note { border-style: dashed; cursor: default; }
 
+/* ── 升级卡片 Loop 工单进度（五阶段回路克制版：简报→研讨→执行→反馈→验收）── */
+.loop-card {
+  width: 100%; max-width: 340px; margin-top: 2px;
+  border: 1px solid var(--border); border-radius: 12px; background: var(--bg-soft);
+  overflow: hidden;
+}
+.loop-toggle {
+  width: 100%; display: flex; align-items: center; gap: 8px;
+  border: none; background: transparent; padding: 8px 12px;
+  font-size: 13px; color: var(--text-2); cursor: pointer; text-align: left;
+}
+.loop-toggle .loop-title { font-weight: 600; color: var(--text); flex: none; }
+.loop-toggle .loop-stage { color: var(--accent); font-weight: 600; font-size: 12.5px; }
+.loop-toggle .loop-caret { margin-left: auto; color: var(--text-3); font-size: 11px; flex: none; }
+.loop-body { padding: 0 12px 10px; display: flex; flex-direction: column; gap: 8px; }
+.loop-steps { display: grid; grid-template-columns: repeat(5, 1fr); gap: 4px; }
+.loop-step { display: flex; flex-direction: column; align-items: center; gap: 4px; min-width: 0; }
+.loop-dot {
+  width: 10px; height: 10px; border-radius: 50%; flex: none;
+  border: 2px solid var(--border-strong); background: var(--surface);
+}
+.loop-step.done .loop-dot { background: var(--accent); border-color: var(--accent); }
+.loop-step.current .loop-dot { border-color: var(--accent); box-shadow: 0 0 0 3px var(--accent-weak); }
+.loop-step.accept .loop-dot { background: var(--success); border-color: var(--success); }
+.loop-step.reject .loop-dot { background: var(--warn); border-color: var(--warn); }
+.loop-label { font-size: 11px; color: var(--text-3); white-space: nowrap; }
+.loop-step.done .loop-label { color: var(--text-2); }
+.loop-step.current .loop-label { color: var(--accent); font-weight: 600; }
+.loop-step.accept .loop-label { color: var(--success); font-weight: 600; }
+.loop-step.reject .loop-label { color: var(--warn); font-weight: 600; }
+.loop-note { margin: 0; font-size: 12px; color: var(--text-2); line-height: 1.5; }
+.loop-note.muted { color: var(--text-3); }
+
+/* 桌面（≥980px）对话列限宽 760px：进度卡与消息气泡同宽对齐，不额外占栏 */
+@media (min-width: 980px) {
+  .loop-card { max-width: 380px; }
+}
+
 .m-msg.typing .m-msg-body { display: inline-flex; gap: 5px; align-items: center; padding: 14px 16px; }
 .m-msg.typing .m-msg-body span {
   width: 7px; height: 7px; border-radius: 50%; background: var(--text-3);

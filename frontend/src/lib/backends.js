@@ -136,6 +136,47 @@ export async function requestChat(type, settings, message) {
   return normalizeChatResponse(type, raw)
 }
 
+// 升级卡片的 Loop 工单进度（用户端克制暴露）：按上报编号查五阶段进度与最新批注。
+// 未知编号回 200+found=false（"工单生成中"空态），网络/服务异常由调用方 try/catch 降级。
+export async function requestTicketProgress(type, settings, requestId) {
+  const meta = backendMeta(type, settings)
+  const raw = await requestJson(meta.baseUrl, `/tickets/progress/${encodeURIComponent(requestId)}`)
+  return normalizeTicketProgress(raw)
+}
+
+function normalizeTicketProgress(raw) {
+  if (!raw || raw.found === false) return { found: false }
+  return {
+    found: true,
+    ticketId: raw.ticket_id ?? raw.ticketId ?? 0,
+    title: raw.title || '',
+    status: raw.status || 'open',
+    stage: raw.stage || '',
+    stageLabel: raw.stage_label || raw.stageLabel || '',
+    createdTs: Number(raw.created_ts ?? raw.createdTs ?? 0),
+    closedTs: raw.closed_ts ?? raw.closedTs ?? null,
+    steps: (raw.steps || []).map(s => ({
+      stage: s.stage || '',
+      label: s.label || '',
+      state: s.state || 'pending',
+      ts: s.ts ?? null
+    })),
+    verdict: {
+      stage: raw.verdict?.stage || '',
+      label: raw.verdict?.label || '验收',
+      state: raw.verdict?.state || 'pending',
+      ts: raw.verdict?.ts ?? null
+    },
+    latestEvent: raw.latest_event ? {
+      action: raw.latest_event.action || '',
+      actor: raw.latest_event.actor || '',
+      note: raw.latest_event.note || '',
+      toStage: raw.latest_event.to_stage || raw.latest_event.toStage || '',
+      ts: Number(raw.latest_event.ts ?? 0)
+    } : null
+  }
+}
+
 export async function addKnowledge(type, settings, documents) {
   return requestJson(backendMeta(type, settings).baseUrl, '/knowledge/add', {
     method: 'POST',

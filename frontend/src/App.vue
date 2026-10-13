@@ -65,6 +65,36 @@
             <button v-if="item.requestId" class="m-action" @click="copyText(item.requestId, '上报编号已复制')">复制上报编号 {{ item.requestId }}</button>
             <span v-else class="m-action muted-note">升级已留痕</span>
           </div>
+          <!-- 升级卡片接入 Loop 工单时间线：按上报编号关联工单，可展开
+               五阶段进度（简报→研讨→执行→反馈→验收）与最新批注；
+               加载失败/审计未启用时降级为一行文案，不阻塞对话 -->
+          <div v-if="item.role === 'assistant' && item.escalated && item.requestId" class="loop-card">
+            <button :class="['loop-toggle', { open: item.loopOpen }]"
+                    :aria-expanded="item.loopOpen ? 'true' : 'false'"
+                    @click="toggleLoop(item)">
+              <span class="loop-title">处理进度</span>
+              <strong v-if="item.loop && item.loop.found" class="loop-stage">{{ item.loop.stageLabel || '处理中' }}</strong>
+              <span class="loop-caret" aria-hidden="true">{{ item.loopOpen ? '▴' : '▾' }}</span>
+            </button>
+            <div v-if="item.loopOpen" class="loop-body">
+              <p v-if="item.loopLoading" class="loop-note muted">进度加载中…</p>
+              <p v-else-if="item.loopError" class="loop-note muted">进度加载失败，请稍后重新展开。</p>
+              <template v-else-if="item.loop && item.loop.found">
+                <div class="loop-steps">
+                  <div v-for="s in loopSteps(item)" :key="s.stage" :class="['loop-step', s.state]">
+                    <span class="loop-dot" aria-hidden="true"></span>
+                    <span class="loop-label">{{ s.short }}</span>
+                  </div>
+                </div>
+                <p v-if="item.loop.latestEvent" class="loop-note">
+                  最新：{{ item.loop.latestEvent.note || loopStageLabel(item.loop.latestEvent.toStage) }}
+                  · {{ item.loop.latestEvent.actor || '系统' }} · {{ formatLoopTime(item.loop.latestEvent.ts) }}
+                </p>
+                <p v-else class="loop-note muted">工单已建立，等待处理进展。</p>
+              </template>
+              <p v-else class="loop-note muted">工单生成中，稍后展开可查看处理进度。</p>
+            </div>
+          </div>
           <div v-else-if="item.role === 'assistant' && item.requestId && !item.feedbackSent" class="m-msg-actions">
             <span class="m-action muted-note">这条回答有帮助吗？</span>
             <button class="m-action" :disabled="feedbackBusy" @click="sendFeedback(item, 'up')">👍</button>
@@ -346,6 +376,7 @@ import {
   requestMonitor,
   requestSearch,
   requestSkills,
+  requestTicketProgress,
   runEvaluation as requestEvaluation,
   saveSettings,
   uploadKnowledge
@@ -600,6 +631,9 @@ async function sendMessage() {
       content: response.response,
       escalated: response.escalated,
       requestId: response.requestId || '',
+      // Agent 路由字段随消息留存：供 dev 面板/排查使用，默认用户界面不渲染（铁律 2）
+      primaryAgent: response.primaryAgent || '',
+      supportingAgents: response.supportingAgents || [],
       critical: response.escalated,
     })
     loadMonitor()
@@ -685,6 +719,58 @@ function formatHistTime(ts) {
   if (days === 0) return `昨天 ${hm}`
   if (days < 7) return `${days} 天前`
   return `${d.getMonth() + 1}/${d.getDate()}`
+}
+
+// ── Loop 工单进度（升级卡片内展开；Agent 路由信息不上默认用户界面——铁律 2）──
+const LOOP_STAGE_LABELS = { brief: '需求简报', discuss: '过程研讨', execute: '执行产出', feedback: '多轮反馈', accept: '验收通过', reject: '验收驳回' }
+const LOOP_STAGE_SHORT = { brief: '简报', discuss: '研讨', execute: '执行', feedback: '反馈' }
+
+function loopStageLabel(stage) { return LOOP_STAGE_LABELS[stage] || stage || '' }
+
+// 五节点进度：四阶段 + 验收结论（accept/reject 归并为末节点，避免并排双叉）
+function loopSteps(item) {
+  const loop = item.loop
+  if (!loop || !loop.found) return []
+  const steps = (loop.steps || []).map(s => ({
+    stage: s.stage,
+    short: LOOP_STAGE_SHORT[s.stage] || s.label,
+    state: s.state,
+  }))
+  const v = loop.verdict || {}
+  steps.push({
+    stage: 'verdict',
+    short: v.state === 'done' ? (v.stage === 'reject' ? '驳回' : '通过') : '验收',
+    state: v.state === 'done' ? (v.stage === 'reject' ? 'reject' : 'accept') : 'pending',
+  })
+  return steps
+}
+
+function formatLoopTime(ts) {
+  const n = Number(ts || 0)
+  if (!n) return ''
+  const d = new Date(n * 1000)
+  return `${String(d.getMonth() + 1).padStart(2, '0')}-${String(d.getDate()).padStart(2, '0')} `
+    + `${String(d.getHours()).padStart(2, '0')}:${String(d.getMinutes()).padStart(2, '0')}`
+}
+
+// 展开即拉最新进度（收起不清缓存）；失败降级为一行文案，绝不阻塞对话
+async function toggleLoop(item) {
+  item.loopOpen = !item.loopOpen
+  if (item.loopOpen) await loadLoopProgress(item)
+}
+
+async function loadLoopProgress(item) {
+  if (!item.requestId) return
+  item.loopLoading = true
+  try {
+    item.loop = await requestTicketProgress(settings.backend, settings, item.requestId)
+    item.loopError = false
+  } catch {
+    item.loop = null
+    item.loopError = true
+  } finally {
+    item.loopLoading = false
+  }
 }
 
 function escalateInChat() {
