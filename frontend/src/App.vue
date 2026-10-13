@@ -65,10 +65,10 @@
             <button v-if="item.requestId" class="m-action" @click="copyText(item.requestId, '上报编号已复制')">复制上报编号 {{ item.requestId }}</button>
             <span v-else class="m-action muted-note">升级已留痕</span>
           </div>
-          <!-- 升级卡片接入 Loop 工单时间线：按上报编号关联工单，可展开
+          <!-- 工单进度卡（应急升级 或 隐患工单已建单）：按上报编号关联工单，可展开
                五阶段进度（简报→研讨→执行→反馈→验收）与最新批注；
                加载失败/审计未启用时降级为一行文案，不阻塞对话 -->
-          <div v-if="item.role === 'assistant' && item.escalated && item.requestId" class="loop-card">
+          <div v-if="item.role === 'assistant' && (item.escalated || item.hazardTicketId) && item.requestId" class="loop-card">
             <button :class="['loop-toggle', { open: item.loopOpen }]"
                     :aria-expanded="item.loopOpen ? 'true' : 'false'"
                     @click="toggleLoop(item)">
@@ -93,6 +93,18 @@
                 <p v-else class="loop-note muted">工单已建立，等待处理进展。</p>
               </template>
               <p v-else class="loop-note muted">工单生成中，稍后展开可查看处理进度。</p>
+            </div>
+          </div>
+          <!-- 隐患确认卡（中档闸门建议：点"上报"才建单，防止工单贬值）：
+               摘要/建议定级/拟派发部门来自《隐患排查依据大全》台账规则，
+               上报成功后原位切换为上面的工单进度卡 -->
+          <div v-else-if="item.role === 'assistant' && item.hazardSuggestion && !item.hazardTicketId && !item.hazardDismissed" class="hazard-card">
+            <p class="hazard-line">检测到可能隐患：{{ item.hazardSuggestion.summary }}</p>
+            <p class="hazard-meta">建议定级 {{ item.hazardSuggestion.severity === 'major' ? '重大' : '一般' }} · 拟派发 {{ item.hazardSuggestion.dept }} · 限期 {{ item.hazardSuggestion.deadlineHours }} 小时</p>
+            <p v-if="item.hazardSuggestion.basis" class="hazard-basis">依据：{{ item.hazardSuggestion.basis }}</p>
+            <div class="hazard-actions">
+              <button class="m-action primary" :disabled="item.hazardBusy" @click="confirmHazard(item)">上报隐患</button>
+              <button class="m-action" :disabled="item.hazardBusy" @click="item.hazardDismissed = true">忽略</button>
             </div>
           </div>
           <div v-else-if="item.role === 'assistant' && item.requestId && !item.feedbackSent" class="m-msg-actions">
@@ -301,6 +313,7 @@
               <div><dt>置信度</dt><dd>{{ formatPercent(lastResponse.routingConfidence) }}</dd></div>
               <div><dt>知识库</dt><dd :class="lastResponse.knowledgeUsed ? 'success' : 'muted'">{{ lastResponse.knowledgeUsed ? '已使用' : '未使用' }}</dd></div>
               <div><dt>升级处置</dt><dd :class="lastResponse.escalated ? 'danger' : 'muted'">{{ lastResponse.escalated ? '是' : '否' }}</dd></div>
+              <div><dt>隐患闸门</dt><dd>{{ hazardActionLabel(lastResponse.hazardAction) }}</dd></div>
             </dl>
             <p v-if="lastResponse.routingReason" class="routing-reason">{{ lastResponse.routingReason }}</p>
           </div>
@@ -373,6 +386,7 @@ import {
   requestKnowledgeStats,
   requestLastEval,
   requestFeedback,
+  requestHazardConfirm,
   requestMonitor,
   requestSearch,
   requestSkills,
@@ -635,6 +649,12 @@ async function sendMessage() {
       primaryAgent: response.primaryAgent || '',
       supportingAgents: response.supportingAgents || [],
       critical: response.escalated,
+      // 隐患闸门：hazardTicketId>0（自动建单/已确认）显示工单进度卡；
+      // hazardSuggestion 存在且未建单/未忽略时显示确认卡
+      hazardTicketId: response.hazardTicketId || 0,
+      hazardSuggestion: response.hazardSuggestion || null,
+      hazardDismissed: false,
+      hazardBusy: false,
     })
     loadMonitor()
     loadConversations()   // 新会话建立/新消息落库后，历史会话列表实时刷新（无需手动刷新页面）
@@ -771,6 +791,37 @@ async function loadLoopProgress(item) {
   } finally {
     item.loopLoading = false
   }
+}
+
+// ── 隐患确认卡（中档闸门：点"上报"才建单）──
+// 建议后端只存 24h（request_id 即凭据），过期回 404；成功后原位展开工单进度卡，
+// 24h 内同实体重复上报由后端自动合并进既有单（merged）
+async function confirmHazard(item) {
+  if (!item.requestId || item.hazardBusy) return
+  item.hazardBusy = true
+  try {
+    const data = await requestHazardConfirm(settings.backend, settings, {
+      request_id: item.requestId,
+      user_id: settings.userId || 'anonymous',
+      conv_id: settings.conversationId || ''
+    })
+    item.hazardTicketId = Number(data.ticket_id || 0)
+    item.loopOpen = true
+    await loadLoopProgress(item)
+    showToast(data.merged ? `已合并到现有工单 #${data.ticket_id}` : `隐患工单 #${data.ticket_id} 已建立`)
+  } catch (error) {
+    const msg = String(error.message || '')
+    showToast(msg.includes('404') ? '上报建议已过期（24 小时内有效）' : `上报失败：${msg}`)
+  } finally {
+    item.hazardBusy = false
+  }
+}
+
+function hazardActionLabel(action) {
+  return {
+    none: '未触发', suggested: '建议上报（待确认）',
+    auto_ticket: '自动建单', merged: '合并既有单'
+  }[action] || '未触发'
 }
 
 function escalateInChat() {

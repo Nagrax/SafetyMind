@@ -1,0 +1,39 @@
+{
+ "note": "隐患工单派发规则：rules 按 order 依次匹配（match=台账大类名，或 match_keywords 命中消息关键词），命中即用该规则的 dept/deadline_hours_major/deadline_hours_general；全部未命中用 default。运行时副本在 data/resource_library/hazard_dispatch.json（可现场改，优先级更高），改此种子需重跑部署。",
+ "default": {
+  "dept": "安环部",
+  "deadline_hours_major": 48,
+  "deadline_hours_general": 168
+ },
+ "rules": [
+  {
+   "order": 1,
+   "match": "易燃易爆危险作业",
+   "dept": "安环部",
+   "deadline_hours_major": 24,
+   "deadline_hours_general": 72,
+   "note": "危险作业类隐患从严：重大 24 小时内闭环"
+  },
+  {
+   "order": 2,
+   "match": "易燃易爆设施及场所",
+   "dept": "安环部",
+   "deadline_hours_major": 24,
+   "deadline_hours_general": 96
+  },
+  {
+   "order": 3,
+   "match_keywords": ["配电", "电气", "电缆", "变压器", "照明"],
+   "dept": "设备动力部",
+   "deadline_hours_major": 48,
+   "deadline_hours_general": 72
+  },
+  {
+   "order": 4,
+   "match": "特种设备",
+   "dept": "设备动力部（特种设备安全管理岗）",
+   "deadline_hours_major": 48,
+   "deadline_hours_general": 120
+  }
+ ]
+}

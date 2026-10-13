@@ -98,6 +98,16 @@ export async function requestFeedback(type, settings, payload) {
   })
 }
 
+// 隐患确认卡：用户点击"上报隐患"后建单（镜像 /feedback：request_id 即凭据）。
+// 建议后端只存 24 小时，过期回 404 由调用方提示。
+export async function requestHazardConfirm(type, settings, payload) {
+  return requestJson(backendMeta(type, settings).baseUrl, '/hazard/confirm', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify(payload)
+  })
+}
+
 export async function reloadSkills(type, settings) {
   return requestJson(backendMeta(type, settings).baseUrl, '/skills/reload', { method: 'POST' })
 }
@@ -223,6 +233,15 @@ function normalizeChatResponse(type, raw) {
     latencyMs: Number(raw.latency_ms ?? raw.latencyMs ?? 0),
     totalMs: Number(raw.total_ms ?? raw.totalMs ?? 0),
     knowledgeUsed: Boolean(raw.knowledge_used ?? raw.knowledgeUsed),
+    hazardAction: raw.hazard_action || raw.hazardAction || 'none',
+    hazardTicketId: Number(raw.hazard_ticket_id ?? raw.hazardTicketId ?? 0),
+    hazardSuggestion: raw.hazard_suggestion ? {
+      summary: raw.hazard_suggestion.summary || '',
+      severity: raw.hazard_suggestion.severity || 'general',
+      dept: raw.hazard_suggestion.dept || '',
+      deadlineHours: Number(raw.hazard_suggestion.deadline_hours ?? raw.hazard_suggestion.deadlineHours ?? 0),
+      basis: raw.hazard_suggestion.basis || ''
+    } : null,
     raw
   }
 }
