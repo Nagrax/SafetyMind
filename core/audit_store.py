@@ -16,6 +16,14 @@
   - 旧数据兼容：status 两态保留为派生兼容字段（brief..feedback→open，
     accept/reject→closed），存量 open 工单视同 execute、closed 视同 accept，
     迁移只加列回填，不改写既有数据。
+
+隐患工单闭环（hazard loop，2026-10 对齐双重预防机制）：
+  - 对话侧 core/hazard_gate.py 分层触发（HIGH+ 自动 / MEDIUM 确认卡）；
+  - MEDIUM 建议暂存 hazard_suggestions 表（用户 POST /hazard/confirm 才建单）；
+  - tickets 增 severity（建议定级）/responsible_dept（派发部门）/user_id（上报人）；
+  - 去重：同用户 24h 内同实体未关闭隐患单合并 repeat_report，不重复建单；
+  - 逾期：check_overdue_tickets 幂等记 overdue_notify 并触发值班 webhook；
+  - 改判：update_ticket_fields 白名单改字段 + patch 时间线留痕（研讨阶段人工定级）。
 """
 import json
 import logging
@@ -62,7 +70,19 @@ CREATE TABLE IF NOT EXISTS tickets (
     urgency TEXT DEFAULT '',
     entities TEXT DEFAULT '',
     message_digest TEXT DEFAULT '',
-    routing_reason TEXT DEFAULT ''
+    routing_reason TEXT DEFAULT '',
+    severity TEXT DEFAULT '',
+    responsible_dept TEXT DEFAULT '',
+    user_id TEXT DEFAULT ''
+);
+CREATE TABLE IF NOT EXISTS hazard_suggestions (
+    request_id TEXT PRIMARY KEY,
+    created_ts REAL NOT NULL,
+    user_id TEXT DEFAULT '',
+    conv_id TEXT DEFAULT '',
+    payload TEXT NOT NULL,
+    ticket_id INTEGER,
+    status TEXT DEFAULT 'pending'
 );
 CREATE TABLE IF NOT EXISTS ticket_timeline (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -131,6 +151,9 @@ class AuditStore:
                 ("entities", "TEXT DEFAULT ''"),
                 ("message_digest", "TEXT DEFAULT ''"),
                 ("routing_reason", "TEXT DEFAULT ''"),
+                ("severity", "TEXT DEFAULT ''"),
+                ("responsible_dept", "TEXT DEFAULT ''"),
+                ("user_id", "TEXT DEFAULT ''"),
             ):
                 if col not in cols:
                     self._con.execute(f"ALTER TABLE tickets ADD COLUMN {col} {ddl}")
@@ -234,11 +257,14 @@ class AuditStore:
                       priority: str = "normal", assignee: str = "",
                       source_request_id: str = "", due_ts: Optional[float] = None,
                       brief: Optional[Dict[str, Any]] = None,
-                      actor: str = "system") -> int:
+                      actor: str = "system", user_id: str = "",
+                      severity: str = "", responsible_dept: str = "") -> int:
         """建单并落入需求简报（brief）阶段。brief 缺省时（管理端手动建单）
         以标题生成最小简报；request_id 经 source_request_id 落库。
         简报字段：intent / urgency / entities(实体) / message_digest(消息摘要) /
-        routing_reason / request_id —— 全部与本行一起落库。"""
+        routing_reason / request_id —— 全部与本行一起落库。
+        隐患工单补充字段：severity（major/general 建议定级）、responsible_dept
+        （派发部门）、user_id（上报人，去重与报表用）。"""
         if brief is None:
             brief = {"intent": "", "urgency": "", "entities": {},
                      "message_digest": _preview(title, 80),
@@ -247,14 +273,15 @@ class AuditStore:
             cur = self._con.execute(
                 "INSERT INTO tickets (created_ts, title, type, priority, assignee,"
                 " source_request_id, due_ts, stage, intent, urgency, entities,"
-                " message_digest, routing_reason)"
-                " VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?)",
+                " message_digest, routing_reason, severity, responsible_dept, user_id)"
+                " VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
                 (time.time(), _preview(title, 120), type_, priority, assignee,
                  source_request_id, due_ts, "brief",
                  str(brief.get("intent", "")), str(brief.get("urgency", "")),
                  json.dumps(brief.get("entities") or {}, ensure_ascii=False),
                  _preview(str(brief.get("message_digest", "")), 120),
-                 _preview(str(brief.get("routing_reason", "")), 120)))
+                 _preview(str(brief.get("routing_reason", "")), 120),
+                 str(severity or ""), str(responsible_dept or ""), str(user_id or "")))
             tid = cur.lastrowid
             brief_store = dict(brief)
             brief_store["request_id"] = brief_store.get("request_id") or source_request_id
@@ -437,6 +464,142 @@ class AuditStore:
                  "accept", "admin", "旧接口闭环，视同验收完成", ""))
             self._con.commit()
             return True
+
+    # ── 隐患工单（hazard gate 暂存/去重/逾期/改判）──────────────────────────
+    def save_hazard_suggestion(self, request_id: str, user_id: str, conv_id: str,
+                               payload: Dict[str, Any]) -> None:
+        """暂存确认卡建议（MEDIUM 档：用户点击 /hazard/confirm 才建单）。
+        payload = hazard_gate.decide() 结果 + 简报材料；SQLite 落库，重启不丢、可审计。
+        同一 request_id 重复上报按覆盖处理（后到的裁决为准）。"""
+        with self._lock:
+            self._con.execute(
+                "INSERT OR REPLACE INTO hazard_suggestions"
+                " (request_id, created_ts, user_id, conv_id, payload, ticket_id, status)"
+                " VALUES (?,?,?,?,?,NULL,'pending')",
+                (request_id, time.time(), user_id, conv_id,
+                 json.dumps(payload, ensure_ascii=False)))
+            self._con.commit()
+
+    def get_hazard_suggestion(self, request_id: str,
+                              max_age_hours: float = 24.0) -> Optional[Dict[str, Any]]:
+        """取待确认建议（pending、未建单、未过期）；无则 None（端点据此回 404）。"""
+        with self._lock:
+            row = self._con.execute(
+                "SELECT * FROM hazard_suggestions WHERE request_id=?", (request_id,)).fetchone()
+        if row is None or row["status"] != "pending" or row["ticket_id"] is not None:
+            return None
+        if time.time() - row["created_ts"] > max_age_hours * 3600:
+            return None
+        try:
+            payload = json.loads(row["payload"])
+        except (ValueError, TypeError):
+            return None
+        return {"request_id": row["request_id"], "user_id": row["user_id"],
+                "conv_id": row["conv_id"], "created_ts": row["created_ts"],
+                "payload": payload}
+
+    def mark_hazard_suggestion(self, request_id: str, status: str,
+                               ticket_id: Optional[int] = None) -> bool:
+        """确认/合并/过期标记（status: confirmed | merged | expired）。"""
+        with self._lock:
+            cur = self._con.execute(
+                "UPDATE hazard_suggestions SET status=?, ticket_id=COALESCE(?, ticket_id)"
+                " WHERE request_id=?", (status, ticket_id, request_id))
+            self._con.commit()
+            return cur.rowcount > 0
+
+    def find_open_hazard_duplicate(self, user_id: str, entities: Dict[str, Any],
+                                   window_hours: float = 24.0) -> Optional[Dict[str, Any]]:
+        """去重：同用户 24h 内未关闭的隐患工单且实体重叠（设备/区域/化学品任一
+        交集）→ 返回已有工单（调用方合并 repeat_report 事件，不新建）。
+        防工单贬值：同一处漏点反复上报只累计到一张单上。"""
+        since = time.time() - window_hours * 3600
+        with self._lock:
+            rows = self._con.execute(
+                "SELECT * FROM tickets WHERE type='hazard' AND status!='closed'"
+                " AND user_id=? AND created_ts>? ORDER BY id DESC LIMIT 50",
+                (user_id, since)).fetchall()
+        ents = entities if isinstance(entities, dict) else {}
+        keys = ("equipment_id", "area", "chemical")
+        for r in rows:
+            try:
+                old = json.loads(r["entities"]) if r["entities"] else {}
+            except (ValueError, TypeError):
+                old = {}
+            for k in keys:
+                a = {str(x) for x in (ents.get(k) or []) if x}
+                b = {str(x) for x in (old.get(k) or []) if x}
+                if a and b and a & b:
+                    return self._ticket_dict(r)
+        return None
+
+    def list_overdue_tickets(self) -> List[Dict[str, Any]]:
+        """逾期未闭环工单（due_ts 已过且 open）——GET /tickets/overdue 数据源。"""
+        now = time.time()
+        with self._lock:
+            rows = self._con.execute(
+                "SELECT * FROM tickets WHERE status!='closed'"
+                " AND due_ts IS NOT NULL AND due_ts<? ORDER BY due_ts ASC", (now,)).fetchall()
+        return [self._ticket_dict(r) for r in rows]
+
+    def check_overdue_tickets(self) -> List[Dict[str, Any]]:
+        """逾期巡检（后台循环调用）：首次逾期的工单记 overdue_notify 时间线并返回
+        （调用方据此发 webhook）；已有该事件的不再重复返回——幂等，通知只发一次。"""
+        newly = []
+        for t in self.list_overdue_tickets():
+            with self._lock:
+                dup = self._con.execute(
+                    "SELECT 1 FROM ticket_timeline WHERE ticket_id=? AND action='overdue_notify'",
+                    (t["id"],)).fetchone()
+            if dup is None:
+                ok = self.record_ticket_event(
+                    t["id"], "overdue_notify", actor="system",
+                    note=f"整改期限已过（逾期 {round((time.time() - t['due_ts']) / 3600, 1)}h），升级提醒",
+                    to_stage=t["stage"])
+                if ok:
+                    newly.append(t)
+        return newly
+
+    # 允许经 PATCH /tickets/{id} 改判的字段（研讨阶段人工定级/改派/改期限）
+    _PATCHABLE_TICKET_FIELDS = {
+        "severity": lambda v: str(v),
+        "responsible_dept": lambda v: str(v),
+        "assignee": lambda v: str(v),
+        "priority": lambda v: str(v),
+        "due_ts": lambda v: float(v),
+    }
+
+    def update_ticket_fields(self, ticket_id: int, fields: Dict[str, Any],
+                             actor: str = "admin", note: str = "") -> Dict[str, Any]:
+        """白名单字段修改 + patch 时间线留痕（改动前后值都落 detail）。
+        返回 {"ok", kind?, ticket?}；not_found / no_field 与流转端点错误口径一致。"""
+        with self._lock:
+            row = self._ticket_row_locked(ticket_id)
+            if row is None:
+                return {"ok": False, "kind": "not_found", "error": f"工单不存在: {ticket_id}"}
+            changes: Dict[str, Any] = {}
+            for key, cast in self._PATCHABLE_TICKET_FIELDS.items():
+                if key in fields and fields[key] is not None:
+                    try:
+                        changes[key] = cast(fields[key])
+                    except (TypeError, ValueError):
+                        return {"ok": False, "kind": "bad_field",
+                                "error": f"字段 {key} 的值不合法: {fields[key]!r}"}
+            if not changes:
+                return {"ok": False, "kind": "no_field",
+                        "error": "无可更新字段（允许: " + ", ".join(sorted(self._PATCHABLE_TICKET_FIELDS)) + "）"}
+            detail = {k: {"from": row[k], "to": v} for k, v in changes.items()}
+            sets = ", ".join(f"{k}=?" for k in changes)
+            self._con.execute(f"UPDATE tickets SET {sets} WHERE id=?",
+                              (*changes.values(), ticket_id))
+            self._con.execute(
+                "INSERT INTO ticket_timeline (ticket_id, ts, action, from_stage,"
+                " to_stage, actor, note, detail) VALUES (?,?,?,?,?,?,?,?)",
+                (ticket_id, time.time(), "patch", "", "", actor, note or "工单信息修改",
+                 json.dumps(detail, ensure_ascii=False)))
+            self._con.commit()
+            new_row = self._ticket_row_locked(ticket_id)
+            return {"ok": True, "ticket": self._ticket_dict(new_row)}
 
     # ── 报表（安环部周报的数据源）─────────────────────────────────────────
     def stats(self) -> Dict[str, Any]:

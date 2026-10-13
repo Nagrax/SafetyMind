@@ -21,6 +21,8 @@ ADMIN_ENV_KEYS: Dict[str, Dict[str, Any]] = {
     "ACCESS_TOKEN":           {"secret": False, "restart": False, "label": "公网访问令牌（发给使用者）"},
     "SAFETYMIND_BGE":         {"secret": False, "restart": True,  "label": "本地意图引擎", "enum": ("0", "1")},
     "SAFETYMIND_EMBEDDING":   {"secret": False, "restart": True,  "label": "嵌入模式", "enum": ("auto", "bge", "ngram")},
+    "SAFETYMIND_HAZARD_AUTOTICKET": {"secret": False, "restart": True, "label": "隐患工单闸门", "enum": ("0", "1")},
+    "SAFETYMIND_HAZARD_OVERDUE_CHECK_S": {"secret": False, "restart": True, "label": "工单逾期巡检间隔（秒）"},
 }
 
 

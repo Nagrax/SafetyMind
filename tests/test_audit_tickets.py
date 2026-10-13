@@ -266,10 +266,16 @@ def main():
                json.dumps(tk, ensure_ascii=False, default=str) if tk else "未找到升级工单")
 
         # 5.2) webhook 在建单（需求简报）时发出且实收，升级事件标记已通知（行为不回退）
+        # 轮询同时等两件事：webhook 实收 与 mark_notified 落库——两者之间有
+        # 天然间隙（hook 返回后服务端才标记），只等实收就断言 notified 会偶发红灯
         deadline = time.time() + 10
-        while time.time() < deadline and not received2:
+        notified_rows = []
+        while time.time() < deadline:
+            if received2:
+                notified_rows = [u for u in store.list_upgrades() if u["request_id"] == rid]
+                if notified_rows and notified_rows[0]["notified"] == 1:
+                    break
             time.sleep(0.2)
-        notified_rows = [u for u in store.list_upgrades() if u["request_id"] == rid]
         record("E2E 建单时 webhook 实收", bool(received2) and rid in received2[0]["text"]["content"],
                f"received2={received2}")
         record("E2E 升级事件已标记通知", bool(notified_rows) and notified_rows[0]["notified"] == 1)

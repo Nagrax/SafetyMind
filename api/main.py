@@ -275,6 +275,26 @@ async def lifespan(app: FastAPI):
         except Exception as ex:
             logger.warning(f"审计存储初始化失败（对话不受影响）: {ex}")
 
+    # 隐患工单逾期巡检（PerformanceMonitor 同款后台循环模式）：首次逾期记
+    # overdue_notify 时间线并发值班 webhook（check_overdue_tickets 幂等，只发一次）；
+    # SAFETYMIND_HAZARD_OVERDUE_CHECK=0 关闭。失败只告警，绝不影响主服务。
+    hazard_overdue_task = None
+    if _audit is not None and os.getenv("SAFETYMIND_HAZARD_OVERDUE_CHECK", "1") == "1":
+        async def _hazard_overdue_loop():
+            interval = float(os.getenv("SAFETYMIND_HAZARD_OVERDUE_CHECK_S", "300"))
+            while True:
+                try:
+                    for t in _audit.check_overdue_tickets():
+                        asyncio.create_task(_notify_hazard_ticket(
+                            t["id"], t.get("source_request_id", ""),
+                            f"【SafetyMind 工单逾期】#{t['id']} {t['title']}\n"
+                            f"整改期限已过仍未闭环，请立即督办。\n"
+                            f"时间: {time.strftime('%m-%d %H:%M:%S')}"))
+                except Exception as ex:
+                    logger.warning(f"隐患逾期巡检失败: {ex}")
+                await asyncio.sleep(interval)
+        hazard_overdue_task = asyncio.create_task(_hazard_overdue_loop())
+
     # 意图引擎后台预热：启用 SAFETYMIND_BGE=1 时，首条消息不再等本地模型冷加载
     # （冷加载约 20-40s，预热后意图阶段毫秒级直出）。
     if os.getenv("SAFETYMIND_BGE", "") == "1":
@@ -283,6 +303,8 @@ async def lifespan(app: FastAPI):
     logger.info("SafetyMind 已就绪")
     yield
 
+    if hazard_overdue_task is not None:
+        hazard_overdue_task.cancel()
     await _monitor.stop()
     if _memory is not None:
         await _memory.close()
@@ -388,6 +410,12 @@ class ChatResponse(BaseModel):
     intent_confidence: float = 0.0
     intent_source_scores: Dict[str, float] = Field(default_factory=dict)
     request_id:  str = ""   # 升级留痕编号（用户端"复制上报编号"用）
+    # ── 隐患工单闸门（分层触发，additive 字段不破坏旧契约）──
+    # none=不建单 | suggested=中档建议（用户端确认卡，点 /hazard/confirm 才建单）
+    # auto_ticket=高危自动建单 | merged=24h 内同实体重复上报，已合并进既有单
+    hazard_action: str = "none"
+    hazard_ticket_id: int = 0
+    hazard_suggestion: Optional[Dict[str, Any]] = None   # suggested 时的确认卡数据
 
 
 # ── 路由 ──────────────────────────────────────────────────────────────────────
@@ -562,6 +590,128 @@ async def ticket_progress(request_id: str):
     if progress is None:
         return {"found": False}
     return progress
+
+
+# ── 隐患工单闭环（分层触发：HIGH+ 自动建单 / MEDIUM 确认卡；对齐双重预防机制）──
+def _create_hazard_ticket(audit, decision: Dict[str, Any], brief: Dict[str, Any],
+                          request_id: str, user_id: str, actor: str) -> tuple:
+    """按闸门裁决建隐患工单。去重先行：同用户 24h 内同实体（设备/区域/化学品）
+    未关闭隐患单不重复建，合并 repeat_report 事件（防工单贬值）。返回 (ticket_id, merged)。"""
+    dup = audit.find_open_hazard_duplicate(user_id, brief.get("entities") or {})
+    if dup is not None:
+        audit.record_ticket_event(
+            dup["id"], "repeat_report", actor=actor,
+            note="24 小时内同实体重复上报，合并进本工单",
+            detail={"request_id": request_id, "severity": decision.get("severity", "")})
+        return dup["id"], True
+    priority = "high" if decision.get("severity") == "major" else "normal"
+    title = decision.get("summary") or f"隐患上报: {brief.get('message_digest', '')[:60]}"
+    try:
+        deadline_h = float(decision.get("deadline_hours") or 168)
+    except (TypeError, ValueError):
+        deadline_h = 168.0
+    tid = audit.create_ticket(
+        title, type_="hazard", priority=priority, source_request_id=request_id,
+        due_ts=time.time() + deadline_h * 3600, brief=brief, actor=actor,
+        user_id=user_id, severity=decision.get("severity", ""),
+        responsible_dept=decision.get("dept", ""))
+    return tid, False
+
+
+async def _notify_hazard_ticket(ticket_id: int, request_id: str, text: str) -> None:
+    """隐患建单/逾期派单 webhook（复用值班通道，失败只告警不抛出）。"""
+    from core.audit_store import notify_escalation_blocking
+    webhook = os.getenv("ESCALATION_WEBHOOK_URL", "").strip()
+    if not webhook:
+        return
+    ok = await asyncio.to_thread(notify_escalation_blocking, webhook,
+                                 {"request_id": request_id, "text": text})
+    if ok and _audit is not None:
+        try:
+            _audit.record_ticket_event(
+                ticket_id, "notify_webhook", actor="system", note="派单 webhook 已实收",
+                to_stage="brief", detail={"request_id": request_id})
+        except Exception as ex:
+            logger.warning(f"工单通知时间线记录失败: {ex}")
+
+
+class HazardConfirmRequest(BaseModel):
+    """确认卡点击（镜像 /feedback 哲学：request_id 即凭据，免管理令牌——
+    建议只发给上报者本人，且 24h 过期）。"""
+    request_id: str
+    user_id: str = ""
+    conv_id: str = ""
+
+
+@app.post("/hazard/confirm", tags=["审计"])
+async def hazard_confirm(body: HazardConfirmRequest):
+    """确认上报建议 → 建隐患工单（brief 阶段起步，五阶段回路闭环）。
+    建议不存在/已处理/已过期回 404；重复上报自动合并（merged=true）。"""
+    if _audit is None:
+        raise HTTPException(503, "审计存储未启用")
+    sug = _audit.get_hazard_suggestion(body.request_id)
+    if sug is None:
+        raise HTTPException(404, "上报建议不存在、已处理或已过期（24 小时内有效）")
+    payload = sug.get("payload") or {}
+    decision = payload.get("decision") or {}
+    brief = payload.get("brief") or {}
+    user_id = body.user_id or sug.get("user_id") or "anonymous"
+    tid, merged = _create_hazard_ticket(_audit, decision, brief,
+                                        body.request_id, user_id, actor=user_id)
+    _audit.mark_hazard_suggestion(body.request_id, "merged" if merged else "confirmed",
+                                  ticket_id=tid)
+    asyncio.create_task(_notify_hazard_ticket(
+        tid, body.request_id,
+        f"【SafetyMind 隐患工单】编号 {body.request_id}\n{decision.get('summary', '')}\n"
+        f"级别: {'重大' if decision.get('severity') == 'major' else '一般'}"
+        f" · 派发: {decision.get('dept', '安环部')}"
+        f" · 限期: {decision.get('deadline_hours', '')} 小时\n"
+        f"时间: {time.strftime('%m-%d %H:%M:%S')}\n请责任部门限期整改，验收走工单五阶段。"))
+    return {"ok": True, "ticket_id": tid, "merged": merged}
+
+
+class TicketPatchInput(BaseModel):
+    """研讨阶段人工改判（PATCH /tickets/{id}）：改定级/派发部门/责任人/限期，
+    改动前后值都落 patch 时间线，全程留痕。"""
+    severity: Optional[str] = None         # major | general
+    responsible_dept: Optional[str] = None
+    assignee: Optional[str] = None
+    priority: Optional[str] = None         # low | normal | high | critical
+    due_hours: Optional[float] = None      # 相对当前时间的新限期
+    note: str = ""
+
+
+@app.patch("/tickets/{ticket_id}", tags=["审计"])
+async def ticket_patch(ticket_id: int, body: TicketPatchInput,
+                       _admin: None = Depends(require_admin)):
+    """白名单字段修改 + 时间线留痕；工单不存在 404，无有效字段 400。"""
+    if _audit is None:
+        raise HTTPException(503, "审计存储未启用")
+    fields: Dict[str, Any] = {}
+    if body.severity is not None:
+        fields["severity"] = body.severity
+    if body.responsible_dept is not None:
+        fields["responsible_dept"] = body.responsible_dept
+    if body.assignee is not None:
+        fields["assignee"] = body.assignee
+    if body.priority is not None:
+        fields["priority"] = body.priority
+    if body.due_hours is not None:
+        fields["due_ts"] = time.time() + body.due_hours * 3600
+    result = _audit.update_ticket_fields(ticket_id, fields, actor="admin", note=body.note)
+    if not result["ok"]:
+        if result.get("kind") == "not_found":
+            raise HTTPException(404, result["error"])
+        raise HTTPException(400, result["error"])
+    return result
+
+
+@app.get("/tickets/overdue", tags=["审计"])
+async def tickets_overdue(_admin: None = Depends(require_admin)):
+    """逾期未闭环工单清单（整改期限已过且未验收）。"""
+    if _audit is None:
+        raise HTTPException(503, "审计存储未启用")
+    return {"tickets": _audit.list_overdue_tickets()}
 
 
 # ── .env 可视化配置（管理端点；白名单 + 掩码 + 原子写）───────────────────────
@@ -916,6 +1066,61 @@ async def _chat_core(req, conv_id: str, OrcReq, MsgRole, t_start: float):
         except Exception as ex:
             logger.warning(f"审计/升级记录失败: {ex}")
 
+    # 7. 隐患工单闸门（分层触发：隐患类意图 × HIGH+ 自动建单 / × MEDIUM 确认卡建议）。
+    #    应急升级（escalated）已在上面建 emergency 工单，闸门直接跳过防重复。
+    #    独立 try/except 降级——闸门任何失败只告警，绝不阻塞对话（仓库降级铁律）。
+    hazard_action, hazard_ticket_id, hazard_suggestion = "none", 0, None
+    if _audit is not None and not result.escalated:
+        try:
+            from core import hazard_gate
+            decision = hazard_gate.decide(
+                intent_result.intent.value if intent_result.intent else "other",
+                intent_result.urgency.value if intent_result.urgency else 1,
+                intent_result.entities or {}, req.message, False)
+            if decision is not None:
+                msg_digest_hz = " ".join(req.message.split())[:80]
+                brief_hz = {
+                    "intent": intent_result.intent.value if intent_result.intent else "other",
+                    "urgency": (intent_result.urgency.name.lower()
+                                if intent_result.urgency else "low"),
+                    "entities": intent_result.entities or {},
+                    "message_digest": msg_digest_hz,
+                    "routing_reason": result.routing_reason,
+                    "request_id": result.request_id,
+                    "severity": decision.get("severity", ""),
+                    "category": decision.get("category", ""),
+                    "basis": decision.get("basis", ""),
+                    "dept": decision.get("dept", ""),
+                }
+                if decision["action"] == "auto":
+                    hazard_ticket_id, merged_hz = _create_hazard_ticket(
+                        _audit, decision, brief_hz, result.request_id,
+                        req.user_id, actor="system")
+                    hazard_action = "merged" if merged_hz else "auto_ticket"
+                    asyncio.create_task(_notify_hazard_ticket(
+                        hazard_ticket_id, result.request_id,
+                        f"【SafetyMind 隐患工单】编号 {result.request_id}\n"
+                        f"{decision.get('summary', '')}\n"
+                        f"级别: {'重大' if decision.get('severity') == 'major' else '一般'}"
+                        f" · 派发: {decision.get('dept', '安环部')}"
+                        f" · 限期: {decision.get('deadline_hours', '')} 小时\n"
+                        f"时间: {time.strftime('%m-%d %H:%M:%S')}\n"
+                        f"高危隐患自动建单，请责任部门限期整改。"))
+                else:  # suggest：暂存建议，用户点确认卡才建单（24h 内有效）
+                    _audit.save_hazard_suggestion(
+                        result.request_id, req.user_id, conv_id,
+                        {"decision": decision, "brief": brief_hz})
+                    hazard_action = "suggested"
+                    hazard_suggestion = {
+                        "summary": decision.get("summary", ""),
+                        "severity": decision.get("severity", "general"),
+                        "dept": decision.get("dept", ""),
+                        "deadline_hours": decision.get("deadline_hours", 0),
+                        "basis": decision.get("basis", ""),
+                    }
+        except Exception as ex:
+            logger.warning(f"隐患工单闸门失败（不影响对话）: {ex}")
+
     return ChatResponse(
         conv_id=conv_id,
         response=result.response,
@@ -937,6 +1142,9 @@ async def _chat_core(req, conv_id: str, OrcReq, MsgRole, t_start: float):
         intent_confidence=round(intent_result.confidence, 4),
         intent_source_scores=intent_result.source_scores,
         request_id=result.request_id,
+        hazard_action=hazard_action,
+        hazard_ticket_id=hazard_ticket_id,
+        hazard_suggestion=hazard_suggestion,
     )
 
 

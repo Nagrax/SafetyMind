@@ -1276,6 +1276,22 @@ button:disabled { opacity: 0.5; cursor: not-allowed; }
   .loop-card { max-width: 380px; }
 }
 
+/* ── 隐患确认卡（中档闸门建议：点"上报"才建单）──
+   警示琥珀边与升级红、主题蓝区分：这是"待你确认的动作"，不是已发生的升级 */
+.hazard-card {
+  width: 100%; max-width: 340px; margin-top: 2px;
+  border: 1px solid var(--warn); border-left: 3px solid var(--warn);
+  border-radius: 12px; background: var(--surface);
+  padding: 10px 12px; display: flex; flex-direction: column; gap: 4px;
+}
+.hazard-line { margin: 0; font-size: 13px; color: var(--text); line-height: 1.5; }
+.hazard-meta { margin: 0; font-size: 12px; color: var(--text-2); }
+.hazard-basis { margin: 0; font-size: 11px; color: var(--text-3); line-height: 1.4; }
+.hazard-actions { display: flex; gap: 8px; margin-top: 4px; }
+@media (min-width: 980px) {
+  .hazard-card { max-width: 380px; }
+}
+
 .m-msg.typing .m-msg-body { display: inline-flex; gap: 5px; align-items: center; padding: 14px 16px; }
 .m-msg.typing .m-msg-body span {
   width: 7px; height: 7px; border-radius: 50%; background: var(--text-3);
