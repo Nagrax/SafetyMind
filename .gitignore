@@ -23,6 +23,7 @@ logs/
 # OS
 .DS_Store
 Thumbs.db
+NUL
 
 # Docker 构建产物
 build-image*.sh
