@@ -1,0 +1,110 @@
+{
+ "说明": "常见安全管理台账 → 支撑文件清单映射（种子）。category 对应资源库三分类，tags 用于在资源库中自动匹配已有条目；matched 不到的支撑文件会在清单中标 missing，提示管理员补充。清单为常见实践总结，具体以当地监管要求和企业制度为准。",
+ "bundles": [
+  {
+   "id": "training",
+   "name": "安全培训教育台账",
+   "aliases": ["培训台账", "安全教育台账", "三级教育"],
+   "items": [
+    {"name": "年度安全培训计划", "description": "培训对象、内容、学时、时间安排，需企业负责人签批", "category": "documents", "tags": ["培训", "计划"]},
+    {"name": "三级安全教育登记卡", "description": "厂级/车间级/班组级教育记录与考核成绩，新员工 24 学时以上（危化单位72学时）", "category": "documents", "tags": ["三级教育", "新员工"]},
+    {"name": "培训签到表", "description": "每次培训的参训人员签到原始记录", "category": "documents", "tags": ["签到", "培训"]},
+    {"name": "培训课件", "description": "本次培训使用的教材/课件存档", "category": "documents", "tags": ["课件", "培训"]},
+    {"name": "考试卷与成绩汇总", "description": "培训后考核试卷、成绩记录、补考记录", "category": "documents", "tags": ["考试", "考核"]},
+    {"name": "培训效果评价", "description": "对培训有效性的评价与改进意见", "category": "documents", "tags": ["评价"]}
+   ]
+  },
+  {
+   "id": "hazard",
+   "name": "隐患排查治理台账",
+   "aliases": ["隐患台账", "排查治理台账", "双重预防"],
+   "items": [
+    {"name": "隐患排查计划/清单", "description": "排查频次、范围、责任人的计划性文件", "category": "documents", "tags": ["隐患", "排查"]},
+    {"name": "安全检查表", "description": "各专业/岗位检查表（日常、专项、季节性）", "category": "documents", "tags": ["检查表"]},
+    {"name": "隐患整改通知单", "description": "隐患描述、整改要求、责任人与期限，需签收", "category": "documents", "tags": ["整改", "通知单"]},
+    {"name": "整改复查验证记录", "description": "整改完成情况与复查人签字，闭环证据", "category": "documents", "tags": ["复查", "闭环"]},
+    {"name": "重大隐患治理方案", "description": "重大隐患的治理方案、资金保障与应急预案（如有）", "category": "documents", "tags": ["重大隐患", "方案"]}
+   ]
+  },
+  {
+   "id": "hazardous_chemicals",
+   "name": "危险化学品管理台账",
+   "aliases": ["危化品台账", "化学品台账"],
+   "items": [
+    {"name": "危险化学品清单", "description": "品名、CAS号、最大存量、储存地点、UN号", "category": "documents", "tags": ["危化品", "清单"]},
+    {"name": "MSDS汇编", "description": "在用化学品的最新版安全技术说明书（可用本系统 msds_lookup 核对条目）", "category": "documents", "tags": ["MSDS", "化学品"]},
+    {"name": "出入库记录", "description": "领用/退回/盘点记录，双人双锁场所需双人签字", "category": "documents", "tags": ["出入库"]},
+    {"name": "储存场所定期检查记录", "description": "柜/库温湿度、通风、静电接地、相容性检查", "category": "documents", "tags": ["储存", "检查"]},
+    {"name": "重大危险源备案材料", "description": "辨识评估报告与备案回执（构成重大危险源时必备）", "category": "documents", "tags": ["重大危险源", "备案"]}
+   ]
+  },
+  {
+   "id": "emergency",
+   "name": "应急预案与演练台账",
+   "aliases": ["应急台账", "预案演练台账"],
+   "items": [
+    {"name": "应急预案文本", "description": "综合/专项/现场处置方案，按规定评审发布", "category": "documents", "tags": ["应急预案"]},
+    {"name": "预案备案回执", "description": "向应急管理部门备案的回执", "category": "documents", "tags": ["备案"]},
+    {"name": "演练方案", "description": "演练目的、情景设置、参演单位与脚本", "category": "documents", "tags": ["演练", "方案"]},
+    {"name": "演练记录（签到/照片/视频索引）", "description": "演练过程原始记录与影像资料索引", "category": "documents", "tags": ["演练", "记录"]},
+    {"name": "演练评估报告", "description": "演练效果评估与改进措施，闭环下次演练", "category": "documents", "tags": ["评估", "演练"]}
+   ]
+  },
+  {
+   "id": "special_equipment",
+   "name": "特种设备台账",
+   "aliases": ["特种设备", "压力容器台账"],
+   "items": [
+    {"name": "特种设备清单", "description": "设备类别、编号、注册代码、检验日期", "category": "documents", "tags": ["特种设备", "清单"]},
+    {"name": "使用登记证", "description": "每台设备的特种设备使用登记证复印件", "category": "documents", "tags": ["登记证"]},
+    {"name": "定期检验报告", "description": "法定定期检验报告，注意下次检验日期预警", "category": "documents", "tags": ["检验"]},
+    {"name": "作业人员证", "description": "特种设备作业人员资格证及复审记录", "category": "documents", "tags": ["人员证"]},
+    {"name": "日常维护保养记录", "description": "维保单位/自检的日常维保记录", "category": "documents", "tags": ["维保"]}
+   ]
+  },
+  {
+   "id": "work_permit",
+   "name": "作业许可台账",
+   "aliases": ["作业票台账", "特殊作业台账"],
+   "items": [
+    {"name": "作业票存根", "description": "动火/受限空间/高处/吊装/临时用电等票证存根，按 GB30871 分类归档", "category": "documents", "tags": ["作业票", "动火"]},
+    {"name": "作业风险分析记录", "description": "JSA/风险分析随票归档", "category": "documents", "tags": ["风险分析", "JSA"]},
+    {"name": "气体检测记录", "description": "动火/受限空间作业的分析数据与检测人签字", "category": "documents", "tags": ["气体检测"]},
+    {"name": "监护人记录", "description": "监护人资格与在岗记录", "category": "documents", "tags": ["监护"]}
+   ]
+  },
+  {
+   "id": "contractor",
+   "name": "相关方管理台账",
+   "aliases": ["承包商台账", "外来施工台账"],
+   "items": [
+    {"name": "相关方资质审查记录", "description": "营业执照、安全生产许可证、业绩审查", "category": "documents", "tags": ["资质", "相关方"]},
+    {"name": "安全管理协议", "description": "双方安全职责划分协议", "category": "documents", "tags": ["协议"]},
+    {"name": "入厂安全教育记录", "description": "外来人员作业前教育与交底记录", "category": "documents", "tags": ["入厂教育"]},
+    {"name": "现场监督检查记录", "description": "作业过程安全监护与违章处理记录", "category": "documents", "tags": ["现场检查"]}
+   ]
+  },
+  {
+   "id": "occupational",
+   "name": "职业健康管理台账",
+   "aliases": ["职业卫生台账", "职业病危害台账"],
+   "items": [
+    {"name": "职业病危害因素检测报告", "description": "年度定期检测报告与点位布置图", "category": "documents", "tags": ["检测", "职业病危害"]},
+    {"name": "职业健康体检报告", "description": "上岗前/在岗/离岗体检结果与告知签收", "category": "documents", "tags": ["体检"]},
+    {"name": "防护用品发放记录", "description": "PPE 发放签收与更换周期记录", "category": "documents", "tags": ["防护用品", "PPE"]},
+    {"name": "职业病危害告知材料", "description": "合同告知、公告栏、警示标识照片", "category": "documents", "tags": ["告知"]}
+   ]
+  },
+  {
+   "id": "safety_investment",
+   "name": "安全投入台账",
+   "aliases": ["安全费用台账", "安全经费"],
+   "items": [
+    {"name": "安全费用提取使用计划", "description": "按《企业安全生产费用提取和使用管理办法》编制的年度计划", "category": "standards", "tags": ["安全费用", "提取"]},
+    {"name": "费用使用凭证汇总", "description": "整改、培训、检测、劳保等支出的凭证汇总", "category": "documents", "tags": ["凭证"]},
+    {"name": "劳保用品采购与验收记录", "description": "采购合同、验收记录、供应商资质", "category": "documents", "tags": ["劳保", "采购"]},
+    {"name": "安全设施维护投入记录", "description": "安全设施/联锁/消防器材的维护更新投入", "category": "documents", "tags": ["安全设施"]}
+   ]
+  }
+ ]
+}

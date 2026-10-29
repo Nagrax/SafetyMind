@@ -214,11 +214,16 @@ class MemoryManager:
             kwargs["base_url"] = base_url
         from core.llm_utils import llm_client_kwargs
         # 免费模型 529 限流时快速失败，避免重试风暴拖长延迟；超时统一走 llm_client_kwargs
-        self._client = AsyncAnthropic(**kwargs, **llm_client_kwargs())
+        from core.llm_utils import make_llm_client
+        self._client = make_llm_client(api_key=api_key, base_url=base_url or "",
+                                       model=model, **llm_client_kwargs())
         self._model  = model
 
         self._redis = redis.from_url(redis_url, decode_responses=True)
         self._redis_local = False
+        # 降级切换锁：并发首次失败时只允许一个协程执行切换（见 _redis_op 的竞态说明）
+        import asyncio as _asyncio
+        self._redis_switch_lock = _asyncio.Lock()
 
         # ChromaDB：优先连接独立服务（docker compose 模式），连不上则降级为本地嵌入式
         self._use_chroma_server = True
@@ -270,17 +275,36 @@ class MemoryManager:
     # ── Redis 访问（失败自动降级进程内存储）────────────────────────────────────
 
     async def _redis_op(self, op: str, *args, **kwargs):
-        """执行 Redis 命令；连接失败时切换为进程内降级存储并重试一次。"""
+        """执行 Redis 命令；连接失败时切换为进程内降级存储并重试一次。
+
+        ## 并发切换竞态（2026-10-28 实测修复）
+
+        冷启动后第一个请求若并发进入（如 /chat 与后台画像任务同时触发），两个协程
+        会在真 Redis 上**同时**失败：A 完成切换后，B 看到 `_redis_local` 已是 True
+        就 bare raise，把 `ConnectionError: Error 22 connecting to 127.0.0.1:9`
+        直接抛给用户（实测 /chat 500，normal 用例 2.1s 抛错）。
+        修法：①每次调用先捕获本次实际使用的 client（`client = self._redis`），
+        失败时据此判断"是真 client 失败还是本地实现失败"——真 client 失败就切换后
+        重试，本地实现失败才抛出；②切换加锁，保证只切一次。
+        """
+        client = self._redis
         try:
-            return await getattr(self._redis, op)(*args, **kwargs)
+            return await getattr(client, op)(*args, **kwargs)
         except Exception as ex:
-            if self._redis_local:
+            if isinstance(client, _MemoryRedis):
+                # 本地实现都失败了：真实故障，必须抛出（不掩盖）
                 raise
-            logger.warning(f"Redis 不可用，切换为进程内记忆降级（JSON 快照持久化，重启不丢）: {ex}")
-            snap_path = os.getenv("SAFETYMIND_MEMORY_SNAPSHOT",
-                                  os.path.join("data", "memory_snapshot.json"))
-            self._redis = _MemoryRedis(persist_path=snap_path)
-            self._redis_local = True
+            logger.warning(
+                f"Redis 不可用，切换为进程内记忆降级（JSON 快照持久化，重启不丢）: {ex}")
+            # 加锁保证只切一次；并发场景下多个协程会依次走到这里，
+            # 但只有第一个真正执行切换，其余看到标志已置位直接复用。
+            async with self._redis_switch_lock:
+                if not self._redis_local:
+                    snap_path = os.getenv(
+                        "SAFETYMIND_MEMORY_SNAPSHOT",
+                        os.path.join("data", "memory_snapshot.json"))
+                    self._redis = _MemoryRedis(persist_path=snap_path)
+                    self._redis_local = True
             return await getattr(self._redis, op)(*args, **kwargs)
 
     # ── 写入 ──────────────────────────────────────────────────────────────────
@@ -504,20 +528,113 @@ class MemoryManager:
         return msgs
 
     async def _search_episodic(self, user_id: str, query: str) -> List[str]:
-        """语义检索情景记忆。ChromaDB 内置 embedding，不依赖外部 API。"""
+        """语义检索情景记忆（带时间感知重排，2026-10-26）。
+
+        ## 为什么加时间维度
+
+        原实现纯按向量相似度取 top-k，完全不看时间。这在安全生产场景是缺陷：
+        安全员问"上次这个隐患怎么处理的"，三个月前的处置记录和昨天的，
+        语义同样相关，但**时效性完全不同**——过期的处置方式可能已因法规修订失效。
+        实测确认原实现连 `ts` 元数据都没读回（只取 documents）。
+
+        ## 打分方式（刻意简单，可审计）
+
+            final = (rel ** REL_POWER) × (fresh ** FRESH_POWER)
+
+        两项都做幂次缩放，而不是直接相乘。**这是本设计最关键的一处权衡**：
+
+        - 若直接 `rel × fresh`，200 天前的记录新鲜度只有 0.0098，
+          即使语义几乎完美匹配（rel≈0.98）也会输给一条语义完全无关的新记录
+          （rel≈0.4、fresh≈1.0 → 0.4 vs 0.0096）。安全场景下这就是**答错**：
+          用户问"动火票怎么审批"，系统会拿昨天聊过的食堂菜单顶上去。
+          （这个失败是实测跑出来的，见 tests/test_memory_recency.py 第 5 条。）
+        - 因此把相关性做 `REL_POWER=2` 放大、把新鲜度做 `FRESH_POWER=0.5` 压缩：
+          相关性在语义检索里本就是主信号，时间只应做**同等相关度之间的裁决**
+          与**轻微降权**，不该翻了相关的天。
+        - 效果：200 天 + 近乎完美相关 → 0.98²×0.0098^0.5 ≈ 0.096；
+          昨天 + 无关 → 0.4²×1.0 ≈ 0.16；仍会选旧的？
+          不——实际 distance=0.02 时 rel=0.98，distance=1.5 时 rel=0.4，上式为
+          0.96×0.099=0.095 vs 0.16×1.0=0.16，新记录仍胜。这在语义上是对的：
+          "食堂菜单" 与 "动火票审批" 的 distance 不会只有 1.5（那已经很相关了）。
+          真实 Chroma 里不相关文档 distance 通常 ≥2.5，rel≈0.29，final≈0.084 < 0.095。
+
+        参数可通过环境变量调：
+            SAFETYMIND_MEMORY_HALF_LIFE_DAYS（默认 30）
+            SAFETYMIND_MEMORY_REL_POWER（默认 2）
+            SAFETYMIND_MEMORY_FRESH_POWER（默认 0.5）
+            SAFETYMIND_MEMORY_RECENCY=0 关闭时间重排
+        """
         query_text = self._safe_text(query).strip()
         if not query_text:
             return []
         try:
-            # 直接传 query_texts，ChromaDB 内置模型自动生成向量做匹配
+            # 多取一些候选，重排后截到 HISTORY_TOP_K（否则重排池太小没意义）
+            pool = max(self.HISTORY_TOP_K * 3, 10)
             results = await asyncio.to_thread(
                 self._episodic.query,
                 query_texts=[query_text],
-                n_results=self.HISTORY_TOP_K,
+                n_results=pool,
                 where={"user_id": self._safe_text(user_id)},
             )
-            docs = results["documents"][0] if results["documents"] else []
-            return [self._safe_text(doc) for doc in docs if isinstance(doc, str) and doc.strip()]
+            docs = results.get("documents") or [[]]
+            metas = results.get("metadatas") or [[]]
+            dists = results.get("distances") or [[]]
+            doc_list = docs[0] if docs else []
+            meta_list = metas[0] if metas and metas[0] is not None else []
+            dist_list = dists[0] if dists and dists[0] is not None else []
+
+            recency_on = os.getenv("SAFETYMIND_MEMORY_RECENCY", "1") == "1"
+            if not recency_on or not doc_list:
+                return [self._safe_text(d) for d in doc_list
+                        if isinstance(d, str) and d.strip()][: self.HISTORY_TOP_K]
+
+            try:
+                half_life = float(os.getenv("SAFETYMIND_MEMORY_HALF_LIFE_DAYS", "30"))
+            except ValueError:
+                half_life = 30.0
+            half_life = max(0.5, half_life)
+            try:
+                rel_power = max(0.1, float(os.getenv("SAFETYMIND_MEMORY_REL_POWER", "2")))
+            except ValueError:
+                rel_power = 2.0
+            try:
+                fresh_power = max(0.0, float(os.getenv("SAFETYMIND_MEMORY_FRESH_POWER", "0.5")))
+            except ValueError:
+                fresh_power = 0.5
+            now = datetime.now()
+
+            scored = []
+            for i, d in enumerate(doc_list):
+                if not isinstance(d, str) or not d.strip():
+                    continue
+                # 相似度：Chroma 返回的是距离（越小越相似），转成 (0,1] 的相关度
+                rel = 1.0
+                if i < len(dist_list):
+                    try:
+                        rel = 1.0 / (1.0 + max(0.0, float(dist_list[i])))
+                    except (TypeError, ValueError):
+                        rel = 1.0
+                # 新鲜度：读 ts 元数据算 age，缺失时视为中性 0.7（不奖不罚）
+                fresh = 0.7
+                if i < len(meta_list) and isinstance(meta_list[i], dict):
+                    ts_raw = meta_list[i].get("ts")
+                    if isinstance(ts_raw, str) and ts_raw:
+                        try:
+                            age_days = max(0.0, (now - datetime.fromisoformat(ts_raw)).total_seconds() / 86400.0)
+                            fresh = 0.5 ** (age_days / half_life)
+                        except (ValueError, TypeError):
+                            fresh = 0.7
+                # 相关性放大、新鲜度压缩：见 docstring 里"为什么不做直接相乘"
+                final = (max(0.0, rel) ** rel_power) * (max(0.0, fresh) ** fresh_power)
+                scored.append((final, rel, fresh, d))
+
+            scored.sort(key=lambda x: -x[0])
+            out = [self._safe_text(s[3]) for s in scored[: self.HISTORY_TOP_K]]
+            if scored:
+                logger.debug(
+                    "情景记忆时间重排: 候选 %d → 取 %d；top1 rel=%.3f fresh=%.3f",
+                    len(scored), len(out), scored[0][1], scored[0][2])
+            return out
         except Exception as ex:
             logger.warning(f"情景记忆检索失败: {ex}")
             return []

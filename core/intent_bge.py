@@ -144,6 +144,21 @@ class BGEProtoClassifier:
         os.environ.setdefault("HF_HUB_DISABLE_XET", "1")
         os.environ.setdefault("HF_ENDPOINT", "https://hf-mirror.com")
         os.environ.setdefault("HF_HOME", r"D:\hf_cache")
+        # ── 冷启动离线优先（2026-10-26 生产就绪门禁实测）───────────────────
+        # 现象：默认联网模式下启动要发 15 次 HF 外部 HEAD 请求，冷启动 40.2s；
+        #      HF_HUB_OFFLINE=1 时 0 次外部请求、29.2s。更严重的是**无外网环境**
+        #      （内网部署/防火墙/镜像站限流）会导致模型加载卡住，服务 180s 都起不来
+        #      （prod_readiness G1 实测就是这种失败）。重启是运维常态，这等于可用性缺陷。
+        #
+        # 权衡：默认离线 = 启动快且可离线部署；代价是"模型有新版本时不会自动发现"。
+        # 这个取舍对生产是对的：**部署可复现 > 自动升级**。需要联网检查时显式设
+        # SAFETYMIND_HF_ONLINE=1（或自己设 HF_HUB_OFFLINE=0）。
+        if os.getenv("SAFETYMIND_HF_ONLINE", "").strip() == "1":
+            os.environ.pop("HF_HUB_OFFLINE", None)
+            os.environ.pop("TRANSFORMERS_OFFLINE", None)
+        else:
+            os.environ.setdefault("HF_HUB_OFFLINE", "1")
+            os.environ.setdefault("TRANSFORMERS_OFFLINE", "1")
         import torch
         from core.bge_embedding import _apply_torch_thread_limit, get_shared_bge
         _apply_torch_thread_limit()  # 小核机器并发推理保护（与知识库嵌入同一全局限制）

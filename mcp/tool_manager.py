@@ -58,12 +58,27 @@ class ToolStats:
     consecutive_fails:  int = 0
 
     @property
+    def completed(self) -> int:
+        return self.success + self.failed
+
+    @property
+    def in_flight(self) -> int:
+        """已受理未返回的调用数（与 AgentStats 同口径，2026-10-29 统一）。"""
+        return max(0, self.total - self.completed)
+
+    @property
     def success_rate(self) -> float:
-        return self.success / self.total if self.total else 1.0
+        """只按已完成调用计算；无完成样本给 1.0。
+
+        与 AgentStats 同一缺陷、同一修法：total 在调用开始时 +1，若分母用 total，
+        慢工具（corpus 检索 ~1s、模型重排更久）在途期间会被算成失败并压低成功率，
+        进而触发 Monitor 告警、并影响熔断/路由判断。
+        """
+        return self.success / self.completed if self.completed else 1.0
 
     @property
     def avg_latency_ms(self) -> float:
-        return self.total_latency_ms / self.total if self.total else 0.0
+        return self.total_latency_ms / self.completed if self.completed else 0.0
 
 
 # ── 熔断器 ────────────────────────────────────────────────────────────────────
@@ -135,11 +150,9 @@ class MCPToolManager:
     """
 
     def __init__(self, api_key: str, base_url: Optional[str] = None, model: str = "claude-3-5-sonnet-20241022"):
-        kwargs: Dict[str, Any] = {"api_key": api_key}
-        if base_url:
-            kwargs["base_url"] = base_url
-        from core.llm_utils import llm_client_kwargs
-        self._client = AsyncAnthropic(**kwargs, **llm_client_kwargs())
+        from core.llm_utils import llm_client_kwargs, make_llm_client
+        self._client = make_llm_client(api_key=api_key, base_url=base_url or "",
+                                       model=model, **llm_client_kwargs())
         self._model  = model
         self._tools: Dict[str, Tool] = {}
         self._cache: Dict[str, tuple] = {}   # key → (result, expire_at, reranked)
@@ -461,6 +474,10 @@ class MCPToolManager:
                 "avg_latency_ms": round(t.stats.avg_latency_ms, 1),
                 "consecutive_fails": t.stats.consecutive_fails,
                 "circuit_state": t.breaker.state.value,
+                # additive：区分"在途"与"失败"（旧消费方不受影响）
+                "completed": t.stats.completed,
+                "failed": t.stats.failed,
+                "in_flight": t.stats.in_flight,
             }
             for name, t in self._tools.items()
         }

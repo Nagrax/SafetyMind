@@ -15,9 +15,12 @@ ChromaDB 在这里的角色：
   两者互不干扰。
 """
 import asyncio
+import contextvars
 import hashlib
 import logging
-from typing import Any, Dict, List, Optional
+import threading
+import time
+from typing import Any, Callable, Dict, List, Optional
 
 import os
 import chromadb
@@ -25,6 +28,39 @@ import chromadb
 from core.chroma_utils import open_local_chroma
 
 logger = logging.getLogger(__name__)
+
+# ── 访问范围（S-05 资料 ACL）────────────────────────────────────────────────
+# 请求级资料范围：多用户形态下由 api/main.py 在一次请求内绑定，检索（含线程池内的同步
+# 实现、模型驱动的工具调用）按该范围过滤；默认 None = 不做任何过滤（本地/单人形态行为不变）。
+SCOPES_CONTEXT: contextvars.ContextVar[Optional[List[str]]] = contextvars.ContextVar(
+    "safetymind_kb_scopes", default=None)
+
+# ── K03/K07：corpus（统一导入库）接入同一条检索/注入链（加法式）────────────────
+# 注册一个 callable：fn(query, scopes) -> Dict（corpus.search 返回结构，含 blocks/cards/build）。
+# 未注册或调用失败时返回 None —— 既有 knowledge_search 链路逐字节不变。
+CORPUS_PROVIDER: Optional[Callable[[str, Optional[List[str]]], Any]] = None
+
+
+def set_corpus_provider(fn: Optional[Callable[[str, Optional[List[str]]], Any]]) -> None:
+    """注册 corpus 检索提供者（api.main 在 lifespan 内接线；测试可注入）。"""
+    global CORPUS_PROVIDER
+    CORPUS_PROVIDER = fn
+
+
+def get_corpus_provider() -> Optional[Callable[[str, Optional[List[str]]], Any]]:
+    return CORPUS_PROVIDER
+
+
+def run_corpus_provider(query: str, scopes: Optional[List[str]] = None) -> Optional[Dict[str, Any]]:
+    """调用已注册的 corpus 检索；未注册/失败返回 None（不阻断既有链路）。"""
+    fn = CORPUS_PROVIDER
+    if fn is None:
+        return None
+    try:
+        return fn(query, scopes)
+    except Exception as ex:  # pragma: no cover - 依赖外部数据与磁盘状态
+        logger.warning(f"corpus 检索接入失败（既有链路不受影响）: {ex}")
+        return None
 
 
 class KnowledgeBase:
@@ -43,8 +79,9 @@ class KnowledgeBase:
     COLLECTION_NAME         = "knowledge_base"
     PARENT_COLLECTION_NAME  = "knowledge_base_parents"
     PARENT_MAX_CHARS        = 6000   # 父块（整篇文档）入库截断上限
-    RETURN_PARENT_MAX_CHARS = 1200   # 返回给 prompt 的父块内容截断
+    RETURN_PARENT_MAX_CHARS = 2400   # 返回给 prompt 的父块内容截断（上层可再按 token 预算收紧）
     OVERLAP_SENTENCES       = 1      # 相邻子块重叠的句子数
+    DOC_META_KEYS           = ("source", "version", "scope", "status")  # 可选的文档身份元数据
 
     def __init__(
         self,
@@ -96,6 +133,15 @@ class KnowledgeBase:
             metadata={"description": "SafetyMind RAG 知识库（子块）"},
             embedding_function=embedding_function,
         )
+        # 运行态降级标记（None=正常；"transient"/"corrupt"=已降级），
+        # 供 /search/direct 等端点在响应体如实标注（2026-10-26 新增）
+        self._last_degraded: Optional[str] = None
+        # 运行态自愈状态（2026-10-26）：corrupt 时可归档重建，无需重启
+        self._chroma_path = chroma_path
+        self._embed_fn = embedding_function
+        self._embed_suffix = suffix
+        self._recovery_lock = threading.Lock()
+        self._recovered_at = 0.0
         # 父块集合：整篇文档，命中子块后取回完整上下文（仅为批量 get 的载体，不参与检索）
         self._parents = self._client.get_or_create_collection(
             name=self.PARENT_COLLECTION_NAME + suffix,
@@ -113,19 +159,34 @@ class KnowledgeBase:
         """
         批量导入文档到知识库。
 
-        documents 格式: [{"title": "...", "content": "..."}, ...]
+        documents 格式: [{"title": "...", "content": "...",
+                          "source": "...", "version": "...", "scope": "...", "status": "..."}, ...]
+        后四个为可选的文档身份元数据，缺失时按空串写入子块与父块 metadata，
+        既有只给 title/content 的调用行为不变。
         长文档会自动切片（每片约 500 字，句级边界，相邻块重叠 1 句）。
         同时将整篇原文存入父块集合，供父子召回使用。
 
+        upsert 语义：同一 title 再次导入时先删除该 title 的旧子块再写入，
+        避免新旧子块并存污染检索（父块按 parent_id 覆盖）；删除只针对同 title，
+        不会影响其他文档。
+
         返回值：导入的子块数量。
+
+        批量写入（2026-10-29 实测修）：原实现对**每篇文档**做一次父块 upsert（一次嵌入）
+        和一次按标题删除；灌 1698 条真实数据实测跑了 20 分钟还没完（父块逐篇嵌入是主因）。
+        现在改为：按标题批量删除（$in 分片）+ 父块**一次批量 upsert** + 子块一次批量 add。
         """
         ids, docs, metas = [], [], []
+        parent_ids, parent_docs, parent_metas = [], [], []
+        titles: List[str] = []
 
         for doc in documents:
             title   = doc.get("title", "")
             content = doc.get("content", "")
+            extra   = {k: (doc.get(k, "") or "") for k in self.DOC_META_KEYS}
             parent_id = hashlib.md5(f"{title}_parent".encode()).hexdigest()
             chunks  = self._chunk_text(content, chunk_size=500)
+            titles.append(title)
 
             for i, chunk in enumerate(chunks):
                 doc_id = hashlib.md5(f"{title}_{i}_{chunk[:50]}".encode()).hexdigest()
@@ -137,19 +198,41 @@ class KnowledgeBase:
                     "parent_id": parent_id,
                     "chunk_index": i,
                     "total_chunks": len(chunks),
+                    "content_hash": self._short_hash(chunk),
+                    **extra,
                 })
 
-            # 父块：整篇文档（截断），供命中后取回完整上下文
-            self._parents.upsert(
-                ids=[parent_id],
-                documents=[content[:self.PARENT_MAX_CHARS]],
-                metadatas=[{"title": title, "type": "parent"}],
-            )
+            # 父块：整篇文档（截断），供命中后取回完整上下文；身份元数据同步写入父块
+            parent_ids.append(parent_id)
+            parent_docs.append(content[:self.PARENT_MAX_CHARS])
+            parent_metas.append({"title": title, "type": "parent", **extra})
+
+        # upsert：先清掉同标题旧子块，避免重复导入累积（只按标题删除，不动别的文档）
+        # 按 200 个标题一片做 $in，避免超长 where；单片失败只告警不中断（与旧行为一致）
+        for start in range(0, len(titles), 200):
+            batch = titles[start:start + 200]
+            try:
+                self._collection.delete(where={"title": {"$in": batch}})
+            except Exception as ex:
+                logger.warning(f"清理同标题旧子块失败（继续导入）: {ex}")
+
+        if parent_ids:
+            # 一次批量 upsert：Chroma 会对整批做嵌入，比逐篇快一个量级
+            self._parents.upsert(ids=parent_ids, documents=parent_docs,
+                                 metadatas=parent_metas)
 
         if ids:
             # ChromaDB 会自动生成 Embedding
             self._collection.add(ids=ids, documents=docs, metadatas=metas)
             logger.info(f"知识库导入 {len(ids)} 个子块 / {len(documents)} 篇父文档")
+            # 库内容变了 → 回复缓存必须全量失效，否则会拿旧答案回答新库
+            # （版本号进缓存 key，bump 即天然失效；见 core/response_cache.py）
+            try:
+                from core.response_cache import bump_kb_version
+                _v = bump_kb_version()
+                logger.info(f"回复缓存已失效（kb_version → {_v}）")
+            except Exception as _ex:
+                logger.warning(f"缓存版本号更新失败（不影响导入）: {_ex}")
 
         return len(ids)
 
@@ -159,23 +242,79 @@ class KnowledgeBase:
 
     # ── 检索 ──────────────────────────────────────────────────────────────────
 
-    def search(self, query: str, top_k: int = 5) -> List[Dict[str, Any]]:
+    def search(self, query: str, top_k: int = 5,
+               scopes: Optional[List[str]] = None) -> List[Dict[str, Any]]:
         """
         父子召回（small-to-big）：
           1. 用 query 在子块集合上做向量检索（超采 top_k * 4）
           2. 按父块聚合去重，保留每篇父块的最高子块得分
           3. 批量取回父块（整篇）内容，按子块得分排序返回前 top_k 篇
 
-        旧数据（子块无 type/parent_id 元数据）自动退化为子块直出。
+        访问范围（S-05）：scopes 为 None 时不做任何过滤（且回落到请求级 SCOPES_CONTEXT，
+        未绑定即不过滤 → 本地/单人形态行为不变）；scopes 为列表时只允许 scope 属于该列表
+        的文档，外加 scope 为空串的公共文档（含旧数据缺 scope 字段者按公共处理）。
+        过滤条件不被当前 ChromaDB 支持时降级为不过滤并在日志中如实说明。
+
+        返回结构（旧字段 title/content/score/chunk 保留；snippet 语义升级为完整命中子块）：
+          - snippet       命中的**完整子块**正文（不再 300 字截断），供上层直接组装证据
+          - snippet_short 旧语义的 300 字短摘要（兼容）
+          - context_blob  命中子块在父文档内的前/后相邻子块拼接（取不到为空串）
+          - chunk_id / content_hash  子块正文 sha256 前 16 位（稳定身份，供引用定位）
+          - doc_id / parent_id       父块（整篇文档）身份
+          - chunk_index / total_chunks / section  章节定位（旧数据缺失给 -1 / ""）
+          - source / version / scope / status     文档身份元数据（缺失给 ""）
+        content 仍是父块内容（按 RETURN_PARENT_MAX_CHARS 截断）。
+
+        旧数据（子块无 type/parent_id 元数据）自动退化为子块直出，身份字段给安全默认值。
         """
-        results = self._collection.query(
-            query_texts=[query],
-            n_results=top_k * 4,
-            where={"type": "child"},
-        )
+        if scopes is None:
+            scopes = SCOPES_CONTEXT.get()
+        restricted = scopes is not None and "*" not in scopes
+        # 运行时降级（2026-10-26 实测新增）：
+        #   ChromaDB 在长时间运行 + 反复并发后会出现**运行态劣化**：
+        #     chromadb.errors.InternalError: Error executing plan: Internal error: Error finding id
+        #   实测证据：同一份 .env、同一配置下，全新实例 /search/direct 返回 200，
+        #   而跑了多轮压测的旧实例稳定 500（3/3）。仓库原有的自愈只在**启动时**
+        #   （core/chroma_utils.open_local_chroma）生效，运行中遇到该错误会一路抛到 HTTP 500，
+        #   前端「检索」按钮直接失败、/chat 也降级。
+        #
+        # 处理原则：**检索不可用不应该让整个对话/检索接口 500**。
+        #   捕获后如实标记 degraded 并返回空结果，由上层决定如何向用户说明。
+        #   绝不静默伪造检索结果（那会把"没查到"变成"查到了"）。
+        try:
+            results = self._scoped_child_query(query, top_k * 4, scopes)
+        except Exception as ex:
+            _degrade_note = self._runtime_degrade(ex)
+            logger.warning(f"知识库检索运行态异常，已降级为空结果: {ex}")
+            self._last_degraded = _degrade_note
+            # 运行态自愈（2026-10-26）：corrupt 时归档重建 + 重导默认知识，无需重启。
+            # 只重试一次：自愈后仍失败就如实返回空，绝不循环。
+            # 自愈自身失败也**绝不外抛**——降级搜索不能因为自愈 bug 变成 500
+            # （本轮实测：mock 场景缺自愈属性时连带抛 AttributeError 就是这个坑）。
+            if (_degrade_note == "corrupt"
+                    and os.getenv("SAFETYMIND_KB_RUNTIME_RECOVERY", "1") == "1"):
+                recovered = False
+                try:
+                    recovered = self.recover_runtime(str(ex)[:200])
+                except Exception as rec_ex:
+                    logger.error(f"运行态自愈执行异常（按未自愈处理）: {rec_ex}")
+                if recovered:
+                    try:
+                        results = self._scoped_child_query(query, top_k * 4, scopes)
+                        self._last_degraded = None   # 自愈成功，恢复健康标记
+                        logger.info("知识库运行态自愈成功，本次查询已在重建后的库上完成")
+                    except Exception as ex2:
+                        logger.warning(f"自愈后重查仍失败，返回空结果: {ex2}")
+                        return []
+                else:
+                    return []
+            else:
+                return []
         if not results["documents"] or not results["documents"][0]:
             # 兼容旧数据：子块没有 type 元数据时不过滤重查
             results = self._collection.query(query_texts=[query], n_results=top_k * 4)
+            if restricted:
+                results = self._client_scope_filter(results, scopes)
             if not results["documents"] or not results["documents"][0]:
                 return []
             hits = zip(
@@ -183,16 +322,21 @@ class KnowledgeBase:
                 results["metadatas"][0],
                 results["distances"][0],
             )
-            return [
-                {
-                    "title":    meta.get("title", ""),
-                    "content":  doc[:self.RETURN_PARENT_MAX_CHARS],
-                    "snippet":  doc[:300],
-                    "score":    round(1.0 - dist, 4),
-                    "chunk":    meta.get("chunk_index", 0),
+            items: List[Dict[str, Any]] = []
+            for doc, meta, dist in hits:
+                meta = meta or {}
+                item = {
+                    "title":         meta.get("title", ""),
+                    "content":       doc[:self.RETURN_PARENT_MAX_CHARS],
+                    "snippet":       doc,
+                    "snippet_short": doc[:300],
+                    "context_blob":  "",
+                    "score":         round(1.0 - dist, 4),
+                    "chunk":         meta.get("chunk_index", 0),
                 }
-                for doc, meta, dist in hits
-            ][:top_k]
+                item.update(self._identity_fields(doc, meta))
+                items.append(item)
+            return items[:top_k]
 
         hits = zip(
             results["documents"][0],
@@ -203,6 +347,7 @@ class KnowledgeBase:
         # 按父块聚合：同一篇文档的多个子块命中只保留最高分
         best_by_parent: Dict[str, Dict[str, Any]] = {}
         for doc, meta, dist in hits:
+            meta = meta or {}
             parent_id = meta.get("parent_id", "")
             score = round(1.0 - dist, 4)  # ChromaDB 返回距离，转为相似度
             if not parent_id or parent_id not in best_by_parent or score > best_by_parent[parent_id]["score"]:
@@ -212,6 +357,7 @@ class KnowledgeBase:
                     "score":     score,
                     "chunk":     meta.get("chunk_index", 0),
                     "snippet":   doc,
+                    "meta":      meta,
                 }
 
         # 按子块得分排序，取前 top_k 篇父文档
@@ -228,23 +374,104 @@ class KnowledgeBase:
             except Exception as ex:
                 logger.warning(f"父块取回失败，退化为子块直出: {ex}")
 
-        items: List[Dict[str, Any]] = []
+        # 批量取回命中父块的全部子块（仅正文与元数据，不含向量），用于按 chunk_index 拼接邻近上下文
+        siblings: Dict[str, Dict[int, str]] = {}
+        if ids_to_fetch:
+            try:
+                got = self._collection.get(where={"parent_id": {"$in": ids_to_fetch}})
+                for sdoc, smeta in zip(got.get("documents") or [], got.get("metadatas") or []):
+                    smeta = smeta or {}
+                    pid = smeta.get("parent_id", "")
+                    ci = smeta.get("chunk_index")
+                    if pid and isinstance(ci, int):
+                        siblings.setdefault(pid, {})[ci] = sdoc
+            except Exception as ex:
+                logger.warning(f"邻近子块取回失败（context_blob 置空）: {ex}")
+
+        items = []
         for entry in ordered:
             parent_text = parents_map.get(entry["parent_id"])
             if not parent_text:
                 parent_text = entry["snippet"]  # 无父块时退化为命中的子块
-            items.append({
-                "title":    entry["title"],
-                "content":  parent_text[:self.RETURN_PARENT_MAX_CHARS],
-                "snippet":  entry["snippet"][:300],
-                "score":    entry["score"],
-                "chunk":    entry["chunk"],
-            })
+            meta = entry.get("meta") or {}
+            item = {
+                "title":         entry["title"],
+                "content":       parent_text[:self.RETURN_PARENT_MAX_CHARS],
+                "snippet":       entry["snippet"],
+                "snippet_short": entry["snippet"][:300],
+                "context_blob":  self._neighbor_blob(entry["parent_id"], meta, siblings),
+                "score":         entry["score"],
+                "chunk":         entry["chunk"],
+            }
+            item.update(self._identity_fields(entry["snippet"], meta))
+            items.append(item)
         return items
 
-    async def search_async(self, query: str, top_k: int = 5) -> List[Dict[str, Any]]:
-        """异步检索；ChromaDB 客户端为同步实现，因此放入线程池执行。"""
-        return await asyncio.to_thread(self.search, query, top_k)
+    async def search_async(self, query: str, top_k: int = 5,
+                           scopes: Optional[List[str]] = None) -> List[Dict[str, Any]]:
+        """异步检索；ChromaDB 客户端为同步实现，因此放入线程池执行。
+
+        asyncio.to_thread 会复制当前 contextvars，故请求级 SCOPES_CONTEXT 在线程内同样可见。
+        """
+        return await asyncio.to_thread(self.search, query, top_k, scopes)
+
+    def list_documents(self) -> List[Dict[str, Any]]:
+        """
+        返回去重后的文档目录（仅元数据，不含可引用正文）。
+
+        目录项字段：title / doc_id / source / version / scope / status /
+        chunk_count / has_child。只有父块、没有子块的文档 has_child=False，
+        上层据此区分"只有目录记录"与"已收录可引用条款"，避免用目录宣称已读取正文。
+        """
+        catalog: Dict[str, Dict[str, Any]] = {}
+
+        def _entry(doc_id: str, meta: Dict[str, Any]) -> Dict[str, Any]:
+            return {
+                "title":       meta.get("title", "") or "",
+                "doc_id":      doc_id,
+                "source":      meta.get("source", "") or "",
+                "version":     meta.get("version", "") or "",
+                "scope":       meta.get("scope", "") or "",
+                "status":      meta.get("status", "") or "",
+                "chunk_count": 0,
+                "has_child":   False,
+            }
+
+        try:
+            parents = self._parents.get(include=["metadatas"])
+        except Exception as ex:
+            logger.warning(f"目录父块读取失败: {ex}")
+            parents = {}
+        for pid, pmeta in zip(parents.get("ids") or [], parents.get("metadatas") or []):
+            catalog[pid] = _entry(pid, pmeta or {})
+
+        try:
+            kids = self._collection.get(include=["metadatas"])
+        except Exception as ex:
+            logger.warning(f"目录子块读取失败: {ex}")
+            kids = {}
+
+        for cmeta in kids.get("metadatas") or []:
+            cmeta = cmeta or {}
+            if cmeta.get("type") not in (None, "child"):
+                continue
+            pid = cmeta.get("parent_id", "") or ""
+            if not pid:
+                continue
+            entry = catalog.get(pid)
+            if entry is None:
+                entry = catalog[pid] = _entry(pid, cmeta)
+            entry["chunk_count"] += 1
+            entry["has_child"] = True
+            for k in ("title", "source", "version", "scope", "status"):
+                if not entry.get(k):
+                    entry[k] = cmeta.get(k, "") or ""
+
+        return list(catalog.values())
+
+    async def list_documents_async(self) -> List[Dict[str, Any]]:
+        """异步获取文档目录；ChromaDB 客户端为同步实现，因此放入线程池执行。"""
+        return await asyncio.to_thread(self.list_documents)
 
     @property
     def doc_count(self) -> int:
@@ -265,10 +492,173 @@ class KnowledgeBase:
             handler=kb.search_handler,
             ...
         ))
+
+        访问范围（S-05，可选）：params.scopes 或 context.scopes 给出资料范围；两者都没有时
+        回落到请求级 SCOPES_CONTEXT（多用户形态下由 API 层绑定）——未绑定即不传 scopes，
+        检索行为与改造前完全一致。
         """
         query = params.get("query", "")
         top_k = params.get("top_k", 5)
-        return await self.search_async(query, top_k=top_k)
+        scopes = params.get("scopes")
+        if scopes is None and isinstance(context, dict):
+            scopes = context.get("scopes")
+        if scopes is None:
+            scopes = SCOPES_CONTEXT.get()
+        return await self.search_async(query, top_k=top_k, scopes=scopes)
+
+    # ── 请求级访问范围（S-05）────────────────────────────────────────────────
+
+    def _runtime_degrade(self, ex: Exception) -> str:
+        """记录一次运行态检索降级，并判断是否属于"需要重启才能恢复"的类别。
+
+        区分两类异常（决定上层该怎么应对）：
+          - **transient**：偶发连接/超时。正常的重试逻辑会自愈，只需降级本次。
+          - **corrupt**：ChromaDB 内部状态损坏（`Error finding id` / `hnsw` / `segment`）。
+            实测这类**重启才能恢复**，必须显式提示，否则运维只会看到"检索总是空的"。
+            （2026-10-26 更新：corrupt 现在支持运行态自愈，见 recover_runtime。）
+
+        返回值是降级类别字符串，写入 `self._last_degraded`，供 /search/direct 等端点
+        在响应体里如实标注（前端可据此提示"知识库暂不可用"，而不是显示"没检索到"）。
+        """
+        msg = str(ex).lower()
+        corrupt_markers = ("error finding id", "hnsw", "segment", "nothing found on disk",
+                           "internal error")
+        kind = "corrupt" if any(m in msg for m in corrupt_markers) else "transient"
+        self._last_degraded = kind
+        if kind == "corrupt":
+            logger.error(
+                "知识库运行态损坏（%s）。已尝试运行态自愈（归档重建）；"
+                "若反复出现，检查是否多进程/多实例共享同一 chroma 目录（铁律 9）。",
+                str(ex)[:160])
+        return kind
+
+    # ── 运行态自愈（corrupt 时无需重启）─────────────────────────────────────
+
+    _RECOVERY_COOLDOWN_S = 120.0   # 两次自愈的最小间隔：防"重建又损坏"死循环
+
+    def recover_runtime(self, reason: str) -> bool:
+        """corrupt 时归档坏库并重建，返回是否成功。
+
+        流程（与启动自愈 core/chroma_utils.open_local_chroma 同构，但发生在运行中）：
+          1. 归档损坏目录（Windows 句柄未释放时 rename 被拒 → 退到时间戳新目录）
+          2. 重新打开 client + 子块/父块集合（沿用同一嵌入函数与集合后缀）
+          3. 重导默认知识（_load_default_docs）
+        此前人工添加的文档会丢失——这是权衡：**可用性 > 数据完整性**，
+        且日志里会明确提示重新上传。
+
+        防护：线程锁防并发重建；冷却期（120s）防"重建又损坏"死循环。
+        服务器模式（chroma host:port）不归本方法管——那是独立进程的事。
+        """
+        if getattr(self, "_use_server", False):
+            logger.warning("服务器模式不支持本地运行态自愈，跳过（需重启 chroma 服务）")
+            return False
+        with self._recovery_lock:
+            now = time.time()
+            if now - getattr(self, "_recovered_at", 0.0) < self._RECOVERY_COOLDOWN_S:
+                logger.warning("距上次自愈不足冷却期（%.0fs），跳过以防循环重建",
+                               now - getattr(self, "_recovered_at", 0.0))
+                return False
+            try:
+                self._archive_and_reopen()
+                self._load_default_docs()
+                self._recovered_at = now
+                logger.error(
+                    "知识库运行态自愈完成（原因: %s）。默认知识已重导；"
+                    "此前人工添加的文档已随坏库归档，需要重新上传。", reason)
+                return True
+            except Exception as ex:
+                logger.error(f"知识库运行态自愈失败: {type(ex).__name__}: {ex}")
+                return False
+
+    def _archive_and_reopen(self) -> None:
+        """归档损坏目录并重开 client 与两个集合（嵌入函数与后缀沿用 init 的选择）。"""
+        path = self._chroma_path
+        archive = f"{path}_corrupt_{int(time.time())}"
+        try:
+            os.rename(path, archive)
+            logger.warning(f"已归档损坏库 → {archive}（可人工删除）")
+            new_path = path
+        except OSError:
+            new_path = f"{path}_fresh_{int(time.time())}"
+            logger.warning(f"归档失败（文件被占用），改用新目录: {new_path}")
+        self._chroma_path = new_path
+        client = chromadb.PersistentClient(
+            path=new_path,
+            settings=chromadb.Settings(anonymized_telemetry=False),
+        )
+        for col in client.list_collections():
+            col.count()   # 探测新目录健康（与启动自愈同款）
+        self._client = client
+        self._collection = client.get_or_create_collection(
+            name=self.COLLECTION_NAME + self._embed_suffix,
+            metadata={"description": "SafetyMind RAG 知识库（子块）"},
+            embedding_function=self._embed_fn,
+        )
+        self._parents = client.get_or_create_collection(
+            name=self.PARENT_COLLECTION_NAME + self._embed_suffix,
+            metadata={"description": "SafetyMind RAG 知识库（父块·整篇）"},
+            embedding_function=self._embed_fn,
+        )
+
+    def bind_scopes(self, scopes: Optional[List[str]]):
+        """绑定本次请求的资料范围（contextvar），返回 token 供 reset。"""
+        return SCOPES_CONTEXT.set(list(scopes) if scopes else None)
+
+    @staticmethod
+    def reset_scopes(token) -> None:
+        """解除绑定（失败不抛出：范围绑定不参与业务失败判定）。"""
+        try:
+            SCOPES_CONTEXT.reset(token)
+        except Exception:  # pragma: no cover - 跨上下文 reset 等极端情形
+            pass
+
+    def _scoped_child_query(self, query: str, n: int,
+                            scopes: Optional[List[str]]) -> Dict[str, Any]:
+        """子块检索 + 访问范围过滤。
+
+        scopes 为 None 或含 "*" → 与改造前一致（type=child，不做范围过滤）。
+        否则用 $or（scope ∈ scopes 或 scope 为空串=公共）过滤；命中为空时退回公共
+        检索再按范围客户端过滤，以兼容缺少 scope 字段的旧数据（视为公共）。
+
+        **安全边界（S-05 验收）**：范围过滤是数据隔离边界，无法生效时一律 fail-closed
+        返回空结果，绝不"降级为不过滤"把无权文档交出去；失败原因如实记 ERROR 日志。
+        """
+        if scopes is None or "*" in scopes:
+            return self._collection.query(query_texts=[query], n_results=n,
+                                          where={"type": "child"})
+        cond = {"$or": [{"scope": {"$in": list(scopes)}}, {"scope": ""}]}
+        try:
+            res = self._collection.query(query_texts=[query], n_results=n,
+                                         where={"$and": [{"type": "child"}, cond]})
+        except Exception as ex:
+            logger.error(
+                f"知识库访问范围过滤无法生效，按 fail-closed 返回空结果"
+                f"（不降级为不过滤：无权文档不得进入检索上下文）：{ex}")
+            return {"ids": [[]], "documents": [[]], "metadatas": [[]], "distances": [[]]}
+        if res.get("documents") and res["documents"][0]:
+            return res
+        return self._client_scope_filter(
+            self._collection.query(query_texts=[query], n_results=n), scopes)
+
+    @staticmethod
+    def _client_scope_filter(results: Dict[str, Any],
+                             scopes: Optional[List[str]]) -> Dict[str, Any]:
+        """客户端范围过滤：只保留 scope ∈ scopes 或 scope 缺失/空串（公共）的命中。"""
+        if scopes is None or "*" in scopes:
+            return results
+        docs = results.get("documents") or []
+        metas = results.get("metadatas") or []
+        dists = results.get("distances") or []
+        if not docs or not docs[0]:
+            return results
+        kept_docs, kept_metas, kept_dists = [], [], []
+        for doc, meta, dist in zip(docs[0], metas[0] if metas else [], dists[0] if dists else []):
+            scope = ((meta or {}).get("scope") or "")
+            if scope == "" or scope in scopes:
+                kept_docs.append(doc)
+                kept_metas.append(meta)
+                kept_dists.append(dist)
+        return {"documents": [kept_docs], "metadatas": [kept_metas], "distances": [kept_dists]}
 
     # ── 内部方法 ──────────────────────────────────────────────────────────────
 
@@ -301,6 +691,55 @@ class KnowledgeBase:
             chunks.append("。".join(current))
 
         return chunks
+
+    @staticmethod
+    def _short_hash(text: str) -> str:
+        """子块/内容的稳定短哈希（sha256 前 16 位 hex），用于引用定位。"""
+        return hashlib.sha256((text or "").encode("utf-8")).hexdigest()[:16]
+
+    @staticmethod
+    def _identity_fields(doc: str, meta: Dict[str, Any]) -> Dict[str, Any]:
+        """从命中子块正文与其 metadata 提取可引用身份字段，缺失给安全默认值。"""
+        chunk_index = meta.get("chunk_index")
+        if not isinstance(chunk_index, int):
+            chunk_index = -1
+        total_chunks = meta.get("total_chunks")
+        if not isinstance(total_chunks, int):
+            total_chunks = -1
+        h = KnowledgeBase._short_hash(doc)
+        section = (f"第{chunk_index + 1}/{total_chunks}段"
+                   if chunk_index >= 0 and total_chunks > 0 else "")
+        parent_id = meta.get("parent_id", "") or ""
+        return {
+            "chunk_id":     h,
+            "content_hash": h,
+            "doc_id":       parent_id,
+            "parent_id":    parent_id,
+            "chunk_index":  chunk_index,
+            "total_chunks": total_chunks,
+            "source":       meta.get("source", "") or "",
+            "version":      meta.get("version", "") or "",
+            "scope":        meta.get("scope", "") or "",
+            "status":       meta.get("status", "") or "",
+            "section":      section,
+        }
+
+    @staticmethod
+    def _neighbor_blob(parent_id: str, meta: Dict[str, Any],
+                       siblings: Dict[str, Dict[int, str]]) -> str:
+        """命中子块在父文档内的前/后相邻子块拼接（按 chunk_index），取不到为空串。"""
+        if not parent_id:
+            return ""
+        idx = meta.get("chunk_index")
+        if not isinstance(idx, int):
+            return ""
+        sib = siblings.get(parent_id) or {}
+        parts: List[str] = []
+        if idx - 1 in sib:
+            parts.append(sib[idx - 1])
+        if idx + 1 in sib:
+            parts.append(sib[idx + 1])
+        return "\n".join(parts)
 
     def _load_default_docs(self) -> None:
         """导入默认知识库文档（安全生产法规与制度摘编）。"""

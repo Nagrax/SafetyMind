@@ -16,6 +16,24 @@ def llm_client_kwargs() -> Dict[str, Any]:
     }
 
 
+def make_llm_client(api_key: str, base_url: str = "", model: str = "", **kwargs):
+    """LLM 客户端工厂（2026-10-27）：按 SAFETYMIND_LLM_PROTOCOL 返回对应协议客户端。
+
+    背景：.env 的 8326 中继只支持 OpenAI 协议，而全仓库 10 处调用点写死了
+    AsyncAnthropic。HTTP 桥接代理方案被中继的 DeepSeek Messages 通道卡死
+    （不支持 OpenAI tool_calls 结构，只支持纯文本对话，三种排布全 502 实测）。
+    本工厂走 EvoHarness 式调用侧适配：core/llm_protocol.OpenAICompatClient
+    模仿 Anthropic SDK 调用面（messages.create / .content / .stop_reason），
+    各调用点把 `AsyncAnthropic(**kw, **llm_client_kwargs())` 换成本工厂即可，
+    业务代码零改动。
+
+    协议选择：SAFETYMIND_LLM_PROTOCOL=anthropic（默认，零行为变化）| openai。
+    base_url / model 复用现有 ANTHROPIC_* 环境变量（.env 无需新增键）。
+    """
+    from core.llm_protocol import make_llm_client as _make
+    return _make(api_key=api_key, base_url=base_url, model=model, **kwargs)
+
+
 def extract_text_content(content: Iterable[Any]) -> str:
     """Return text blocks from Anthropic-style response content."""
     texts: List[str] = []
