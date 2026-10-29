@@ -83,32 +83,54 @@ if (checkOnly) {
   process.exit(0)
 }
 
-// ── 3. 提交 ────────────────────────────────────────────────────────────────
+// ── 3. 提交（无变更也继续，可能是上次推送失败的积压提交） ──────────────────
 git(['add', '-A'])
 const staged = git(['diff', '--cached', '--name-only'])
-if (!staged) {
-  console.log('• 无变更，跳过提交')
-  process.exit(0)
+if (staged) {
+  if (!message) {
+    console.error('✖ 有变更但缺少提交信息：请用 -m "..."')
+    process.exit(4)
+  }
+  git(['commit', '-m', message])
+  const sha = git(['rev-parse', '--short', 'HEAD'])
+  console.log(`✔ 已提交 ${sha}：${message.split('\n')[0]}`)
+} else {
+  console.log('• 无新变更，继续检查未推送提交')
 }
-if (!message) {
-  console.error('✖ 有变更但缺少提交信息：请用 -m "..."')
-  process.exit(4)
-}
-git(['commit', '-m', message])
-const sha = git(['rev-parse', '--short', 'HEAD'])
-console.log(`✔ 已提交 ${sha}：${message.split('\n')[0]}`)
 
-// ── 4. 推送 ────────────────────────────────────────────────────────────────
+// ── 4. 推送（本机 DNS 偶发解析失败，重试两次；失败必须非 0 退出）────────────
 if (noPush) {
   console.log('• --no-push：仅本地提交')
   process.exit(0)
 }
+let ahead = 0
 try {
-  git(['push', 'origin', 'HEAD'])
-  const upstream = git(['rev-parse', '--abbrev-ref', '--symbolic-full-name', '@{u}'])
-  console.log(`✔ 已推送 ${sha} → ${upstream}`)
-} catch (e) {
-  console.error('✖ 提交已生成但推送失败（不要当作已同步）：')
-  console.error((e.stderr || e.stdout || e.message || '').toString().trim().slice(0, 500))
-  process.exit(5)
+  ahead = Number(git(['rev-list', '--count', '@{u}..HEAD']) || 0)
+} catch {
+  ahead = 1   // 没有上游分支时也要推
 }
+if (ahead === 0) {
+  console.log('✔ 已与远端同步（无待推送提交）')
+  process.exit(0)
+}
+const sleep = (ms) => new Promise(r => setTimeout(r, ms))
+let lastErr = null
+for (let attempt = 1; attempt <= 3; attempt++) {
+  try {
+    git(['push', 'origin', 'HEAD'])
+    const upstream = git(['rev-parse', '--abbrev-ref', '--symbolic-full-name', '@{u}'])
+    const sha = git(['rev-parse', '--short', 'HEAD'])
+    console.log(`✔ 已推送 ${sha} → ${upstream}（待推送 ${ahead} 个提交）`)
+    process.exit(0)
+  } catch (e) {
+    lastErr = e
+    if (attempt < 3) {
+      console.log(`• 第 ${attempt} 次推送失败，3 秒后重试（本机 DNS 偶发）`)
+      await sleep(3000)
+    }
+  }
+}
+console.error('✖ 提交已在本地但推送失败（不要当作已同步）：')
+console.error((lastErr?.stderr || lastErr?.stdout || lastErr?.message || '').toString().trim().slice(0, 500))
+process.exit(5)
+
