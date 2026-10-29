@@ -16,6 +16,7 @@ LLM-as-Judge 是评测 Agent 质量的关键技术：
 import asyncio
 import json
 import logging
+import os
 import pathlib
 import statistics
 import time
@@ -28,6 +29,8 @@ from anthropic import AsyncAnthropic
 from core.llm_utils import extract_text_content
 
 from core.intent_recognizer import IntentCategory, IntentRecognizer
+
+from evaluation.rubric import RubricVerdict, evaluate_funnel
 
 logger = logging.getLogger(__name__)
 
@@ -155,6 +158,43 @@ Agent 响应: {response}
         return value.encode("utf-8", errors="ignore").decode("utf-8")
 
 
+# ── 分层漏斗 Judge（程序化、无 LLM）────────────────────────────────────────────
+
+class LayeredJudge:
+    """分层漏斗 Rubric Judge：程序化判定，零 LLM 依赖（端点死亡时仍可评测）。
+
+    与 LLMJudge 的差异：LLMJudge 是"打分型"（0-1 连续分），本类是"门控型"
+    （串行层短板 + 并联安全红线），产出可归因的层/子项结论。
+    默认评估行为不变：仅在 EndToEndEvaluator 显式开启漏斗开关时才参与。
+    """
+
+    def __init__(self, pass_threshold: float = 0.75):
+        self._pass_threshold = pass_threshold
+
+    def evaluate(
+        self,
+        question: str,
+        response: str,
+        *,
+        evidence: Optional[str] = None,
+        tool_expectations: Optional[List[str]] = None,
+        tool_trace: Optional[List[str]] = None,
+        domain: Optional[str] = None,
+    ) -> RubricVerdict:
+        return evaluate_funnel(
+            question, response,
+            evidence=evidence,
+            tool_expectations=tool_expectations,
+            tool_trace=tool_trace,
+            domain=domain,
+        )
+
+    @staticmethod
+    def passes(verdict: RubricVerdict) -> bool:
+        """N/A（overall=None）不计入通过：返回 False，由调用方决定是否计入分母。"""
+        return verdict.overall is True
+
+
 # ── 意图识别评测 ──────────────────────────────────────────────────────────────
 
 class IntentEvaluator:
@@ -243,12 +283,17 @@ class EndToEndEvaluator:
         kwargs: Dict[str, Any] = {"api_key": api_key}
         if base_url:
             kwargs["base_url"] = base_url
-        from core.llm_utils import llm_client_kwargs
-        client = AsyncAnthropic(**kwargs, **llm_client_kwargs())
+        from core.llm_utils import llm_client_kwargs, make_llm_client
+        client = make_llm_client(api_key=api_key, base_url=base_url or "",
+                                 model=model, **llm_client_kwargs())
 
         self._orchestrator     = orchestrator
         self._judge            = LLMJudge(client, model)
+        self._layered_judge    = LayeredJudge(self.PASS_THRESHOLD)
         self._intent_evaluator = IntentEvaluator(recognizer)
+        # 漏斗评测开关（默认关闭）：仅当环境变量为 "1" 时才附加 rubric 结果，
+        # 保证既有默认评测行为逐字节不变。
+        self._funnel_enabled   = os.getenv("SAFETYMIND_EVAL_FUNNEL", "0") == "1"
         self._history:         List[EvalReport] = []
         self._baseline_path = pathlib.Path(baseline_path) if baseline_path else None
         self._baseline: Optional[EvalReport] = self._load_baseline()
@@ -360,6 +405,18 @@ class EndToEndEvaluator:
             history.append({"role": "assistant", "content": actual_answer})
 
             test_id = f"dialog_{case_idx}" if len(questions) == 1 else f"dialog_{case_idx}_turn_{turn_idx}"
+            metadata: Dict[str, Any] = {
+                "question": question,
+                "response": actual_answer,
+                "agent_type": orch_result.agent_type.value,
+                "intent": orch_result.intent.value if orch_result.intent else None,
+                "turn": turn_idx,
+                "conv_id": conv_id,
+                "judge_failed": scores.judge_failed,
+                "judge_error": scores.error,
+            }
+            if self._funnel_enabled:
+                metadata["rubric"] = self._rubric_metadata(case, question, orch_result)
             results.append(EvalResult(
                 test_id=test_id,
                 passed=passed,
@@ -371,19 +428,27 @@ class EndToEndEvaluator:
                     "overall": scores.overall,
                 },
                 detail=f"Q: {question[:30]}... → 综合评分 {scores.overall:.3f}",
-                metadata={
-                    "question": question,
-                    "response": actual_answer,
-                    "agent_type": orch_result.agent_type.value,
-                    "intent": orch_result.intent.value if orch_result.intent else None,
-                    "turn": turn_idx,
-                    "conv_id": conv_id,
-                    "judge_failed": scores.judge_failed,
-                    "judge_error": scores.error,
-                },
+                metadata=metadata,
             ))
 
         return results
+
+    def _rubric_metadata(self, case: Dict[str, Any], question: str, orch_result) -> Dict[str, Any]:
+        """漏斗开启时，把分层 Rubric 结论附加到用例 metadata（默认不启用）。"""
+        evidence = case.get("evidence")
+        if evidence is not None:
+            evidence = str(evidence)
+        verdict = self._layered_judge.evaluate(
+            question,
+            orch_result.response,
+            evidence=evidence,
+            tool_expectations=case.get("tool_expectations"),
+            tool_trace=case.get("tool_trace"),
+            domain=case.get("domain") or (
+                orch_result.intent.value if orch_result.intent else None
+            ),
+        )
+        return asdict(verdict)
 
     @staticmethod
     def _dialog_turns(case: Dict[str, Any]) -> List[str]:
