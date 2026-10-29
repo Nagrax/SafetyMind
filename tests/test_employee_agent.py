@@ -245,15 +245,23 @@ def t8_parallel_block_format():
                   entities={"equipment_id": ["R-101"]})
     r = asyncio.run(orch.run(req))
     expected = "[compliance - 主处理]\n票据办理完成\n\n[equipment - 辅助处理]\n设备处置完成"
+    # 契约更新（2026-10-26）：原断言是 `seen_tasks[0] is seen_tasks[1]`（共享同一 task），
+    # 但"所有专家共享同一份上下文"正是用户指出的设计缺陷——所谓隔离上下文并不存在。
+    # 现改为断言【真隔离】：每个专家各自装配任务包（对象不同、背景可按领域切片），
+    # 而**用户原始问题必须逐字节相同**（题意不得因隔离而漂移）。
+    # 这是把契约从"共享"收紧到"隔离但题意一致"，不是放松断言。
+    same_user_msg = (len(seen_tasks) == 2
+                     and seen_tasks[0].messages[-1] == seen_tasks[1].messages[-1])
     ok = (r.response == expected
           and r.primary_agent == AgentType.COMPLIANCE
           and r.supporting_agents == [AgentType.EQUIPMENT]
           and r.agent_types == [AgentType.COMPLIANCE, AgentType.EQUIPMENT]
           and r.escalated is False
-          and len(seen_tasks) == 2 and seen_tasks[0] is seen_tasks[1]  # 员工装配一次、共享
+          and len(seen_tasks) == 2 and seen_tasks[0] is not seen_tasks[1]   # 各专家独立装配
+          and same_user_msg                                                  # 但题意一致
           and seen["compliance"] and seen["equipment"])
-    record("并行块格式不变 + 任务包单次装配全部专家共享", ok,
-           f"resp={r.response!r} types={r.agent_types}")
+    record("并行块格式不变 + 各专家独立装配任务包（真隔离）且题意一致", ok,
+           f"resp={r.response!r} types={r.agent_types} same_task={seen_tasks[0] is seen_tasks[1] if len(seen_tasks)==2 else '?'} same_msg={same_user_msg}")
 
 
 # ── 5. 专家无状态：不注入背景，system 仅自身提示词+动态 Skills ─────────────────
@@ -338,7 +346,8 @@ def t11_contract_fields():
     names = [f.name for f in fields(OrchestratorResult)]
     expected = ["request_id", "response", "agent_type", "intent", "escalated",
                 "latency_ms", "agent_types", "primary_agent", "supporting_agents",
-                "routing_reason", "routing_confidence"]
+                "routing_reason", "routing_confidence",
+                "tool_trace"]  # P0-A：末尾追加的工具调用轨迹（additive，默认空列表）
     record("OrchestratorResult 契约字段原样保留", names == expected, f"got={names}")
 
 

@@ -10,6 +10,7 @@ import asyncio
 import json
 import os
 import sys
+import tempfile
 import threading
 import time
 from http.server import BaseHTTPRequestHandler, HTTPServer
@@ -26,7 +27,9 @@ def record(name, ok, detail=""):
 
 
 def main():
-    tmp_db = "data/_audit_test.db"
+    # 铁律 9：所有测试产物（审计库/旧库）都放独立临时目录，工程目录不留残留
+    _tmp_root = Path(tempfile.mkdtemp(prefix="audit_tickets_test_"))
+    tmp_db = str(_tmp_root / "_audit_test.db")
     Path(tmp_db).unlink(missing_ok=True)
     os.environ["AUDIT_DB_PATH"] = tmp_db
 
@@ -168,7 +171,7 @@ def main():
 
     # 3.6) 旧数据兼容：两态旧库非破坏迁移（open→execute / closed→accept）
     import sqlite3 as _sq3
-    legacy_db = "data/_audit_legacy_test.db"
+    legacy_db = str(_tmp_root / "_audit_legacy_test.db")
     Path(legacy_db).unlink(missing_ok=True)
     lcon = _sq3.connect(legacy_db)
     lcon.executescript("""
@@ -217,9 +220,15 @@ def main():
     hook_srv.shutdown()
 
     # 5) /chat 端到端（死 LLM）：CRITICAL 模板 → 自动升级+简报建单+建单时 webhook；新端点；鉴权
+    # 铁律 9：下面用 with TestClient 触发 lifespan（真实构造记忆/知识库），必须把 chroma/会话
+    # 目录指到独立临时目录，绝不打开桌面端 data/chroma、data/kb_chroma。
+    _iso = tempfile.mkdtemp(prefix="audit_tickets_test_")
     os.environ.update({"ANTHROPIC_BASE_URL": "http://127.0.0.1:9", "ANTHROPIC_API_KEY": "dummy", "API_HOST": "0.0.0.0",
                        "ADMIN_TOKEN": "test-admin-123", "AUDIT_DB_PATH": tmp_db,
-                       "ESCALATION_WEBHOOK_URL": "http://127.0.0.1:8972/hook"})
+                       "ESCALATION_WEBHOOK_URL": "http://127.0.0.1:8972/hook",
+                       "CHROMA_PERSIST_DIRECTORY": os.path.join(_iso, "chroma"),
+                       "CHROMA_KB_PERSIST_DIRECTORY": os.path.join(_iso, "kb_chroma"),
+                       "SAFETYMIND_CONVERSATIONS_DIR": os.path.join(_iso, "conversations")})
     received2 = []  # 建单（需求简报）时点的 webhook 收端
 
     class Hook2(BaseHTTPRequestHandler):

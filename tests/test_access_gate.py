@@ -16,9 +16,15 @@ def record(name, ok, detail=""):
 def main():
     os.environ["ACCESS_TOKEN"] = "gate-secret-42"
     os.environ["API_HOST"] = "127.0.0.1"
-    os.environ["AUDIT_DB_PATH"] = "data/_gate_audit.db"
+    # 铁律 9：审计库与 chroma/会话目录都放独立临时目录，工程目录不留残留
+    import tempfile
+    _iso = tempfile.mkdtemp(prefix="access_gate_test_")
+    os.environ["AUDIT_DB_PATH"] = os.path.join(_iso, "_gate_audit.db")
+    os.environ["CHROMA_PERSIST_DIRECTORY"] = os.path.join(_iso, "chroma")
+    os.environ["CHROMA_KB_PERSIST_DIRECTORY"] = os.path.join(_iso, "kb_chroma")
+    os.environ["SAFETYMIND_CONVERSATIONS_DIR"] = os.path.join(_iso, "conversations")
     try:
-        Path("data/_gate_audit.db").unlink()  # 句柄可能未即时释放
+        Path(os.environ["AUDIT_DB_PATH"]).unlink()  # 句柄可能未即时释放
     except OSError:
         pass
 
@@ -48,10 +54,8 @@ def main():
         r = client.post("/chat", json={"message": "你好", "user_id": "g", "conv_id": "g4"})
         record("未设 ACCESS_TOKEN → 门不启用", r.status_code == 200, f"code={r.status_code}")
 
-    try:
-        Path("data/_gate_audit.db").unlink()  # 句柄可能未即时释放
-    except OSError:
-        pass
+    import shutil
+    shutil.rmtree(_iso, ignore_errors=True)   # 临时产物清理干净，工程目录不留残留
     failed = RESULTS.count(False)
     print(f"\n{len(RESULTS) - failed}/{len(RESULTS)} PASSED")
     sys.exit(1 if failed else 0)
