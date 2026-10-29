@@ -8,8 +8,14 @@ import sys
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
+sys.path.insert(0, str(Path(__file__).resolve().parent))   # 共享的存储自检 helper
+
+import _storage_guard as guard   # 共享的"存储自检 + 一次重建重试"（只依赖标准库）
 
 RESULTS = []
+
+# 临时存储只进 D 盘（铁律 7）：本用例的全套 chroma/会话/审计目录都挂在这个目录下
+_SCRATCH = Path("d:/claudecode/scratch/sm-iter-20261019")
 
 
 def record(name, ok, detail=""):
@@ -97,8 +103,59 @@ def check_markdown_renderer():
            "item.content.split" in vue, "App.vue 用户分支需保持 content.split 纯文本渲染")
 
 
+def _prepare_kb_dir(iso: Path) -> Path:
+    """lifespan 建知识库之前先自检存储是否真的可用；不可用则换全新目录重建一次（最多一次）。
+
+    本机 ChromaDB 1.5.9 在 Windows 上偶发持久 HNSW 段不可读（`Error creating hnsw
+    segment reader: Nothing found on disk`，全新唯一目录、单进程也可能出现，约 1/70）：
+    这里先建一次并做一次检索自检。自检通过就把这批**已自检的集合**留给 lifespan 复用
+    （不删集合——删掉后 lifespan 会重建一个新段，等于重新掷骰子）；自检不过则换全新
+    目录再来一次，仍不过则如实打印 WARN，交给后续端点断言反映。
+    """
+    probe = "条款编号FE-7701"
+    d = None
+    for tag in (guard.TAG_PRIMARY, guard.TAG_REBUILD):
+        d = guard.fresh_dir(iso, "kb_chroma", tag=tag)
+        kb, why = None, ""
+        try:
+            from mcp.knowledge_base import KnowledgeBase
+            kb = KnowledgeBase(chroma_host="127.0.0.1", chroma_port=1, chroma_path=str(d))
+            base = kb.doc_count
+            n = kb.add_documents([{"title": "前端接线存储自检",
+                                   "content": f"本条款编号 {probe} 仅用于建库自检，不是产品内容。",
+                                   "source": "自检", "version": "v1"}])
+            ok, why = guard.kb_storage_healthy(kb, base, n, probe)
+        except Exception as ex:
+            ok, why = False, f"{type(ex).__name__}: {str(ex)[:120]}"
+        # 自检通过 → 保留集合给 lifespan 复用；不过 → 删集合，让 lifespan 从空库重建
+        guard.release_kb(kb, drop_collections=not ok)
+        if ok:
+            if tag != guard.TAG_PRIMARY:
+                print(f"[WARN] 存储自检失败后已换全新目录重建知识库：{d.name}", flush=True)
+            return d
+        print(f"[WARN] 存储自检失败（{d.name}）：{why} → 换全新目录重建一次", flush=True)
+    print("[WARN] 重建一次后存储自检仍不可用；后续端点断言将如实反映该状态", flush=True)
+    return d
+
+
 def main():
     check_markdown_renderer()
+
+    # 铁律 9：本用例用 with TestClient 触发 lifespan，会真实构造记忆/知识库；
+    # 必须把 chroma/会话/审计目录全部指到独立临时目录，绝不打开桌面端
+    # data/chroma、data/kb_chroma（并发或复用会导致 HNSW 段损坏；2026-10 实测
+    # 本用例曾刷新桌面目录 mtime）。临时存储只进 D 盘（铁律 7）。
+    import gc
+    import os
+    import tempfile
+    _SCRATCH.mkdir(parents=True, exist_ok=True)
+    _iso = Path(tempfile.mkdtemp(prefix="fe_endpoints_test_", dir=str(_SCRATCH)))
+    os.environ["CHROMA_PERSIST_DIRECTORY"] = str(_iso / "chroma")
+    os.environ["AUDIT_DB_PATH"] = str(_iso / "audit.db")
+    os.environ["SAFETYMIND_CONVERSATIONS_DIR"] = str(_iso / "conversations")
+    # 先自检存储可用（自检不过换全新目录重建一次），再把目录交给 lifespan 复用：
+    # 否则 1/70 的持久 HNSW 段不可读会随机打红本用例
+    os.environ["CHROMA_KB_PERSIST_DIRECTORY"] = str(_prepare_kb_dir(_iso))
 
     from fastapi.testclient import TestClient
     from api.main import app
@@ -126,8 +183,10 @@ def main():
         record("POST /api/python/skills/reload 别名", r.status_code == 200, f"code={r.status_code}")
 
         # 会话历史：写入（借 /chat 太慢，直接调存储层）→ 列表 → 恢复 → 删除
+        # 注意：必须用与本进程 app 同一个存储目录（上方已指到独立临时目录），
+        # 写死 "data/conversations" 会与端点读写的目录不一致（且违反铁律 9）。
         from memory.conversation_store import ConversationStore
-        store = ConversationStore("data/conversations")
+        store = ConversationStore(os.environ["SAFETYMIND_CONVERSATIONS_DIR"])
         store.append_message("endpoint_test", "c_hist_1", "user", "动火作业票怎么办理")
         store.append_message("endpoint_test", "c_hist_1", "assistant", "办理流程：...", escalated=False, request_id="r9")
         r = client.get("/conversations?user_id=endpoint_test")
@@ -166,6 +225,26 @@ def main():
         r = client.get("/")
         record("GET / 静态首页(frontend/dist)", r.status_code == 200 and "<div id=" in r.text,
                f"code={r.status_code} len={len(r.text)}")
+
+    # 结束：显式释放 lifespan 建的知识库/记忆 chroma 句柄再清临时目录
+    # （Windows 句柄未释放时目录删不掉；lifespan 关闭时只关了记忆的 Redis/偏好库）
+    try:
+        import api.main as api_main
+        tm_ref = api_main._tool_manager
+        tool = tm_ref._tools.get("knowledge_search") if tm_ref is not None else None
+        guard.release_kb(getattr(tool.handler, "__self__", None) if tool is not None else None)
+        mem = api_main._memory
+        mem_colls = [getattr(mem, "_episodic", None), getattr(mem, "_profile", None)]
+        mem_cli = next((getattr(c, "_client", None) for c in mem_colls if c is not None), None)
+        if mem_cli is not None:
+            mem_cli.close()
+    except Exception:
+        pass
+    gc.collect()
+    # 目录名带随机后缀，统一扫掉（含上次运行被句柄占住的残留）
+    for d in sorted(_SCRATCH.glob("fe_endpoints_test_*"), reverse=True):
+        if not guard.rmtree_retry(d):
+            print(f"[WARN] 临时目录残留未清干净（句柄未释放？）: {d}", flush=True)
 
     failed = RESULTS.count(False)
     print(f"\n{len(RESULTS) - failed}/{len(RESULTS)} PASSED")

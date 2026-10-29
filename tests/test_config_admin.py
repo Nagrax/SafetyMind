@@ -16,11 +16,20 @@ def record(name, ok, detail=""):
 
 
 def main():
-    tmp_env = "data/_config_test.env"
+    # 铁律 9：本用例两次 with TestClient 触发 lifespan（真实构造记忆/知识库），
+    # 且会写 .env 测试文件——所有产物都放独立临时目录：
+    # 绝不打开桌面端 data/chroma、data/kb_chroma，工程目录不留残留。
+    import tempfile
+    _iso = tempfile.mkdtemp(prefix="config_admin_test_")
+    tmp_env = os.path.join(_iso, "_config_test.env")
     Path(tmp_env).write_text(
         "# 测试配置（注释行必须被保留）\nANTHROPIC_API_KEY=sk-original-key-123456\nESCALATION_PHONE=\n",
         encoding="utf-8")
     os.environ["ENV_FILE_PATH"] = tmp_env
+    os.environ["CHROMA_PERSIST_DIRECTORY"] = os.path.join(_iso, "chroma")
+    os.environ["CHROMA_KB_PERSIST_DIRECTORY"] = os.path.join(_iso, "kb_chroma")
+    os.environ["SAFETYMIND_CONVERSATIONS_DIR"] = os.path.join(_iso, "conversations")
+    os.environ["AUDIT_DB_PATH"] = os.path.join(_iso, "audit.db")
     # 0) 首次一键生成管理密码（仅未配置时可用）
     from fastapi.testclient import TestClient
     from api.main import app
@@ -83,6 +92,29 @@ def main():
         r = client.post("/config/admin", json={"values": {"SAFETYMIND_BGE": "2"}}, headers=H)
         record("枚举外取值 → 400", r.status_code == 400, f"code={r.status_code}")
 
+        # S-05 多用户主体目录：合法 JSON 受理且只回掩码；非法值一律 400（绝不写进 .env）
+        good = ('[{"token":"tok-a","subject_id":"u-a","roles":["reporter"],"scopes":["plant-a"]},'
+                '{"token":"tok-b","subject_id":"u-b"}]')
+        r = client.post("/config/admin", json={"values": {"SAFETYMIND_USERS": good}}, headers=H)
+        record("合法主体目录受理", r.status_code == 200 and "SAFETYMIND_USERS" in r.json()["updated"],
+               f"code={r.status_code} body={r.text[:160]}")
+        r = client.get("/config/admin", headers=H)
+        ok = ("tok-a" not in r.text and "****" in r.text
+              and any(c["key"] == "SAFETYMIND_USERS" and c["configured"] and c["secret"]
+                      for c in r.json()["config"]))
+        record("主体目录掩码（用户令牌不出端点）", ok, f"body={r.text[:200]}")
+        for name, bad in (("非 JSON", "not-json"),
+                          ("缺 token", '[{"subject_id":"u-x"}]'),
+                          ("缺 subject_id", '[{"token":"tok-x"}]'),
+                          ("空数组", "[]")):
+            r = client.post("/config/admin", json={"values": {"SAFETYMIND_USERS": bad}}, headers=H)
+            record(f"主体目录非法（{name}）→ 400", r.status_code == 400, f"code={r.status_code}")
+        r = client.get("/config/admin", headers=H)
+        record("非法写入未污染已存值（仍是合法主体目录）",
+               "tok-a" not in r.text and os.environ.get("SAFETYMIND_USERS") == good,
+               f"env={str(os.environ.get('SAFETYMIND_USERS'))[:60]}")
+        os.environ.pop("SAFETYMIND_USERS", None)
+
         # 注释行保留 + 密钥更新后仍掩码
         r = client.post("/config/admin", json={"values": {"ANTHROPIC_API_KEY": "sk-new-key-987654"}}, headers=H)
         record("更新 API Key 受理", r.status_code == 200 and "ANTHROPIC_API_KEY" in r.json()["restart_required"])
@@ -103,6 +135,8 @@ def main():
         ok = r.status_code == 200 and r.json().get("auth_mode") == "local"
         record("本地形态+已设密码仍免密", ok, f"code={r.status_code} body={r.text[:120]}")
 
+    import shutil
+    shutil.rmtree(_iso, ignore_errors=True)   # 临时产物清理干净，工程目录不留残留
     failed = RESULTS.count(False)
     print(f"\n{len(RESULTS) - failed}/{len(RESULTS)} PASSED")
     sys.exit(1 if failed else 0)
