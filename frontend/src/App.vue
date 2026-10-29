@@ -60,6 +60,30 @@
           <div v-else class="m-msg-body">
             <p v-for="(line, i) in item.content.split('\n')" :key="i">{{ line }}</p>
           </div>
+          <!-- 依据（P0-B 证据引用）：命中条款可定位——标题/章节/来源/版本 + 命中片段。
+               只展示业务可读信息，文档指纹（chunk_id/hash）在 ?dev=1 面板；
+               catalog_only 的条目明确写"仅目录记录"，避免让用户以为读到了正文 -->
+          <div v-if="item.role === 'assistant' && item.citations && item.citations.length" class="cite-card">
+            <button :class="['cite-toggle', { open: item.citeOpen }]"
+                    :aria-expanded="item.citeOpen ? 'true' : 'false'"
+                    @click="item.citeOpen = !item.citeOpen">
+              <span class="cite-title">依据</span>
+              <strong class="cite-count">{{ item.citations.length }} 条</strong>
+              <span class="cite-caret" aria-hidden="true">{{ item.citeOpen ? '▴' : '▾' }}</span>
+            </button>
+            <ol v-if="item.citeOpen" class="cite-list">
+              <li v-for="c in item.citations" :key="c.index" class="cite-item">
+                <p class="cite-head">
+                  <strong class="cite-doc">{{ c.title }}</strong>
+                  <span v-if="c.section" class="cite-loc">{{ c.section }}</span>
+                  <span v-if="c.version" class="cite-ver">版本 {{ c.version }}</span>
+                  <span v-if="c.source" class="cite-src">{{ c.source }}</span>
+                </p>
+                <p class="cite-snippet">{{ c.snippet }}</p>
+                <p v-if="c.catalogOnly" class="cite-note muted">仅目录记录（未读取正文条款）</p>
+              </li>
+            </ol>
+          </div>
           <div v-if="item.role === 'assistant' && item.escalated" class="m-msg-actions">
             <a v-if="config.escalationPhone" class="m-action primary" :href="`tel:${config.escalationPhone}`">📞 拨打安全值班</a>
             <button v-if="item.requestId" class="m-action" @click="copyText(item.requestId, '上报编号已复制')">复制上报编号 {{ item.requestId }}</button>
@@ -107,6 +131,13 @@
               <button class="m-action" :disabled="item.hazardBusy" @click="item.hazardDismissed = true">忽略</button>
             </div>
           </div>
+          <!-- 排队超时/生成失败的失败气泡（2026-10-29）：后端已下发 retry_after，
+               这里给一个可点重试的入口——高峰期安全员需要知道"等多久、点哪里"，
+               而不是盯着一条读起来像普通回答的错误文案。 -->
+          <div v-if="item.role === 'assistant' && item.errorCode" class="m-msg-actions retry-row">
+            <span class="m-action muted-note">{{ item.retryHint }}</span>
+            <button class="m-action primary" :disabled="busy" @click="retryMessage(item)">重试</button>
+          </div>
           <div v-else-if="item.role === 'assistant' && item.requestId && !item.feedbackSent" class="m-msg-actions">
             <span class="m-action muted-note">这条回答有帮助吗？</span>
             <button class="m-action" :disabled="feedbackBusy" @click="sendFeedback(item, 'up')">👍</button>
@@ -117,7 +148,10 @@
           </div>
         </article>
 
-        <div v-if="busy" class="m-msg assistant typing"><div class="m-msg-body"><span></span><span></span><span></span></div></div>
+        <div v-if="busy" class="m-msg assistant typing">
+          <div class="m-msg-body"><span></span><span></span><span></span></div>
+          <p v-if="stageText" class="m-stage-note">{{ stageText }}</p>
+        </div>
       </div>
 
       <div v-if="messages.length" class="m-quick">
@@ -136,7 +170,7 @@
           @input="autoGrow"
           @keydown.enter.exact.prevent="onEnter"
         ></textarea>
-        <button class="m-send" :disabled="busy || !draft.trim()" @click="sendMessage" aria-label="发送">➤</button>
+        <button class="m-send" :disabled="busy || !draft.trim()" @click="sendMessage()" aria-label="发送">➤</button>
       </footer>
 
       <!-- ══════════ 知识库右栏（桌面 ≥1200px 常驻，参考 IDE 多栏面板） ══════════ -->
@@ -314,7 +348,9 @@
               <div><dt>知识库</dt><dd :class="lastResponse.knowledgeUsed ? 'success' : 'muted'">{{ lastResponse.knowledgeUsed ? '已使用' : '未使用' }}</dd></div>
               <div><dt>升级处置</dt><dd :class="lastResponse.escalated ? 'danger' : 'muted'">{{ lastResponse.escalated ? '是' : '否' }}</dd></div>
               <div><dt>隐患闸门</dt><dd>{{ hazardActionLabel(lastResponse.hazardAction) }}</dd></div>
+              <div><dt>工具调用</dt><dd :class="lastResponse.toolsUsed && lastResponse.toolsUsed.length ? 'success' : 'muted'">{{ toolsUsedLabel(lastResponse) }}</dd></div>
             </dl>
+            <p v-if="lastResponse.citations && lastResponse.citations.length" class="routing-reason">依据指纹：{{ citationFingerprint(lastResponse) }}</p>
             <p v-if="lastResponse.routingReason" class="routing-reason">{{ lastResponse.routingReason }}</p>
           </div>
           <p v-else class="side-empty">发送消息后，这里会显示安全 Agent 路由、风险意图和耗时。</p>
@@ -375,7 +411,6 @@ import {
   createInitialSettings,
   deleteConversation as requestDeleteConversation,
   reloadSkills,
-  requestChat,
   requestConfig,
   requestConversationMessages,
   requestAdminConfig,
@@ -393,6 +428,7 @@ import {
   requestTicketProgress,
   runEvaluation as requestEvaluation,
   saveSettings,
+  streamChat,
   uploadKnowledge
 } from './lib/backends'
 import { inlineTokens, parseMarkdown } from './lib/markdown'
@@ -499,6 +535,13 @@ const config = ref({ escalationPhone: '' })
 const messages = ref([])
 const draft = ref('')
 const busy = ref(false)
+// 等待期的可见进度（来自 /chat/stream 的 stage 事件）：把"三个点转圈"换成
+// "正在检索资料 / 正在生成回答"。流式不可用时保持为空，行为与改造前一致。
+const stageText = ref('')
+const STAGE_LABELS = {
+  queued: '已排队，等待处理…',
+  processing: '正在检索资料并生成回答…'
+}
 const feedbackBusy = ref(false)
 const healthOk = ref(false)
 const healthLabel = ref('未检查')
@@ -618,10 +661,16 @@ async function reloadSkillSet() {
   finally { busy.value = false }
 }
 
-async function sendMessage() {
-  const content = draft.value.trim()
+async function sendMessage(explicitContent, opts = {}) {
+  // 只接受字符串：模板里 @click="sendMessage()" 必须显式调用；若写成 @click="sendMessage"，
+  // Vue 会把 MouseEvent 当第一个参数传进来，消息会变成 "[object PointerEvent]"
+  // （2026-10-29 真实浏览器验证当场抓到，见 scratch/btest/sm_retry_ui.mjs 的截图）。
+  const content = (typeof explicitContent === 'string' ? explicitContent : draft.value).trim()
   if (!content || busy.value) return
-  messages.value.push({ id: createMessageId(), role: 'user', content })
+  // 重试时不重复追加同一条用户气泡（失败气泡已被移除，历史看起来仍是"一问一答"）
+  if (!opts.skipUserBubble) {
+    messages.value.push({ id: createMessageId(), role: 'user', content })
+  }
   draft.value = ''
   resetGrow()
   busy.value = true
@@ -633,7 +682,13 @@ async function sendMessage() {
       settings.conversationId = newConvId()
       persist()
     }
-    const response = await requestChat(settings.backend, settings, content)
+    stageText.value = ''
+    const response = await streamChat(settings.backend, settings, content, {
+      onStage: (evt) => {
+        const key = String(evt && evt.stage || '')
+        stageText.value = STAGE_LABELS[key] || ''
+      }
+    })
     if (response.conversationId && !settings.conversationId) {
       settings.conversationId = response.conversationId
       persist()
@@ -642,7 +697,7 @@ async function sendMessage() {
     messages.value.push({
       id: createMessageId(),
       role: 'assistant',
-      content: response.response,
+      content: chatMessageText(response),
       escalated: response.escalated,
       requestId: response.requestId || '',
       // Agent 路由字段随消息留存：供 dev 面板/排查使用，默认用户界面不渲染（铁律 2）
@@ -655,6 +710,17 @@ async function sendMessage() {
       hazardSuggestion: response.hazardSuggestion || null,
       hazardDismissed: false,
       hazardBusy: false,
+      // 依据引用（P0-B）：命中条款与可定位身份；默认折叠，展开可看片段与版本。
+      // 文档指纹（chunkId/hash）不在用户面渲染，只在 ?dev=1 面板可查（铁律 2）。
+      citations: response.citations || [],
+      citeOpen: false,
+      // 失败可重试（2026-10-29）：后端在 event:error / done.error 里下发 code 与
+      // retry_after；这里给 UI 一个明确的"重试"入口，而不是让错误文案伪装成回答。
+      errorCode: (response.error && response.error.code) || '',
+      retryAfter: Number(response.retryAfter || 0),
+      retryHint: retryHintText(response),
+      // 工具轨迹（P0-A）：真实发生的工具调用，仅开发者面板展示（铁律 2）
+      toolsUsed: response.toolsUsed || [],
     })
     loadMonitor()
     loadConversations()   // 新会话建立/新消息落库后，历史会话列表实时刷新（无需手动刷新页面）
@@ -662,11 +728,44 @@ async function sendMessage() {
     messages.value.push({ id: createMessageId(), role: 'assistant', content: `请求失败：${error.message}\n请检查网络后重试；紧急情况请直接拨打值班电话。` })
   } finally {
     busy.value = false
+    stageText.value = ''
     scrollToBottom()
   }
 }
 
 function usePrompt(prompt) { draft.value = prompt; autoGrow({ target: null }) }
+
+// 失败气泡的提示文案与重试（2026-10-29）：后端 event:error 已带 code/retry_after，
+// 这里把它变成用户看得懂的"等多久 + 点哪里"，而不是一句伪装成回答的错误文案。
+function retryHintText(response) {
+  const code = (response && response.error && response.error.code) || ''
+  if (!code) return ''
+  const wait = Number((response && response.retryAfter) || 0)
+  if (code === 'queue_timeout') {
+    return wait ? `建议 ${wait} 秒后重试` : '请稍后重试'
+  }
+  return '可以重试一次'
+}
+
+// 失败时不要把后端的长句（"对话当前繁忙，请稍后重试（排队超时 2s）"）当回答正文，
+// 否则和下面的重试提示重复两遍（界面减法）：正文只留一句结论，可操作信息放重试行。
+function chatMessageText(response) {
+  const code = (response && response.error && response.error.code) || ''
+  if (code === 'queue_timeout') return '排队超时，本次没有生成回答。'
+  if (code) return '本次生成失败，没有可用的回答。'
+  return (response && response.response) || ''
+}
+
+function retryMessage(item) {
+  let prev = ''
+  const idx = messages.value.indexOf(item)
+  for (let i = idx - 1; i >= 0; i--) {
+    if (messages.value[i].role === 'user') { prev = messages.value[i].content; break }
+  }
+  if (!prev) return
+  messages.value = messages.value.filter(m => m !== item)
+  sendMessage(prev, { skipUserBubble: true })
+}
 
 function confirmGenerated() {
   generatedToken.value = ''
@@ -822,6 +921,20 @@ function hazardActionLabel(action) {
     none: '未触发', suggested: '建议上报（待确认）',
     auto_ticket: '自动建单', merged: '合并既有单'
   }[action] || '未触发'
+}
+
+// 工具调用摘要（P0-A）：如实反映本次请求真实发生的工具调用，而非"口头声称已查询"
+function toolsUsedLabel(response) {
+  const list = (response && response.toolsUsed) || []
+  if (!list.length) return '未调用'
+  return list.map((t) => `${t.name}${t.ok ? '' : '（失败）'}`).join(' · ')
+}
+
+// 依据指纹（P0-B）：doc/chunk/段落定位，仅开发者面板展示，便于引用追溯
+function citationFingerprint(response) {
+  const list = (response && response.citations) || []
+  return list.map((c) => `#${c.index} ${c.docId || '-'}·${c.chunkId || '-'}`
+    + (c.chunkIndex >= 0 ? `(${c.chunkIndex + 1}/${c.totalChunks})` : '')).join(' , ')
 }
 
 function escalateInChat() {

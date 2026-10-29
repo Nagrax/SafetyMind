@@ -1239,6 +1239,39 @@ button:disabled { opacity: 0.5; cursor: not-allowed; }
 .m-action.muted-note { border-style: dashed; cursor: default; }
 
 /* ── 升级卡片 Loop 工单进度（五阶段回路克制版：简报→研讨→执行→反馈→验收）── */
+/* 依据引用卡（P0-B 证据引用）：命中条款可定位——标题/章节/来源/版本 + 命中片段。
+   默认折叠，只占一行；展开后按条目列出，内容可滚动，不吃掉整屏高度。 */
+.cite-card {
+  width: 100%; max-width: min(100%, 560px); margin-top: 2px;
+  border: 1px solid var(--border); border-radius: 12px; background: var(--bg-soft);
+  overflow: hidden;
+}
+.cite-toggle {
+  width: 100%; display: flex; align-items: center; gap: 8px;
+  border: none; background: transparent; padding: 8px 12px;
+  font-size: 13px; color: var(--text-2); cursor: pointer; text-align: left;
+}
+.cite-toggle .cite-title { font-weight: 600; color: var(--text); flex: none; }
+.cite-toggle .cite-count { color: var(--accent); font-weight: 600; font-size: 12.5px; }
+.cite-toggle .cite-caret { margin-left: auto; color: var(--text-3); font-size: 11px; flex: none; }
+.cite-list {
+  margin: 0; padding: 0 12px 10px; list-style: none;
+  display: flex; flex-direction: column; gap: 10px;
+  max-height: 320px; overflow-y: auto;
+}
+.cite-item { border-top: 1px dashed var(--border); padding-top: 8px; }
+.cite-item:first-child { border-top: none; padding-top: 0; }
+.cite-head { display: flex; flex-wrap: wrap; align-items: baseline; gap: 6px; margin: 0 0 4px; }
+.cite-head .cite-doc { font-size: 13px; color: var(--text); }
+.cite-head .cite-loc,
+.cite-head .cite-ver,
+.cite-head .cite-src {
+  font-size: 11.5px; color: var(--text-3);
+  border: 1px solid var(--border); border-radius: 6px; padding: 0 5px;
+}
+.cite-snippet { margin: 0; font-size: 12.5px; line-height: 1.6; color: var(--text-2); white-space: pre-wrap; }
+.cite-note { margin: 4px 0 0; font-size: 11.5px; }
+
 .loop-card {
   width: 100%; max-width: 340px; margin-top: 2px;
   border: 1px solid var(--border); border-radius: 12px; background: var(--bg-soft);
@@ -1300,6 +1333,20 @@ button:disabled { opacity: 0.5; cursor: not-allowed; }
 .m-msg.typing .m-msg-body span:nth-child(2) { animation-delay: .18s; }
 .m-msg.typing .m-msg-body span:nth-child(3) { animation-delay: .36s; }
 @keyframes mtyping { 0%, 60%, 100% { transform: translateY(0); opacity: .5; } 30% { transform: translateY(-4px); opacity: 1; } }
+
+/* 等待期阶段提示（来自 /chat/stream 的 stage 事件）：慢路径不再只有转圈，
+   用户能看到"正在检索资料并生成回答"。无 stage 事件时不渲染（behavior 不变）。 */
+.m-stage-note {
+  margin: 2px 0 0 2px; font-size: 12px; line-height: 1.4; color: var(--text-3);
+}
+
+/* 失败可重试行（排队超时/生成失败）：提示等待时长 + 一个明确的"重试"按钮。
+   按钮用描边（不是实心红）：重试是安全动作，不该看起来像危险操作。 */
+.retry-row { align-items: center; gap: 10px; }
+.retry-row .m-action.primary {
+  background: transparent; border-color: var(--accent); color: var(--accent);
+}
+.retry-row .m-action.primary:hover { background: var(--accent); color: #fff; }
 
 /* ── 快捷场景条 ── */
 .m-quick {

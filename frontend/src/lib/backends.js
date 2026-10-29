@@ -146,6 +146,93 @@ export async function requestChat(type, settings, message) {
   return normalizeChatResponse(type, raw)
 }
 
+// 流式对话（2026-10-29）：后端 /chat/stream 早就实现（事件 meta → stage* → delta → done），
+// 但前端一直只调 /chat —— 于是用户实际仍是"盯着三个点等 15~50s"，上一轮所说的
+// "等待期无反馈"只修了后端一半。这里补上前端接入：
+//   - stage 事件驱动"正在检索资料 / 正在生成回答"的可见进度；
+//   - delta 边到边追加（快路径几十毫秒即有正文）；
+//   - done 带完整响应体，normalize 后与 /chat 完全同构（升级卡/依据/建单卡都不丢）。
+// 任何一步不可用（旧后端、代理缓冲、网络中断）都**回退到非流式 /chat**，绝不空回。
+export async function streamChat(type, settings, message, { onStage } = {}) {
+  const meta = backendMeta(type, settings)
+  const payload = buildChatPayload(type, settings, message)
+  const url = `${normalizeBaseUrl(meta.baseUrl)}/chat/stream`
+  let finalBody = null
+  let streamed = ''
+  let errEvent = null
+  try {
+    const response = await fetch(url, {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+        'X-Access-Token': localStorage.getItem('safetymind.accessToken') || ''
+      },
+      body: JSON.stringify(payload)
+    })
+    const ctype = String(response.headers.get('content-type') || '')
+    if (!response.ok || !response.body || !ctype.includes('text/event-stream')) {
+      throw new Error('stream-unavailable')
+    }
+    const reader = response.body.getReader()
+    const decoder = new TextDecoder('utf-8')
+    let buffer = ''
+    for (;;) {
+      const { done, value } = await reader.read()
+      if (done) break
+      buffer += decoder.decode(value, { stream: true })
+      // SSE 帧以空行分隔；末段可能不完整，留在 buffer 里等下一次 read
+      const frames = buffer.split('\n\n')
+      buffer = frames.pop() || ''
+      for (const frame of frames) {
+        const evt = parseSseFrame(frame)
+        if (!evt) continue
+        if (evt.event === 'stage') {
+          if (typeof onStage === 'function') onStage(evt.data || {})
+        } else if (evt.event === 'delta') {
+          streamed += String((evt.data && evt.data.text) || '')
+        } else if (evt.event === 'error') {
+          // 排队超时/生成失败：记下来交给 UI 显示"重试"，不要静默吞掉
+          errEvent = evt.data || {}
+        } else if (evt.event === 'done') {
+          finalBody = evt.data || {}
+        }
+      }
+    }
+    if (!finalBody) throw new Error('stream-no-done')
+    // 后端 done 已带完整响应体；万一旧后端只回摘要，用累积的 delta 补齐正文
+    const merged = { ...finalBody }
+    if (!merged.response) merged.response = streamed
+    const normalized = normalizeChatResponse(type, merged)
+    // 失败信息透传给 UI（event:error 优先，其次 done 里带的 error）
+    const err = errEvent || merged.error || null
+    if (err) {
+      normalized.error = err
+      const wait = Number(err.retry_after ?? (merged.error && merged.error.retry_after) ?? 0)
+      normalized.retryAfter = Number.isFinite(wait) ? wait : 0
+    }
+    return normalized
+  } catch {
+    return requestChat(type, settings, message)
+  }
+}
+
+function parseSseFrame(frame) {
+  const lines = String(frame || '').split('\n')
+  let event = 'message'
+  const dataLines = []
+  for (const line of lines) {
+    if (line.startsWith('event:')) event = line.slice(6).trim()
+    else if (line.startsWith('data:')) dataLines.push(line.slice(5).trim())
+  }
+  if (!dataLines.length) return null
+  try {
+    return { event, data: JSON.parse(dataLines.join('\n')) }
+  } catch {
+    return { event, data: { text: dataLines.join('\n') } }
+  }
+}
+
+
 // 升级卡片的 Loop 工单进度（用户端克制暴露）：按上报编号查五阶段进度与最新批注。
 // 未知编号回 200+found=false（"工单生成中"空态），网络/服务异常由调用方 try/catch 降级。
 export async function requestTicketProgress(type, settings, requestId) {
@@ -242,6 +329,26 @@ function normalizeChatResponse(type, raw) {
       deadlineHours: Number(raw.hazard_suggestion.deadline_hours ?? raw.hazard_suggestion.deadlineHours ?? 0),
       basis: raw.hazard_suggestion.basis || ''
     } : null,
+    // 依据引用（P0-B）：命中片段 + 可定位身份。业务面只用 title/section/
+    // source/version/snippet；chunkId/contentHash 等指纹留给 ?dev=1 面板（铁律 2）。
+    citations: Array.isArray(raw.citations) ? raw.citations.map((c) => ({
+      index: Number(c.index || 0),
+      title: c.title || '',
+      section: c.section || '',
+      source: c.source || '',
+      version: c.version || '',
+      status: c.status || '',
+      score: c.score,
+      snippet: c.snippet || '',
+      docId: c.doc_id || c.docId || '',
+      chunkId: c.chunk_id || c.chunkId || '',
+      contentHash: c.content_hash || c.contentHash || '',
+      chunkIndex: Number(c.chunk_index ?? c.chunkIndex ?? -1),
+      totalChunks: Number(c.total_chunks ?? c.totalChunks ?? -1),
+      catalogOnly: Boolean(c.catalog_only ?? c.catalogOnly)
+    })) : [],
+    // 工具轨迹（P0-A）：本次请求真实发生的工具调用（不是"口头声称已查询"）。
+    toolsUsed: Array.isArray(raw.tools_used ?? raw.toolsUsed) ? (raw.tools_used ?? raw.toolsUsed) : [],
     raw
   }
 }
