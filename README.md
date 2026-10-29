@@ -106,13 +106,25 @@ docker compose up -d    # 首次启动会导入 7 篇默认安全知识库文档
 > 通过 `ANTHROPIC_BASE_URL` 配置，此时意图识别的向量路自动禁用，权重切换为
 > LLM 0.85 / 关键词 0.15。
 
+### 模型选择（2026-10-29 实测，别再用"不响应思考开关"的模型）
+
+| 模型 | 同一判定类问题 | 结论 |
+|---|---|---|
+| `zcode/GLM-5.3-Flash` | 70.8s，finish=length，**正文 0 字**，reasoning 10.4k 字 | 不响应 `reasoning_effort` 与 `thinking`，**不可用于正文生成** |
+| `raccoon/sn-deepseek-v4-1-flash-1017` | **6.4s**，finish=stop，正文 990 字，reasoning 0 | 默认模型（`.env` 的 `ANTHROPIC_MODEL`） |
+
+直连中继的四组对照见 `scratch/sm-loop/probe_thinking_variants.py`；
+复跑截断实验：`benchmarks/eval_truncation_budget.py`（切模型后三档预算 0/4 截断）。
+注意：OpenAI 协议适配层会把 `max_tokens` 抬到 ≥4096，`SAFETYMIND_MAX_TOKENS` 只能抬高、
+不能压低；**预算加大救不回"思考不可控"的模型，换模型才是修法**。
+
 ## 七个模块，一条处置链
 
 | # | 模块 | 核心问题 | 代表机制 | 主要代码 |
 | --- | --- | --- | --- | --- |
 | ① | 意图识别 | 一句话属于哪类安全业务、多急 | 19 类安全意图三路加权融合（LLM/向量/关键词）、4 级紧急度（泄漏→HIGH、爆炸→CRITICAL）、实体抽取（设备编号/作业类型/化学品/区域）、LRU 缓存 + 在线学习；可选本地语义引擎级联（`SAFETYMIND_BGE=1` bge 原型分类器 96.4%、`SAFETYMIND_LAYA=1` 判别式路由），置信度达阈直出、跳过 LLM 调用 | `core/intent_recognizer.py` `core/intent_bge.py` |
 | ② | 多 Agent 路由 | 谁来答、要不要并行、要不要升级 | 意图映射 + 领域打分（辅 Agent ≥0.45 且 ≥主×0.55 时并行）、CRITICAL/转人工直达升级 Agent、低置信度先澄清、专属失败降级兜底、每条响应带路由原因 | `agents/agent_orchestrator.py` |
-| ③ | RAG 知识库 | 法规条文命中但缺上下文 | 500 字句级重叠切片、父子召回（子块检索、整篇返回）、4 路查询改写、内容哈希去重、LLM 重排、寒暄门控；嵌入式模式默认 BGE 语义嵌入（检索 top3 命中 7/7 vs n-gram 4/7） | `mcp/knowledge_base.py` |
+| ③ | RAG 知识库 | 法规条文命中但缺上下文 | 500 字句级重叠切片、父子召回（子块检索、整篇返回）、4 路查询改写、内容哈希去重、LLM 重排、寒暄门控；嵌入式模式默认 BGE 语义嵌入（检索 top3 命中 7/7 vs n-gram 4/7）；corpus 通道有词面证据闸门（`SAFETYMIND_CORPUS_MIN_TERM_HITS`） | `mcp/knowledge_base.py` |
 | ④ | MCP 工具治理 | 下游挂了不雪崩 | 三态熔断（5 连败 OPEN / 60s HALF_OPEN 探测）、30s 执行超时、300s 结果缓存（上限 5000 条）、JSON Schema 参数校验、降级兜底 | `mcp/tool_manager.py` |
 | ⑤ | 三级记忆 | 记住当前会话，也记住这个人 | Redis 工作记忆（24h TTL，15 条压缩保 5 + LLM 摘要）、Chroma 情景记忆跨会话语义召回、人员安全画像（岗位/装置/设备/化学品/安全历史）每轮异步更新 | `memory/conversation_memory.py` |
 | ⑥ | Skills 动态注入 | 处置 SOP 运营侧可改 | SKILL.md + 手写 front matter 解析、按 Agent 绑定 + 关键词命中注入、单条 3200 / 总量 5000 字符预算、热加载 + 单文件失败隔离 | `core/skill_loader.py` |
@@ -130,6 +142,7 @@ docker compose up -d    # 首次启动会导入 7 篇默认安全知识库文档
 | 方法 | 路径 | 说明 |
 | --- | --- | --- |
 | POST | `/chat` | 主对话（意图/路由/RAG/记忆全链路） |
+| POST | `/chat/stream` | 同一链路的 SSE 版：`meta → stage* → delta* → done`，失败时 `error → done`（前端默认走这个） |
 | POST | `/search?query=&top_k=` | 检索演示：改写→并行召回→重排 |
 | POST | `/knowledge/add` · `/knowledge/upload` | 批量/文件导入知识库（自动切片+父子结构） |
 | GET | `/knowledge/stats` | 知识库片段统计 |
@@ -144,6 +157,21 @@ docker compose up -d    # 首次启动会导入 7 篇默认安全知识库文档
 设置 `ACCESS_TOKEN` 后，除健康检查/用户端配置/前端静态资源外，以上端点均要求请求头 `X-Access-Token`（发给使用者的口令，前端"设置"页填一次即记住）。
 
 前端通过 `/api/python/*` 前缀访问以上接口（与 Nginx 反代路径一致），后端已同时挂载两套路径。
+
+### `/chat/stream` 事件契约
+
+| 事件 | 何时发 | data 关键字段 |
+| --- | --- | --- |
+| `meta` | 请求一进来 | `emergency`、`message`（前 60 字） |
+| `stage` | 排队 / 开始处理 | `stage`（`queued`/`processing`）、`lane` |
+| `delta` | 答案分块 | `text` |
+| `error` | 排队超时或生成异常 | `code`（`queue_timeout`/`internal_error`）、`message`、`retry_after` |
+| `done` | **每次都发**（含失败） | 完整响应体（`response`/`citations`/`escalated`/`hazard*`/`conversation_id`）+ `path` |
+
+要点：失败也必须以 `error → done` 收尾（`done.response` 是可读提示），客户端才不会看到"半截流"；
+客户端断开时服务端会立刻释放并发容量（`tests/test_stream_gate_leak.py` 锁定）。
+前端把 `error.code=queue_timeout` 渲染成"排队超时，本次没有生成回答。 + 建议 N 秒后重试 + 【重试】"，
+点击重试复用上一条用户消息。
 
 ## 环境变量
 
@@ -175,6 +203,16 @@ docker compose up -d    # 首次启动会导入 7 篇默认安全知识库文档
 | `API_HOST` | `127.0.0.1`（desktop/mobile 启动器自动设置） | 监听地址；`python -m api.main` 默认 `0.0.0.0`——**网络暴露时必须配置 `ADMIN_TOKEN` 与 `ACCESS_TOKEN`** |
 | `SAFETYMIND_DEPLOYED` | 空 | 服务器反代部署标记：设 `1` 后管理端点强制鉴权（防绑定地址欺骗免密）；桌面端勿设 |
 | `CHAT_MAX_CONCURRENCY` | `4` | 对话链路并发闸门：LLM/torch 推理限流保护（20 并发压测实测保护检索端点不被饿死） |
+| `SAFETYMIND_MAX_TOKENS` | `1024` | 生成输出预算（OpenAI 协议适配层会抬到 ≥4096；详见"模型选择"一节） |
+| `SAFETYMIND_TEMPERATURE` | 不设置（用端点默认） | 生成采样温度；评测复现用 `0`。默认不发送该字段，产品行为不变 |
+| `SAFETYMIND_ANSWER_STYLE` | 不设置 | `brief` = 先结论/最多 5 条/450 字内（实测字数 −48%、延迟仅 −13%，**默认关闭**，见 `benchmarks/eval_answer_length_ab.py`） |
+| `SAFETYMIND_FALLBACK_MODEL` | 空 | 备用模型：主模型出现"思考吃光预算、正文 0 字"时换它重试一次（`core/llm_protocol.py` 的 `_maybe_fallback`）。只保证"有答案"：实测备选 qwen3-8-flash 快 40% 但四维质量低约 0.4，属降级水平 |
+| `SAFETYMIND_INTENT_MODEL` | 空（沿用生成模型） | 意图识别专用模型：实测 test2 准确率同为 0.980，低置信回落 14.65s → **2.35s**（覆盖约 42.7% 请求） |
+| `SAFETYMIND_INTENT_LLM_TIMEOUT_S` | `0`（关闭） | 意图 LLM 回落超时；**设 6s 会让低置信准确率从 95.3% 掉到 29.7%**，属"准确率换延迟"的取舍，默认不开 |
+| `SAFETYMIND_TORCH_THREADS` | 自适应 `max(1,min(4,cpu//2))` | 嵌入推理线程数；实测 1→4 线程吞吐 +176%（4→8 只 +11%），2 核机器自动保持 1 线程 |
+| `SAFETYMIND_CORPUS_MIN_TERM_HITS` | `2` | corpus 通道注入闸门：≥N 个非泛用查询词逐字命中才注入；`0` 关闭（回退只按 top_k 截断） |
+| `SAFETYMIND_CORPUS_TERM_STOPWORDS` | 空 | 额外锚点停用词（逗号分隔），用于压制"安全/作业"这类泛用词 |
+| `SAFETYMIND_CORPUS_TOP_K` | `6` | corpus 通道候选条数（最终注入仍受 top_k 与闸门约束） |
 
 ## 项目结构
 
@@ -210,3 +248,13 @@ SafetyMind/
 - **更强 LLM 对照**：以强模型（v4-pro / DeepSeek 级）复测三路融合与两级终判的对照实验（免费档 flash 的对照已完成，见 BENCHMARK.md）；
 - **人工盲测回填**：盲测工具包已随仓库提供（`benchmarks/intent/blind_test/`，50 条分层样本），人工一致率待回填基准文档；
 - **HTTPS 与域名**：当前以内测形态运行（IP 直连 + 访问门），绑定域名后由 Caddy 自动签发证书（配置见 docs/DEPLOY.md）。
+
+### `escalation_basis`（升级依据，2026-10-29）
+
+`escalated=true` 时附带依据：`urgency`（CRITICAL 紧急度）/ `intent`（意图即转人工）/
+`safety_net`（本地紧急预检兜底）/ `model_hint`（模型正文里出现"建议转人工"等关键词）。
+
+前三种是**确定性**的；`model_hint` 取决于生成文本，同一问题两次可能不同。
+`/chat` 与 `/chat/stream` 的同题对照实测（12 题）：确定性字段零不一致，
+`escalated` 有 2 题因 `model_hint` 波动——**测试与自动化应断言 `escalation_basis`
+而不是 `escalated`**。

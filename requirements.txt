@@ -21,6 +21,16 @@ httpx==0.28.1              # monitor/performance_monitor.py webhook 告警
 
 # ── 工具 ──────────────────────────────────────────────────────────────────────
 python-dotenv==1.0.1
+# 安全台账文件导出（core/ledger_export.py，2026-10-26 新增）：
+#   安全员日常用 Office/WPS，台账最终要交 .xlsx/.docx 文件而不只是聊天回答。
+#   openpyxl 产 xlsx；python-docx 产 docx（安全检查记录这类本质是 Word 文档）。
+#   两者都是轻量纯 Python 库，不引入编译链，因此放在主 venv 而非解析工具链 venv。
+openpyxl==3.1.5             # xlsx 台账生成（同时被 corpus/导出复用）
+python-docx==1.2.0          # docx 检查记录生成
+# 说明：资料库 FTS5 中文预分词用 jieba（已在服务 venv 安装，不在此处重复声明）；
+#       重量级 DOCX/XLSX/PPTX/PDF **解析**库仍只在解析工具链 venv（D:/SafetyMindData/venv），
+#       仓库运行时对重库惰性导入、缺失时抛 RuntimeError（见 corpus/parsers.py）。
+#       注意区分：解析（重，隔离）vs 生成（轻，主环境）——这里只加了生成侧。
 
 # ── 桌面端 ────────────────────────────────────────────────────────────────────
 pywebview==5.4              # desktop.pyw 原生窗口（Windows 走 Edge WebView2）
