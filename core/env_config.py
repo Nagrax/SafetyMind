@@ -23,7 +23,41 @@ ADMIN_ENV_KEYS: Dict[str, Dict[str, Any]] = {
     "SAFETYMIND_EMBEDDING":   {"secret": False, "restart": True,  "label": "嵌入模式", "enum": ("auto", "bge", "ngram")},
     "SAFETYMIND_HAZARD_AUTOTICKET": {"secret": False, "restart": True, "label": "隐患工单闸门", "enum": ("0", "1")},
     "SAFETYMIND_HAZARD_OVERDUE_CHECK_S": {"secret": False, "restart": True, "label": "工单逾期巡检间隔（秒）"},
+    # 多用户主体目录：配置后 S-05 才启用严格身份隔离（会话/工单/资料按主体授权）。
+    # 标 secret：里面是各用户的访问令牌，读取只回掩码（管理员改就得整段重填）。
+    "SAFETYMIND_USERS": {"secret": True, "restart": False,
+                         "label": "多用户主体目录（JSON；配置后启用严格隔离，留空=本地单人形态）",
+                         "json": "users"},
 }
+
+
+def _validate_users_json(value: str) -> None:
+    """SAFETYMIND_USERS 必须是 JSON 数组或对象，且每个主体含 token 与 subject_id。
+
+    非法值直接拒绝：把不可用的主体目录写进 .env 会让隔离"看似开启实则无主体"，
+    比拒绝写入危险得多。空数组同样拒绝（要清空请把该键留空）。
+    """
+    import json as _json
+    try:
+        data = _json.loads(value)
+    except ValueError as ex:
+        raise ValueError(f"SAFETYMIND_USERS 不是合法 JSON: {ex}")
+    if isinstance(data, dict):
+        entries = [
+            dict(v, token=k) if isinstance(v, dict) else {"token": k}
+            for k, v in data.items()
+        ]
+    elif isinstance(data, list):
+        entries = data
+    else:
+        raise ValueError("SAFETYMIND_USERS 必须是 JSON 数组或对象")
+    if not entries:
+        raise ValueError("SAFETYMIND_USERS 不能为空数组（要清空请把该键留空）")
+    for i, e in enumerate(entries):
+        if not isinstance(e, dict) or not str(e.get("token") or "").strip():
+            raise ValueError(f"SAFETYMIND_USERS[{i}] 缺少 token")
+        if not str(e.get("subject_id") or "").strip():
+            raise ValueError(f"SAFETYMIND_USERS[{i}] 缺少 subject_id")
 
 
 def _mask(value: str) -> str:
@@ -84,6 +118,8 @@ class EnvConfigManager:
                 raise ValueError(f"{key} 不允许换行（防配置注入）")
             if meta.get("enum") and v and v not in meta["enum"]:
                 raise ValueError(f"{key} 仅允许: {'/'.join(meta['enum'])}")
+            if meta.get("json") == "users" and v:
+                _validate_users_json(v)
             cleaned[key] = v
 
         with self._lock:

@@ -15,6 +15,7 @@ import asyncio
 import hashlib
 import json
 import logging
+import os
 import re
 import time
 from dataclasses import dataclass, field
@@ -265,14 +266,23 @@ class IntentRecognizer:
         kwargs: Dict[str, Any] = {"api_key": api_key}
         if base_url:
             kwargs["base_url"] = base_url
-        from core.llm_utils import llm_client_kwargs
-        self.client    = AsyncAnthropic(**kwargs, **llm_client_kwargs())
+        from core.llm_utils import llm_client_kwargs, make_llm_client
+        self.client    = make_llm_client(api_key=api_key, base_url=base_url or "",
+                                         model=model, **llm_client_kwargs())
         self.model     = model
         self.threshold = confidence_threshold
-        # 第三方兼容 API（如 DeepSeek）通常不支持 Embedding，禁用该策略。
-        # 官方 Anthropic SDK 当前没有 embeddings 资源，因此下面会使用稳定的
-        # 本地字符 n-gram 向量作为轻量兜底，保证三路融合链路真实可跑。
-        self._embedding_enabled = not bool(base_url)
+        # 第三方兼容 API（如 DeepSeek）通常不支持**云端** Embedding，因此历史上这里
+        # 只要配了 base_url 就禁用 embedding 策略。
+        #
+        # 2026-10-28 阶段拆解实测：那是误伤。**本地 BGE 模型不需要任何网络**，
+        # 一并被禁后意图识别退化成 LLM 路径，单次 2384ms（BGE 直出仅约 63ms），
+        # 白等 2.3 秒/请求（占端到端 12s 的 19%）；而 BGE 意图准确率本就高于
+        # LLM 兜底（基准 dev 97.71 / test 96.42 就是 BGE 口径）。
+        # 现在：本地 BGE 可用即启用，与 base_url 无关。
+        #   SAFETYMIND_BGE=0 → 全局关 BGE；SAFETYMIND_INTENT_BGE=0 → 仅关意图 BGE（回退旧行为）
+        _bge_on = (os.getenv("SAFETYMIND_BGE", "1") == "1"
+                   and os.getenv("SAFETYMIND_INTENT_BGE", "1") == "1")
+        self._embedding_enabled = _bge_on or not bool(base_url)
 
         self._tpl_embeddings: Dict[IntentCategory, List[List[float]]] = {}
         self._cache: Dict[str, IntentResult] = {}
@@ -369,7 +379,11 @@ class IntentRecognizer:
                 return result
 
         # LLM 和 Embedding 并行（Embedding 不可用时跳过）
-        llm_task = asyncio.create_task(self._llm_recognize(message, history))
+        # BGE 未达阈值时，把本地首选作为提示传给 LLM（SAFETYMIND_INTENT_HINT=0 关闭）
+        _hint = None
+        if local_res and os.getenv("SAFETYMIND_INTENT_HINT", "1") == "1":
+            _hint = (local_res[0], float(local_res[1]))
+        llm_task = asyncio.create_task(self._llm_recognize(message, history, hint=_hint))
         emb_task = asyncio.create_task(self._embedding_recognize(message)) if self._embedding_enabled else None
         pat      = self._pattern_recognize(message)
 
@@ -415,14 +429,21 @@ class IntentRecognizer:
     async def _llm_recognize(
         self,
         message: str,
-        history: Optional[List[Dict[str, str]]],
+        history: Optional[List[Dict[str, str]]] = None,
+        hint: Optional[tuple] = None,
     ) -> Dict[str, Any]:
-        """策略 1：LLM 语义理解（Few-shot + 上下文）。"""
+        """策略 1：LLM 语义理解（Few-shot + 上下文）。
+
+        hint=(意图名, 融合置信)：BGE 直出未达阈值时把本地首选作为提示传给 LLM。
+        依据（2026-10-29 实测）：43.5% 请求会走本路径、每次 3532ms；
+        给候选可缩短模型比较空间，从而降低输出长度与延迟，同时可能提升一致率。
+        """
         message = self._clean_text(message)
         # 构建 Few-shot 示例
+        _fs_limit = int(os.getenv("SAFETYMIND_INTENT_FEWSHOT", "999"))
         examples = "\n".join(
             f'  消息: "{t}" → 意图: {cat.value}'
-            for cat, tpls in _TEMPLATES.items()
+            for _i, (cat, tpls) in enumerate(_TEMPLATES.items()) if _i < _fs_limit
             for t in tpls[:1]  # 每类取 1 条，控制 prompt 长度
         )
         # 最近 3 轮对话上下文
@@ -433,6 +454,9 @@ class IntentRecognizer:
                 for m in history[-3:]
             )
 
+        # 2026-10-29 实测否决：把 BGE 首选作为 hint 传给 LLM，延迟 4349ms vs 4367ms
+        # （噪声级），准确率完全相同（0.9850/0.9655 逐位一致）——**该优化无效，已回退**。
+        # 保留此注释防止后人重复尝试；若再试，请先确认延迟确实有下降再落地。
         prompt = f"""你是安全生产领域的意图分析专家。根据示例判断用户意图，返回 JSON。
 如果用户问题能匹配细粒度安全业务意图，请优先返回细粒度意图，而不是宽泛大类。
 例如作业票办理优先返回 work_permit，设备报警处置优先返回 equipment_alarm，
@@ -452,12 +476,26 @@ class IntentRecognizer:
         prompt = self._clean_text(prompt)
 
         try:
-            resp = await self.client.messages.create(
+            _max_tok = int(os.getenv("SAFETYMIND_INTENT_MAX_TOKENS", "256"))
+            # 超时保护（2026-10-29 实测，**默认关闭**）：端点高峰期单次意图判定实测
+            # 10.9~24.3s（上午同一请求 6.4s），覆盖约 43.5% 请求；但 6s 超时的代价是
+            # 低置信样本准确率从 ~95% 掉到 **29.7%**（test2 n=150 实测：高置信 86 条
+            # 100%、低置信 64 条 29.7%，整体 70% vs BGE-only 94.9%）——在安全场景里
+            # 用"答得更快但会答错"换延迟不可接受，所以默认 0（关闭）。
+            # 需要硬上限的部署可设 SAFETYMIND_INTENT_LLM_TIMEOUT_S=6，并清楚这是
+            # 准确率换延迟的取舍。真正的解法在端点/模型侧（见 eval_intent_model_ab.py）。
+            try:
+                _timeout = float(os.getenv("SAFETYMIND_INTENT_LLM_TIMEOUT_S", "0") or 0)
+            except ValueError:
+                _timeout = 0.0
+            _call = self.client.messages.create(
                 model=self.model,
-                max_tokens=256,
+                max_tokens=_max_tok,
                 temperature=0.1,
                 messages=[{"role": "user", "content": prompt}],
             )
+            resp = (await asyncio.wait_for(_call, timeout=_timeout)
+                    if _timeout > 0 else await _call)
             raw = extract_text_content(resp.content)
             s, e = raw.find("{"), raw.rfind("}") + 1
             data = json.loads(raw[s:e])
@@ -619,11 +657,14 @@ class IntentRecognizer:
 
     def _urgency(self, message: str, intent: IntentCategory) -> UrgencyLevel:
         msg = message.lower()
+        # 参数名不计为现场证据（2026-10-29）：「爆炸极限」里的「爆炸」曾把
+        # "甲醇的闪点和爆炸极限分别是多少"判成 CRITICAL，直接走应急模板、用户拿不到数值。
+        from core.param_phrases import live_keyword_hits
         for words, signs in _URGENCY_COMBOS:
-            if any(w in msg for w in words) and any(s in msg for s in signs):
+            if live_keyword_hits(msg, words) and live_keyword_hits(msg, signs):
                 return UrgencyLevel.CRITICAL
         for level, kws in _URGENCY_KEYWORDS.items():
-            if any(kw in msg for kw in kws):
+            if live_keyword_hits(msg, kws):
                 return level
         if intent in (
             IntentCategory.ESCALATION,

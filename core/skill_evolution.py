@@ -120,15 +120,39 @@ class SkillEvolution:
         return cand
 
     # ── 审批落盘 ─────────────────────────────────────────
-    def approve(self, cand_id: str) -> Dict[str, Any]:
+    def approve(self, cand_id: str, validation: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
+        """批准候选并落盘。
+
+        `validation`（可选）：来自 core/skill_effect_validation.py 的 before/after
+        对照结果。**有则记入候选的 evidence，无则如实标注 unvalidated**。
+
+        为什么不让 approve 自己去跑验证：
+          - 验证要调真实模型（几十秒 + token 成本），不应阻塞审批动作；
+          - 审批是人的决定，验证是证据，两者应解耦但不能互相假冒。
+        所以这里只做一件事：把"这条改动有没有证据支撑"如实写进台账。
+        """
         cand = next((c for c in self.list_candidates()
                      if c.get("id") == cand_id and c.get("status") == "pending"), None)
         if cand is None:
             return {"ok": False, "error": "pending 候选不存在"}
         written = (self._write_new_skill(cand) if cand["action"] == "add"
                    else self._merge_into_skill(cand))
-        self._update_candidate(cand_id, status="approved", decided_ts=time.time())
-        return {"ok": True, "written": written}
+        extra: Dict[str, Any] = {}
+        if isinstance(validation, dict) and validation.get("ok"):
+            extra = {
+                "validation_verdict": validation.get("verdict"),
+                "validation_delta": validation.get("delta"),
+                "validation_margin": validation.get("margin"),
+                "validation_model": validation.get("model"),
+                "validation_before_mean": (validation.get("before") or {}).get("mean"),
+                "validation_after_mean": (validation.get("after") or {}).get("mean"),
+            }
+        else:
+            # 如实标注：没有证据就是没有证据，不能默认"通过"
+            extra = {"validation_verdict": "unvalidated",
+                     "validation_note": "未提供效果验证证据（approve 不会自行伪造）"}
+        self._update_candidate(cand_id, status="approved", decided_ts=time.time(), **extra)
+        return {"ok": True, "written": written, **extra}
 
     def reject(self, cand_id: str) -> Dict[str, Any]:
         cand = self._update_candidate(cand_id, status="rejected", decided_ts=time.time())
@@ -189,13 +213,12 @@ async def extract_candidate_async(evo: "SkillEvolution", feedback: Dict[str, Any
                                   skills_meta: List[Dict[str, Any]],
                                   api_key: str, base_url: str, model: str) -> None:
     """后台抽取：LLM 提炼候选 → 相似度决策 → 落 pending。失败落 extraction_failed（反馈不丢）。"""
-    from anthropic import AsyncAnthropic
-    from core.llm_utils import llm_client_kwargs
+    from core.llm_utils import llm_client_kwargs, make_llm_client
     try:
         if os.getenv("SAFETYMIND_SKILL_EVOLUTION", "1") != "1":
             return
-        client = AsyncAnthropic(api_key=api_key, base_url=base_url or None,
-                                **llm_client_kwargs())
+        client = make_llm_client(api_key=api_key, base_url=base_url or "",
+                                 model=model, **llm_client_kwargs())
         user_prompt = (f"用户消息：{feedback.get('message_head', '')}\n"
                        f"助手回答（节选）：{feedback.get('answer_head', '')}\n"
                        f"用户反馈：{'差评' if feedback.get('rating') == 'down' else '评语'} "
