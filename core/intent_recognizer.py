@@ -63,6 +63,20 @@ class UrgencyLevel(Enum):
     CRITICAL = 4
 
 
+# 事实型提问标记（2026-10-29）：这类问题在问"具体数值/条款/要求"，即使意图落在
+# 中置信带（[tau, 0.55)）也不该先反问 A/B——用户要的是数字，反问只会让他多点一次。
+# 实测（benchmarks/eval_fact_stability.py）："噪声作业的职业接触限值是多少？依据哪个标准？"
+# 5 次全部返回澄清提示、一次数值都没给。
+_FACTUAL_PATTERN = re.compile(
+    r"(多少|几(级|个|种|小时|天|年|米|分)|依据|标准|规范|条款|是什么|什么是|"
+    r"怎么规定|如何规定|要求(是|有)|判定值|限值)")
+
+
+def is_factual_question(message: str) -> bool:
+    """是否在问具体数值/条款（用于让事实型问题跳过"先反问"）。"""
+    return bool(_FACTUAL_PATTERN.search(message or ""))
+
+
 @dataclass
 class IntentResult:
     intent:     IntentCategory
