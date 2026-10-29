@@ -1296,6 +1296,12 @@ async def _chat_core(req, conv_id: str, OrcReq, MsgRole, t_start: float):
     _clarify_on = os.getenv("SAFETYMIND_CLARIFY", "1") == "1"
     _clarify_hi = float(os.getenv("SAFETYMIND_CLARIFY_MAX_CONF", "0.55"))
     _tau_now = float(os.getenv("SAFETYMIND_BGE_TAU", "0.80"))
+    # 事实型问题跳过"先反问"（2026-10-29，**默认开启**）：问数值/条款时反问只会让用户
+    # 多点一次。控温 A/B（6 题×3 次）：澄清率 17%→0%、事实覆盖 0.56→0.70、
+    # 配对 accuracy +0.133 / concrete +0.20 / safety 0；未控温那轮 accuracy 是 −0.267，
+    # 说明单靠小样本噪声会给出相反结论（见 benchmarks/eval_clarify_factual_ab.py）。
+    from core.intent_recognizer import is_factual_question as _is_factual
+    _skip_factual = os.getenv("SAFETYMIND_CLARIFY_SKIP_FACTUAL", "1") == "1"
     from core.intent_recognizer import UrgencyLevel as _UL
     if (
         _clarify_on
@@ -1305,6 +1311,7 @@ async def _chat_core(req, conv_id: str, OrcReq, MsgRole, t_start: float):
         and intent_result.intent.value in _CLARIFY_SPECIFIC
         and (intent_result.alt_intent or "") in _CLARIFY_SPECIFIC
         and intent_result.alt_confidence >= 0.30
+        and not (_skip_factual and _is_factual(req.message))
     ):
         from core.laya_recognizer import ZH_KEY
         _v2zh = {v: k for k, v in ZH_KEY.items()}
