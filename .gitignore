@@ -1,4 +1,4 @@
-# Python
+﻿# Python
 __pycache__/
 *.py[cod]
 *.egg-info/
@@ -58,3 +58,12 @@ data/chroma*
 
 # 本地 AI 工作协议（含本机路径，不入公共仓库）
 AGENTS.md
+
+# 环境变量备份（含密钥，绝不入库）
+.env.bak*
+.env.*.bak
+.env.local
+
+# 评测产物（可复现，不入库）
+benchmarks/results/
+benchmarks/intent/results/
