@@ -1,0 +1,53 @@
+{
+  "_comment": "隐私泄露形态的**单一事实源**（与 secret-patterns.json 分开，因为处置方式不同：密钥必须拦停，隐私多数需要改写而非中止）。",
+  "_usage": "每条 { id, pattern, why, severity, allow_paths? }。severity=block 表示命中即中止提交；severity=warn 只报告不中止。allow_paths 列出豁免的文件（该文件内允许出现此形态）。",
+  "_rationale": "隐私形态在文档/评测脚本里常有其正当用途（如本机路径用于本地跑），一刀切会逼人绕过守卫；故按严重度分级，block 类是真正不能公开的（真实身份信息），warn 类是「公开前应改写」。",
+  "patterns": [
+    {
+      "id": "windows-user-path",
+      "pattern": "[A-Za-z]:[/\\\\]Users[/\\\\][A-Za-z0-9_.-]+",
+      "why": "Windows 用户目录路径：直接暴露操作系统账号名",
+      "severity": "block"
+    },
+    {
+      "id": "personal-email",
+      "pattern": "[a-zA-Z0-9._%+-]+@(163|126|qq|gmail|foxmail|outlook|hotmail|sina|sohu|aliyun)\\.com",
+      "why": "真实个人邮箱：公开仓库中会直接暴露身份",
+      "severity": "block",
+      "allow_paths": ["evaluation/golden_labels.json"]
+    },
+    {
+      "id": "cn-id-card",
+      "pattern": "\\b[1-9][0-9]{5}(19|20)[0-9]{2}(0[1-9]|1[0-2])(0[1-9]|[12][0-9]|3[01])[0-9]{3}[0-9Xx]\\b",
+      "why": "中国大陆身份证号",
+      "severity": "block"
+    },
+    {
+      "id": "cn-bank-card",
+      "pattern": "(?<![0-9A-Za-z._])[1-9][0-9]{14}[0-9Xx](?![0-9A-Za-z._])",
+      "why": "疑似银行卡号（16~19 位）",
+      "severity": "block",
+      "comment": "两侧排除字母数字与小数点：浮点尾数（如 0.3838579669298401）与哈希/ID 片段不会被误判"
+    },
+    {
+      "id": "cn-mobile",
+      "pattern": "\\b1[3-9][0-9]{9}\\b",
+      "why": "中国大陆手机号（公开仓库中属个人信息）",
+      "severity": "block",
+      "allow_paths": [".env.example", "tests/test_config_admin.py"]
+    },
+    {
+      "id": "local-abs-path",
+      "pattern": "D:[/\\\\]claudecode[/\\\\][A-Za-z0-9_./-]+",
+      "why": "本机绝对路径：暴露目录结构、用户名与工具链习惯；应改为相对仓库根或环境变量",
+      "severity": "warn"
+    },
+    {
+      "id": "weak-default-password",
+      "pattern": "\\b(?:REDIS_PASSWORD|GRAFANA_PASSWORD|SECRET_KEY|JWT_SECRET_KEY|DB_PASSWORD|MYSQL_ROOT_PASSWORD|POSTGRES_PASSWORD)[ \\t]*=[ \\t]*(?!your_|<|\\$\\{|change_this|changeme|example|placeholder|xxx)[^ \\t\\r\\n#]+",
+      "flags": "i",
+      "why": "弱默认口令：示例配置里的默认值容易被直接部署使用",
+      "severity": "warn"
+    }
+  ]
+}

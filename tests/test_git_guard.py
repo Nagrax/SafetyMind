@@ -37,6 +37,7 @@ from pathlib import Path
 
 REPO = Path(__file__).resolve().parents[1]
 RULES_FILE = REPO / "scripts" / "secret-patterns.json"
+PRIVACY_RULES_FILE = REPO / "scripts" / "privacy-patterns.json"
 GUARD = REPO / "scripts" / "git-round.mjs"
 
 RESULTS = []
@@ -330,14 +331,209 @@ def test_guard_runs_and_rejects():
         shutil.rmtree(tmp, ignore_errors=True)
 
 
+# ── 隐私维度（2026-10-30 用户要求「建立长期记忆，防止隐私信息泄露」）────────
+def load_privacy_rules():
+    if not PRIVACY_RULES_FILE.is_file():
+        return None
+    try:
+        return json.loads(PRIVACY_RULES_FILE.read_text(encoding="utf-8"))
+    except Exception:
+        return None
+
+
+def _py_flags(rule):
+    """把规则里的 JS 风格 flags（'i'/'g'/'m'）转成 Python re 的标志位。"""
+    f = 0
+    for ch in (rule.get("flags") or ""):
+        if ch == "i":
+            f |= re.IGNORECASE
+        elif ch == "m":
+            f |= re.MULTILINE
+    return f
+
+
+def test_privacy_rules():
+    """隐私规则文件存在、可编译、分级正确。"""
+    data = load_privacy_rules()
+    record("隐私规则文件存在且是合法 JSON", data is not None, str(PRIVACY_RULES_FILE))
+    if not data:
+        return None
+    pats = data.get("patterns") or []
+    record("隐私规则非空", len(pats) > 0, f"patterns={len(pats)}")
+    bad = []
+    sev_bad = []
+    for p in pats:
+        try:
+            re.compile(p["pattern"], _py_flags(p))
+        except Exception as ex:
+            bad.append(f"{p.get('id')}: {ex}")
+        if p.get("severity") not in ("block", "warn"):
+            sev_bad.append(f"{p.get('id')}: severity={p.get('severity')}")
+    record("每条隐私规则都是合法正则", not bad, "; ".join(bad))
+    record("每条隐私规则都有 block/warn 分级", not sev_bad, "; ".join(sev_bad))
+    # 关键：真实身份信息必须是 block 级
+    ids = {p.get("id"): p.get("severity") for p in pats}
+    must_block = ("windows-user-path", "personal-email", "cn-id-card", "cn-bank-card", "cn-mobile")
+    miss = [i for i in must_block if ids.get(i) != "block"]
+    record("真实身份信息类规则均为 block 级", not miss, f"未 block: {miss}")
+    return data
+
+
+def test_privacy_patterns_hit(data):
+    """隐私形态能被对应规则命中（合成样例，源码不留字面量）。"""
+    if not data:
+        return
+    by_id = {}
+    for p in data["patterns"]:
+        try:
+            by_id[p["id"]] = re.compile(p["pattern"], _py_flags(p))
+        except Exception:
+            continue
+    samples = {
+        "windows-user-path": "C:" + chr(92) + "Users" + chr(92) + "someone",
+        "personal-email": "someone" + "@" + "163" + ".com",
+        "cn-id-card": "11010119900101123X",
+        "cn-bank-card": "622202123456789" + "0",
+        "cn-mobile": "138" + "0000" + "0000",
+        "local-abs-path": "D:" + chr(92) + "claudecode" + chr(92) + "SafetyMind",
+    }
+    miss = []
+    for pid, sample in samples.items():
+        rx = by_id.get(pid)
+        if rx is None:
+            miss.append(f"{pid}: 无规则")
+        elif not rx.search(sample):
+            miss.append(f"{pid}: 规则未命中合成样例")
+    record("隐私形态都能被规则命中", not miss, "; ".join(miss))
+
+
+def test_privacy_no_false_positives(data):
+    """隐私规则不得把普通内容误判成 block 级。"""
+    if not data:
+        return
+    rxs = []
+    for p in data["patterns"]:
+        try:
+            rxs.append((p.get("id"), p.get("severity"),
+                        re.compile(p["pattern"], _py_flags(p))))
+        except Exception:
+            continue
+    benign = [
+        ("浮点尾数", "0.3838579669298401"),
+        ("普通长数字", "1234567890123"),
+        ("短数字", "20261030"),
+        ("占位邮箱", "your_anthropic_api_key_here"),
+        ("占位密码", "SECRET_KEY=change_this_in_production"),
+        ("占位密码2", "REDIS_PASSWORD="),
+        ("相对路径", "scripts/git-round.mjs"),
+        ("英文句子", "the quick brown fox jumps over the lazy dog"),
+    ]
+    fp = []
+    for label, text in benign:
+        for pid, sev, rx in rxs:
+            if sev != "block":
+                continue
+            if rx.search(text):
+                fp.append(f"{label} → {pid}")
+    record("隐私规则不误伤普通内容", not fp, "; ".join(fp))
+
+
+def test_privacy_scanner_runs(data):
+    """端到端：隐私扫描器可运行，且当前工作树无 block 级命中。"""
+    if not shutil.which("node"):
+        record("跳过隐私扫描端到端用例（无 node）", True)
+        return
+    base = _scratch_base()
+    base.mkdir(parents=True, exist_ok=True)
+    tmp = base / ("privacyrepo_" + next(tempfile._get_candidate_names()))
+    (tmp / "scripts").mkdir(parents=True, exist_ok=True)
+    try:
+        for name in ("secret-scan.mjs", "secret-patterns.json", "privacy-patterns.json"):
+            (tmp / "scripts" / name).write_text(
+                (REPO / "scripts" / name).read_text(encoding="utf-8"), encoding="utf-8")
+        # 种入一条真实手机号形态
+        (tmp / "leak.py").write_text(
+            "PHONE = " + chr(34) + "138" + "0000" + "0000" + chr(34) + chr(10), encoding="utf-8")
+        proc = _run_node(
+            ["node", str(tmp / "scripts" / "secret-scan.mjs"), "--privacy",
+             "--repo-root", str(tmp), "leak.py"], tmp)
+        out = proc.stdout + proc.stderr
+        record("隐私扫描器拦下 block 级形态", proc.returncode == 7,
+               f"exit={proc.returncode} {out[:250]}")
+        record("隐私扫描器报出规则 id", "cn-mobile" in out, out[:250])
+        record("隐私扫描器输出不含手机号明文", ("138" + "0000" + "0000") not in out,
+               "扫描日志里出现了手机号明文")
+        # 干净文件应放行
+        (tmp / "leak.py").unlink()
+        (tmp / "ok.py").write_text("x = 1\n", encoding="utf-8")
+        proc2 = _run_node(
+            ["node", str(tmp / "scripts" / "secret-scan.mjs"), "--privacy",
+             "--repo-root", str(tmp), "ok.py"], tmp)
+        record("隐私扫描器对干净文件放行", proc2.returncode == 0,
+               f"exit={proc2.returncode} {proc2.stdout[:150]}")
+    finally:
+        shutil.rmtree(tmp, ignore_errors=True)
+
+
+def test_worktree_no_block_privacy(data):
+    """工作树不含 block 级隐私形态（真实身份信息）。"""
+    if not data:
+        return
+    rxs = []
+    for p in data["patterns"]:
+        if p.get("severity") != "block":
+            continue
+        try:
+            rxs.append((p.get("id"), re.compile(p["pattern"], _py_flags(p)),
+                        set(p.get("allow_paths") or [])))
+        except Exception:
+            continue
+    hits = []
+    for f in REPO.rglob("*"):
+        if not f.is_file():
+            continue
+        rel = f.relative_to(REPO).as_posix()
+        if rel in ("scripts/git-round.mjs", "scripts/secret-scan.mjs",
+                   "scripts/secret-patterns.json", "scripts/privacy-patterns.json",
+                   "tests/test_git_guard.py", ".env"):
+            continue
+        if any(part in rel for part in (".git/", "__pycache__/", "node_modules/",
+                                        ".venv/", "data/", "logs/", "frontend/dist/",
+                                        "benchmarks/results/")):
+            continue
+        try:
+            if f.stat().st_size > 4 * 1024 * 1024:
+                continue
+            raw = f.read_bytes()
+        except Exception:
+            continue
+        if b"\x00" in raw:
+            continue
+        try:
+            text = raw.decode("utf-8")
+        except UnicodeDecodeError:
+            continue
+        for pid, rx, allow_paths in rxs:
+            if rel in allow_paths:
+                continue
+            if rx.search(text):
+                hits.append(f"{rel} [{pid}]")
+                break
+    record("工作树不含 block 级隐私形态", not hits, "; ".join(hits[:10]))
+
+
 if __name__ == "__main__":
     _data = load_rules()
+    _priv = load_privacy_rules()
     for fn in (test_rules_file, test_patterns_hit, test_no_false_positives,
                test_guard_scans_all_tracked_files, test_worktree_clean_of_secrets,
-               test_guard_runs_and_rejects):
+               test_guard_runs_and_rejects,
+               test_privacy_rules, test_privacy_patterns_hit, test_privacy_no_false_positives,
+               test_privacy_scanner_runs, test_worktree_no_block_privacy):
         try:
             if fn.__code__.co_argcount:
-                fn(_data)
+                fn(_priv if fn.__name__.startswith("test_privacy")
+                   or fn.__name__ == "test_worktree_no_block_privacy" else _data)
             else:
                 fn()
         except Exception as ex:
