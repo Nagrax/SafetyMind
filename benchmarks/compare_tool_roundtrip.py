@@ -35,7 +35,7 @@ import sys
 import time
 from pathlib import Path
 
-REPO = Path("D:/claudecode/SafetyMind")
+REPO = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(REPO))
 
 CASES = [

@@ -12,7 +12,7 @@ import threading
 import time
 from pathlib import Path
 
-REPO = Path("D:/claudecode/SafetyMind")
+REPO = Path(__file__).resolve().parents[1]
 PY = REPO / ".venv" / "Scripts" / "python.exe"
 ISO = Path("D:/claudecode/scratch/sm-loop/iso/boot_probe")
 ISO.mkdir(parents=True, exist_ok=True)

@@ -27,7 +27,7 @@ import sys
 import time
 from pathlib import Path
 
-REPO = Path("D:/claudecode/SafetyMind")
+REPO = Path(__file__).resolve().parents[1]
 PY = REPO / ".venv" / "Scripts" / "python.exe"
 OUT = Path("D:/claudecode/scratch/sm-loop/runs/coldstart.json")
 

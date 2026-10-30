@@ -1,6 +1,6 @@
-# -*- coding: utf-8 -*-
+﻿# -*- coding: utf-8 -*-
 # K04 corpus.acquisition 回归测试（standalone，零业务依赖）：
-# 用法: D:/claudecode/SafetyMind/.venv/Scripts/python.exe tests/test_corpus_acquisition.py
+# 用法: python tests/test_corpus_acquisition.py
 # 覆盖方案 §2.3/§4.1/§6/§9：
 #   本地 HTTP 文件服务端到端：下载 → 流式 sha256 → 格式签名校验 → 内容寻址落盘 → 台阶推进；
 #   断点续传（中断后续传，总传输字节小于全量）；幂等（不新增映射/不重复落盘）；

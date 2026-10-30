@@ -47,7 +47,7 @@ import time
 from pathlib import Path
 from typing import Any, Dict, List, Optional
 
-REPO = Path("D:/claudecode/SafetyMind")
+REPO = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(REPO))
 
 # 判定阈值：after 必须比 before 高这么多才算"有改进"（不是"没变差"）
