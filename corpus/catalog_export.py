@@ -13,6 +13,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import os
 import re
 import shutil
 import time
@@ -39,6 +40,11 @@ _FILE_EXTS = (".pdf", ".doc", ".docx", ".xls", ".xlsx", ".ppt", ".pptx", ".zip",
 _CRED_ASSIGN_RE = re.compile(
     r"(?i)\b(?:cookie|token|passcode|passwd|password|pwd|secret|signature|sign|"
     r"access[_-]?key|api[_-]?key)\s*[:=]\s*\S")
+
+# 目标微信小程序的 AppID：**不入库**（2026-10-30 GitHub secret scanning 告警）。
+# 它只是本机缓存目录名的一部分，可由环境变量 SAFETYMIND_WX_APPID 提供；
+# 未设置时用占位符，缓存包本身由 SHA-256 唯一标识，不影响定位与核对。
+_WX_APPID = (os.getenv("SAFETYMIND_WX_APPID") or "<小程序AppID>").strip()
 
 
 def _sha1(text: str) -> str:
@@ -331,7 +337,7 @@ def blocked_register(root: Optional[Union[str, Path]] = None, *,
     blockers = [
         {
             "blocker": "微信小程序会话与 Storage 导出不可得",
-            "why": ("本机仅有缓存包 D:/WeChat/WeChat Files/Applet/<WX_APPID>/9/__APP__.wxapkg"
+            "why": (f"本机仅有缓存包 D:/WeChat/WeChat Files/Applet/{_WX_APPID}/9/__APP__.wxapkg"
                     "（411544 字节，SHA-256 50aa789fac02715344d1d0b38734f2b98e29d8450a2afaab1d2fa5222146d19a）；"
                     "该包不含正常会话已读取的目录与 Storage 值，目录与 MSDS 由云端动态读取，"
                     "故无法取得线上完整目录。"),

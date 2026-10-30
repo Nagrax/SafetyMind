@@ -212,7 +212,8 @@ def test_snapshot_shapes():
         # 裸数组
         r1 = catalog_export.export_snapshot(list(ITEMS[:2]), manifest=m, root=tmp, write_reports=False)
         # wxapkg 解包报告形态：{"data": {"adminFiles": [...]}}
-        payload = {"meta": {"appid": "<WX_APPID>"}, "data": {"adminFiles": [
+        # appid 用占位符：真实小程序 AppID 不入库（2026-10-30 GitHub secret scanning 告警）
+        payload = {"meta": {"appid": "wx" + "0" * 16}, "data": {"adminFiles": [
             {"item_id": "wx-1", "title": "目录导出条目", "downloadUrl": "https://pan.quark.cn/s/wx1"}]}}
         r2 = catalog_export.export_snapshot(payload, manifest=m, root=tmp, write_reports=False)
         record("裸数组快照可导入", r1["total"] == 2 and r1["created"] == 2, f"{r1['total']}")

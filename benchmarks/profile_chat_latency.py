@@ -40,6 +40,8 @@ import httpx
 
 REPO = Path("D:/claudecode/SafetyMind")
 OUT = Path("D:/claudecode/scratch/sm-loop/runs/chat_latency_profile.json")
+sys.path.insert(0, str(REPO / "benchmarks"))
+sys.path.insert(0, str(REPO))
 
 CASES = [
     ("critical", "车间发生氨气泄漏，已经有人中毒晕倒了，现在该怎么办？"),
@@ -66,8 +68,14 @@ def env_for(iso: Path, live: bool, port: int) -> dict:
         "SAFETYMIND_THINKING": "off",
     })
     if live:
+        # 密钥**绝不写死**：环境变量优先，其次仓库 .env（_creds 是唯一凭据入口）。
+        # 历史教训：这里曾写死过真实 key，仓库公开后等于泄露（2026-10-30 修复）。
+        from _creds import judge_key
+        key = judge_key()
+        if not key:
+            raise SystemExit("缺少评测凭据：请设置 ANTHROPIC_API_KEY 或在仓库 .env 填 ANTHROPIC_API_KEY")
         e["ANTHROPIC_BASE_URL"] = os.getenv("ANTHROPIC_BASE_URL", "https://open.bigmodel.cn/api/anthropic")
-        e["ANTHROPIC_API_KEY"] = os.getenv("ANTHROPIC_API_KEY", "<REDACTED_RELAY_KEY>")
+        e["ANTHROPIC_API_KEY"] = key
         e["ANTHROPIC_MODEL"] = os.getenv("ANTHROPIC_MODEL", "glm-4.6")
     else:
         e["ANTHROPIC_BASE_URL"] = "http://127.0.0.1:9"

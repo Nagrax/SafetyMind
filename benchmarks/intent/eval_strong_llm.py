@@ -36,6 +36,7 @@ from collections import defaultdict
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 sys.path.insert(0, os.path.abspath(os.path.join(HERE, "..", "..")))
+sys.path.insert(0, os.path.abspath(os.path.join(HERE, "..")))   # benchmarks/：_creds 凭据唯一入口
 from core.intent_recognizer import IntentCategory
 
 # 与 eval_prototype.py 逐字一致的剔除集（同一判分口径）
@@ -47,16 +48,17 @@ REMOVED = {
     "政府部门联合看和专项检查的区别是什么呗？",
 }
 
+# 密钥**绝不写死**：只认环境变量（`BIGMODEL_KEY` / `DASHSCOPE_KEY`），
+# 缺失时用仓库 .env 的 ANTHROPIC_API_KEY 兜底；两者都没有就直接报错退出。
+# 历史教训：这里曾写死过真实 key，仓库公开后等于泄露（2026-10-30 修复）。
 PROVIDERS = {
     "bigmodel": {
         "base": "https://open.bigmodel.cn/api/anthropic",
         "key_env": "BIGMODEL_KEY",
-        "default_key": "<REDACTED_RELAY_KEY>",
     },
     "dashscope": {
         "base": "https://dashscope.aliyuncs.com/apps/anthropic",
         "key_env": "DASHSCOPE_KEY",
-        "default_key": "<REDACTED_DASHSCOPE_KEY>",
     },
 }
 
@@ -122,7 +124,13 @@ async def main():
     args = ap.parse_args()
 
     cfg = PROVIDERS[args.provider]
-    key = os.getenv(cfg["key_env"]) or cfg["default_key"]
+    key = (os.getenv(cfg["key_env"]) or "").strip()
+    if not key:
+        from _creds import judge_key  # noqa: E402  密钥唯一入口
+        key = judge_key()
+    if not key:
+        raise SystemExit(
+            f"缺少 {cfg['key_env']}：请设置该环境变量，或在仓库 .env 填 ANTHROPIC_API_KEY")
     from anthropic import AsyncAnthropic
     client = AsyncAnthropic(api_key=key, base_url=cfg["base"], timeout=90, max_retries=0)
 
