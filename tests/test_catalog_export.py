@@ -1,6 +1,6 @@
-# -*- coding: utf-8 -*-
+﻿# -*- coding: utf-8 -*-
 # K01 corpus.catalog_export 回归测试（standalone，零业务依赖）：
-# 用法: D:/claudecode/SafetyMind/.venv/Scripts/python.exe tests/test_catalog_export.py
+# 用法: python tests/test_catalog_export.py
 # 覆盖方案 §2.2/§2.3/§4.1/§9：
 #   目录快照导入 → source 行数/受控引用/状态只到 catalog_registered 或 link_exported；
 #   与 2640 对账（catalog_only scope，差异可解释且明确「不能声称文件全量」）；

@@ -37,7 +37,7 @@ import time
 from datetime import datetime
 from pathlib import Path
 
-REPO = Path("D:/claudecode/SafetyMind")
+REPO = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(REPO))
 sys.path.insert(0, str(REPO / "benchmarks" / "intent"))
 OUT_DIR = REPO / "benchmarks" / "results"

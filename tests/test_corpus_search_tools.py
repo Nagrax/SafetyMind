@@ -1,6 +1,6 @@
-# -*- coding: utf-8 -*-
+﻿# -*- coding: utf-8 -*-
 # K03+K07 真实入口测试（打桩 LLM + 真实 corpus 小样本 + 真实工具管理器/端点）：
-# 用法: D:/claudecode/SafetyMind/.venv/Scripts/python.exe tests/test_corpus_search_tools.py
+# 用法: python tests/test_corpus_search_tools.py
 # 覆盖：
 #   - corpus_search 工具经 MCPToolManager 真被调用且结果进入注入（复用 test_chat_tool_evidence 打法）；
 #   - /search/direct?source=corpus 与 ?source=all 返回同一 build marker；

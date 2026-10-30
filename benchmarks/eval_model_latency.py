@@ -36,7 +36,7 @@ from pathlib import Path
 
 import httpx
 
-REPO = Path("D:/claudecode/SafetyMind")
+REPO = Path(__file__).resolve().parents[1]
 OUT_DIR = REPO / "benchmarks" / "results"
 
 BASE, KEY = "http://127.0.0.1:8326/v1", ""

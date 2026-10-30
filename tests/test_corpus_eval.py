@@ -1,6 +1,6 @@
-# -*- coding: utf-8 -*-
+﻿# -*- coding: utf-8 -*-
 # K08 通用资料库评测骨架（离线为主，必须真实跑）：
-# 用法: D:/claudecode/SafetyMind/.venv/Scripts/python.exe tests/test_corpus_eval.py
+# 用法: python tests/test_corpus_eval.py
 # 覆盖：
 #   - 用例集结构：120/30 配额与组配比、split 合法、expect 键合法、缺额必须在 content_gaps 有记录；
 #   - runner 机制（注入 stub 答题器 + 真实小样本 corpus）：

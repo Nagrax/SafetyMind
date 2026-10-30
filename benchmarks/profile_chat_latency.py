@@ -38,7 +38,7 @@ from pathlib import Path
 
 import httpx
 
-REPO = Path("D:/claudecode/SafetyMind")
+REPO = Path(__file__).resolve().parents[1]
 OUT = Path("D:/claudecode/scratch/sm-loop/runs/chat_latency_profile.json")
 sys.path.insert(0, str(REPO / "benchmarks"))
 sys.path.insert(0, str(REPO))

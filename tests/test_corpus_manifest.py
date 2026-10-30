@@ -1,6 +1,6 @@
-# -*- coding: utf-8 -*-
+﻿# -*- coding: utf-8 -*-
 # K02 corpus.manifest 契约/状态机/去重对账 回归测试（standalone，零依赖 venv 外库）：
-# 用法: D:/claudecode/SafetyMind/.venv/Scripts/python.exe tests/test_corpus_manifest.py
+# 用法: python tests/test_corpus_manifest.py
 # 覆盖方案 §5「最低契约」与 §9「状态与对账」：
 #   幂等 upsert/link_asset/add_blocks/register_asset；
 #   同名不同源/版共存（文档 ID 不得只按 title 生成，用户自有不被覆盖）；

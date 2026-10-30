@@ -1,6 +1,6 @@
-# -*- coding: utf-8 -*-
+﻿# -*- coding: utf-8 -*-
 # K03/K07 corpus 管线（离线为主）回归测试：
-# 用法: D:/claudecode/SafetyMind/.venv/Scripts/python.exe tests/test_corpus_pipeline.py
+# 用法: python tests/test_corpus_pipeline.py
 # 覆盖：自有资料导入幂等；来源与采集分母分开（user_imported 不计入 toolbox_acquired；
 #       目录层占位不被算作正文）；build 唯一 marker 落盘、ACTIVE 切换与回滚、上限 stopped_by；
 #       卡/正文分离（blocks 不含 catalog；命中卡回取正文；无正文版本明确标"仅目录"）；

@@ -20,7 +20,7 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 os.environ.setdefault("HF_HOME", "D:/hf_cache")
 
-SEED = Path("D:/claudecode/SafetyMind/data/knowledge_seed/xlsx_docs.json")
+SEED = Path(__file__).resolve().parents[1] / "data/knowledge_seed/xlsx_docs.json"
 
 
 def main():

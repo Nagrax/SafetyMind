@@ -38,7 +38,7 @@ from pathlib import Path
 
 import httpx
 
-REPO = Path("D:/claudecode/SafetyMind")
+REPO = Path(__file__).resolve().parents[1]
 OUT_DIR = REPO / "benchmarks" / "results"
 GATEWAY = os.getenv("JUDGE_GATEWAY", "http://127.0.0.1:8326/v1")
 import sys as _sys, pathlib as _pf

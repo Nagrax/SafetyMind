@@ -46,7 +46,7 @@ from pathlib import Path
 
 import httpx
 
-REPO = Path("D:/claudecode/SafetyMind")
+REPO = Path(__file__).resolve().parents[1]
 PY = REPO / ".venv" / "Scripts" / "python.exe"
 ISO_ROOT = Path("D:/claudecode/scratch/sm-loop/iso/prod_readiness")
 
