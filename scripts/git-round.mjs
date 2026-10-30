@@ -23,7 +23,9 @@
  */
 import { execFileSync } from 'node:child_process'
 import path from 'node:path'
-import { formatHits, loadRules, scanFiles } from './secret-scan.mjs'
+import {
+  formatHits, formatPrivacyHits, loadPrivacyRules, loadRules, scanFiles, scanPrivacyFiles,
+} from './secret-scan.mjs'
 
 const args = process.argv.slice(2)
 const getArg = (name, dflt = '') => {
@@ -82,8 +84,32 @@ if (secretHits.length) {
   process.exit(3)
 }
 
+// ── 2b. 隐私形态扫描（真实身份信息必须拦停；本机路径/弱默认口令只提示）──────
+// 与密钥分开：隐私形态常在文档与评测脚本里有正当用途，一刀切会逼人绕过守卫。
+let PRIVACY_RULES
+try {
+  PRIVACY_RULES = loadPrivacyRules(repoRoot)
+} catch (e) {
+  console.error(`✖ ${e.message}`)
+  process.exit(6)
+}
+const privacyHits = scanPrivacyFiles(scanTargets, repoRoot, PRIVACY_RULES)
+const privacyBlock = privacyHits.filter(h => h.severity === 'block')
+const privacyWarn = privacyHits.filter(h => h.severity !== 'block')
+if (privacyBlock.length) {
+  console.error(formatPrivacyHits(privacyBlock))
+  process.exit(7)
+}
+
 if (checkOnly) {
-  console.log(`✔ 守卫通过：扫描 ${scanTargets.length} 个文件（全部已跟踪 + 候选），无敏感路径、无密钥`)
+  console.log(`✔ 守卫通过：扫描 ${scanTargets.length} 个文件（全部已跟踪 + 候选），无敏感路径、无密钥、无隐私信息`)
+  if (privacyWarn.length) {
+    console.log(`⚠ 隐私提示 ${privacyWarn.length} 处（不拦停，公开前建议改写）：`)
+    for (const h of privacyWarn.slice(0, 10)) {
+      console.log(`  ${h.file}  [${h.rule}] ${h.sample}`)
+    }
+    if (privacyWarn.length > 10) console.log(`  …还有 ${privacyWarn.length - 10} 处`)
+  }
   process.exit(0)
 }
 
