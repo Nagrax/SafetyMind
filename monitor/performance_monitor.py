@@ -98,6 +98,25 @@ class AnomalyDetector:
 
 # ── 性能监控器 ────────────────────────────────────────────────────────────────
 
+def _new_or_existing(factory, name: str, *args, **kwargs):
+    """创建 Prometheus 指标；同名已注册时**复用**已有 collector。
+
+    为什么需要（2026-10-30 实测）：prometheus 的默认 Registry 是**进程级单例**，
+    同名指标二次注册会抛 `ValueError: Duplicated timeseries`。而本进程里出现第二个
+    Monitor 的场景很常见：测试里构造多个实例、`importlib.reload(api.main)`、
+    多应用实例并存。以前这一抛就会让 Monitor（乃至应用启动）直接失败。
+    """
+    try:
+        return factory(name, *args, **kwargs)
+    except ValueError:
+        from prometheus_client import REGISTRY
+        existing = getattr(REGISTRY, "_names_to_collectors", {}).get(name)
+        if existing is not None:
+            logger.info(f"Prometheus 指标 {name} 已注册，复用已有 collector")
+            return existing
+        raise
+
+
 class PerformanceMonitor:
     """
     Agent 在线表现监控。
@@ -139,18 +158,34 @@ class PerformanceMonitor:
 
         # Prometheus 指标（可选）
         self._prom: Dict[str, Any] = {}
+        self._prom_ok: bool = False      # 指标端点是否真的绑上了（未配置/失败都为 False）
         if prometheus_port:
             self._setup_prometheus(prometheus_port)
 
     def _setup_prometheus(self, port: int) -> None:
         self._prom = {
-            "agent_success_rate": Gauge("agent_success_rate", "Agent 成功率", ["agent"]),
-            "agent_latency_ms":   Histogram("agent_latency_ms", "Agent 延迟", ["agent"]),
-            "tool_success_rate":  Gauge("tool_success_rate", "工具成功率", ["tool"]),
-            "requests_total":     Counter("requests_total", "总请求数"),
+            "agent_success_rate": _new_or_existing(Gauge, "agent_success_rate",
+                                                   "Agent 成功率", ["agent"]),
+            "agent_latency_ms":   _new_or_existing(Histogram, "agent_latency_ms",
+                                                   "Agent 延迟", ["agent"]),
+            "tool_success_rate":  _new_or_existing(Gauge, "tool_success_rate",
+                                                   "工具成功率", ["tool"]),
+            "requests_total":     _new_or_existing(Counter, "requests_total", "总请求数"),
         }
-        start_http_server(port)
-        logger.info(f"Prometheus 已启动: :{port}")
+        # 指标端口失败**绝不能**拖垮服务（2026-10-30 实测）：本机 .env 曾把
+        # PROMETHEUS_PORT 设成 9091（Windows 保留端口段 9011–9110），
+        # start_http_server 抛 WinError 10013 → PerformanceMonitor 构造失败 →
+        # 应用启动直接挂掉，17 个测试文件连带失败。监控是可观测性增强，不是业务前提：
+        # 绑不上就禁用端点并如实记一条 warning，对话链路照常。
+        try:
+            start_http_server(port)
+            self._prom_ok = True
+            logger.info(f"Prometheus 已启动: :{port}")
+        except Exception as ex:
+            self._prom_ok = False
+            logger.warning(
+                f"Prometheus 指标端口 {port} 不可用（{ex}）：已禁用指标端点，"
+                f"对话与检索链路不受影响；如需指标请换一个非保留端口或设 PROMETHEUS_PORT=0")
 
     # ── 生命周期 ──────────────────────────────────────────────────────────────
 
