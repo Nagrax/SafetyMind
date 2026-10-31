@@ -1828,6 +1828,32 @@ async def _emergency_fast_path_core(req, sig, t0: float, rid: str):
                                "紧急预检快速分流（零 LLM）：本地规则命中紧急表述，先于普通对话闸门处理")
 
 
+def _kb_inject_style() -> str:
+    """知识库注入口径：默认按"条款依据"注入；`checklist` = 按"检查要点参考"注入。
+
+    为什么需要（2026-10-29 扩容实验）：把 1698 条隐患**检查项**灌进知识库后，
+    隐患类召回 oracle@2 0.25→0.75、无解题 66.7%→0%，但**答案质量反而下降**
+    （accuracy −0.278、safety −0.528）。机制假设是"检查项片段被当成法规条款依据注入"，
+    导致答案变成片段拼接、更爱凑依据。本开关用于验证：换注入口径能否把召回收益拿回来。
+    """
+    return (os.getenv("SAFETYMIND_KB_INJECT_STYLE") or "").strip().lower()
+
+
+def _kb_inject_header() -> str:
+    return "[检查要点参考]" if _kb_inject_style() == "checklist" else "[知识库检索结果]"
+
+
+def _kb_inject_instruction() -> str:
+    if _kb_inject_style() == "checklist":
+        return ("以上为隐患排查**检查要点**条目，只能作为现场排查参考；"
+                "不得当作法规条款原文引用、不得标注为【依据N】；"
+                "需要条款依据时必须说明需核实，禁止编造条款号；"
+                "catalog_only=true 的条目只有目录记录，不得声称已读到其正文条款。")
+    return ("请优先依据以上知识库内容回答，并在引用条款处标注【依据N】；"
+            "知识库内容不足时结合安全生产通用知识说明并提示需要核实，不得编造条款；"
+            "catalog_only=true 的条目只有目录记录，不得声称已读到其正文条款。")
+
+
 async def _build_knowledge_context(message: str, intent=None, top_k: int = 2) -> tuple:
     """
     为 /chat 主链路构建 RAG 知识上下文（P0-B：命中条款进入回答并保留引用）。
@@ -1915,7 +1941,7 @@ async def _build_knowledge_context(message: str, intent=None, top_k: int = 2) ->
                         "catalog_only": not bool(snippet),
                     })
                 if kb_lines:
-                    parts.append("[知识库检索结果]")
+                    parts.append(_kb_inject_header())
                     parts.extend(kb_lines)
     except Exception as ex:
         logger.warning(f"构建知识库上下文失败: {ex}")
@@ -1930,10 +1956,7 @@ async def _build_knowledge_context(message: str, intent=None, top_k: int = 2) ->
 
     if not used:
         return "", False, []
-    parts.append(
-        "请优先依据以上知识库内容回答，并在引用条款处标注【依据N】；"
-        "知识库内容不足时结合安全生产通用知识说明并提示需要核实，不得编造条款；"
-        "catalog_only=true 的条目只有目录记录，不得声称已读到其正文条款。")
+    parts.append(_kb_inject_instruction())
     # 引用序号按合并后的整体顺序重排（KB 与 corpus 两通道共用同一编号体系）
     for n, c in enumerate(citations, start=1):
         c["index"] = n
