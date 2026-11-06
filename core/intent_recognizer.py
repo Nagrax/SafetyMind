@@ -69,7 +69,8 @@ class UrgencyLevel(Enum):
 # 5 次全部返回澄清提示、一次数值都没给。
 _FACTUAL_PATTERN = re.compile(
     r"(多少|几(级|个|种|小时|天|年|米|分)|依据|标准|规范|条款|是什么|什么是|"
-    r"怎么规定|如何规定|要求(是|有)|判定值|限值)")
+    r"怎么规定|如何规定|要求(是|有)|判定值|限值|可以吗|能不能|是否(可以|能|属于)|"
+    r"为什么|有哪些|算不算)")
 
 
 def is_factual_question(message: str) -> bool:

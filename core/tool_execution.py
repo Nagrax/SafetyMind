@@ -350,14 +350,16 @@ class ToolExecutor:
 
             if budget_exceeded:
                 return ExecutionResult(
-                    text=self._finalize_budget_text(last_text, last_text_is_interim,
-                                                    tool_results),
+                    text=await self._finalize_budget_text(last_text, last_text_is_interim,
+                                                          tool_results, system, msgs,
+                                                          allow_force=False),
                     tool_trace=trace, rounds=rounds, calls=calls,
                     terminated="budget_calls", degraded=True)
             if round_idx == self._max_rounds - 1:
                 return ExecutionResult(
-                    text=self._finalize_budget_text(last_text, last_text_is_interim,
-                                                    tool_results),
+                    text=await self._finalize_budget_text(last_text, last_text_is_interim,
+                                                          tool_results, system, msgs,
+                                                          allow_force=True),
                     tool_trace=trace, rounds=rounds, calls=calls,
                     terminated="budget_rounds", degraded=True)
 
@@ -444,21 +446,50 @@ class ToolExecutor:
     def _ensure_text(text: str) -> str:
         return text or "工具调用未在预算内完成，未获得可用的最终回答。"
 
-    def _finalize_budget_text(self, last_text: str, last_text_is_interim: bool,
-                              tool_results: List[Dict[str, Any]]) -> str:
+    async def _finalize_budget_text(self, last_text: str, last_text_is_interim: bool,
+                                    tool_results: List[Dict[str, Any]],
+                                    system: str, msgs: List[Dict[str, Any]],
+                                    allow_force: bool = True) -> str:
         """工具预算耗尽时的收尾文本。
 
-        规则（2026-10-29 实测驱动）：
+        规则（2026-10-29 起，2026-11-01 增强）：
           - 最后一段文字与工具请求同时出现 → 它是**过程话术**（"我再做一次确认"），
             不能当答案交付；有工具证据就交证据摘要，没有就如实说没答出来；
           - 真正的终答（没有同时请求工具）→ 原样返回（不做任何改写）；
-          - 没有文字但有证据 → 交证据摘要（既有行为，见 _partial_evidence_answer）。
-        不额外发起 LLM 调用：轮次预算为 1 的契约（"不再请求模型"）必须保持不变。
+          - **完全没有文字**时（实测 24 题里有 1 题如此："安全阀的校验周期是怎么规定的？"
+            跑完 3 轮工具后只回了一句"工具调用未在预算内完成"）→ 追加**一次**无工具收尾调用，
+            让模型基于已取到的结果直接作答；仍失败才回落证据摘要/固定文案。
+
+        调用次数契约：`max_rounds=1` 时**绝不**追加（既有测试锁定"不再请求模型"），
+        只有预算 >1 轮的常规链路才做这一次收尾。
         """
         if last_text_is_interim:
             return self._partial_evidence_answer(tool_results) or self._ensure_text("")
-        return self._ensure_text(last_text) if last_text else (
-            self._partial_evidence_answer(tool_results) or self._ensure_text(""))
+
+        digest = self._partial_evidence_answer(tool_results)
+        forced = ""
+        if allow_force and not last_text and self._max_rounds > 1:
+            forced = await self._force_final_answer(system, msgs)
+            if forced:
+                logger.info("工具预算耗尽且无正文：已用一次无工具收尾调用产出回答")
+        return forced or (self._ensure_text(last_text) if last_text
+                          else (digest or self._ensure_text("")))
+
+    async def _force_final_answer(self, system: str,
+                                  msgs: List[Dict[str, Any]]) -> str:
+        """一次无工具收尾调用：把"没答出来"变成"基于已有结果作答"。失败返回空串。"""
+        try:
+            resp = await self._create(
+                model=self._model, max_tokens=self._max_tokens, system=system,
+                messages=list(msgs) + [{
+                    "role": "user",
+                    "content": "请基于以上已获得的工具结果，直接给出完整的最终回答；"
+                               "不要再请求任何工具。若资料不足，如实说明缺什么并给出可核实的下一步。"}],
+                **messages_create_kwargs_base())
+            return extract_text_content(_response_blocks(resp)).strip()
+        except Exception as ex:
+            logger.warning(f"无工具收尾调用失败（回落到证据摘要）: {ex}")
+            return ""
 
     @staticmethod
     def _partial_evidence_answer(tool_results: List[Dict[str, Any]]) -> str:
