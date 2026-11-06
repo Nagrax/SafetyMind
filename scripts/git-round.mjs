@@ -121,6 +121,17 @@ if (staged) {
     console.error('✖ 有变更但缺少提交信息：请用 -m "..."')
     process.exit(4)
   }
+  // 提交前把本次会进提交的文件打印出来（2026-11-06 教训：add -A 会把上一个会话的
+  // 未提交改动一起卷进"文档提交"，提交信息与实际内容不符）。超过 15 个文件时提示。
+  const files = staged.split('\n').filter(Boolean)
+  console.log(`• 本次提交 ${files.length} 个文件：`)
+  for (const f of files.slice(0, 15)) console.log(`    ${f}`)
+  if (files.length > 15) console.log(`    …还有 ${files.length - 15} 个`)
+  const suspicious = files.filter(f => /^(core|api|agents|mcp|frontend\/src|tests)\//.test(f))
+  if (suspicious.length && !/^feat|^fix|^test|^refactor|^perf/.test(message)) {
+    console.log(`• 提示：提交信息以「${message.split(/[:(]/)[0]}」开头，但含 ${suspicious.length} 个代码/测试文件；`)
+    console.log('  若不是有意的，先 git restore --staged 再提交（不会自动中止）')
+  }
   git(['commit', '-m', message])
   const sha = git(['rev-parse', '--short', 'HEAD'])
   console.log(`✔ 已提交 ${sha}：${message.split('\n')[0]}`)
