@@ -104,6 +104,11 @@ PLANS = {
 class FakeOrchestrator:
     def __init__(self):
         self.last_req = None
+        # per-message 证据采集（SM-01，2026-11-07）：run() 每轮覆盖 last_req，
+        # 多 case 顺序执行时"最后一次"不属于目标用例；按消息留存每次编排请求，
+        # 断言可指定观察对象（红项根因见
+        # scratch/sm-loop/handoff/SM-01/red-repros/test_e2e_gate.py.md §3.2）。
+        self.reqs_by_message = {}
 
     async def recognize_intent(self, message, history=None):
         from core.intent_recognizer import IntentCategory, IntentResult, UrgencyLevel
@@ -118,6 +123,7 @@ class FakeOrchestrator:
         from agents.agent_orchestrator import AgentType, OrchestratorResult
         from core.tool_execution import ToolCallRecord
         self.last_req = req
+        self.reqs_by_message[req.message] = req
         plan = PLANS.get(req.message, {})
         trace = []
         if "knowledge_search" in plan.get("tools", []):
@@ -213,9 +219,18 @@ def phase_real_entry():
         record("report 携带 profile 元信息（name/version）",
                bool(report["profile"]["name"]) and bool(report["profile"]["version"]),
                json.dumps(report["profile"], ensure_ascii=False))
+        # 观察对象契约同步（SM-01，2026-11-07，fix_mode=test-sync）：按消息捕获 kb-ok
+        # 那次编排请求（per-message 证据采集）。旧写法读 fake.last_req——run() 每轮覆盖，
+        # CASES 末条是 critical-clarify（甲醇泄漏），其注入来自种子文档，永远不含本夹具
+        # 独有的 UNIQ7788，断言按旧写法不可满足（born-red；证据与实验见
+        # scratch/sm-loop/handoff/SM-01/red-repros/test_e2e_gate.py.md §3.2）。
+        # 断言性质只强不弱：kb-ok 请求必须真实到达编排器（未到即失败），且其注入文本
+        # 含命中条款（非样本预填）；检索命中本身由产品链路产生，夹具不预填 knowledge。
+        kb_req = fake.reqs_by_message.get(MSG_KB)
         record("实际执行产生的注入文本含命中条款（非样本预填）",
-               "UNIQ7788" in (fake.last_req.knowledge or ""),
-               f"knowledge={ (fake.last_req.knowledge or '')[:80] }")
+               kb_req is not None and "UNIQ7788" in (kb_req.knowledge or ""),
+               f"observed={kb_req is not None} "
+               f"knowledge={ ((kb_req.knowledge if kb_req else '') or '')[:80] }")
 
         kb = _case(report, "kb-ok")
         record("正例：命中知识库 → citations≥1", kb["passed"] and len(kb["citations"]) >= 1,
@@ -291,6 +306,11 @@ def phase_real_entry():
             return "", False, []
 
         api_main._build_knowledge_context = _no_kb
+        # 反证前清空回复缓存（SM-01，2026-11-07）：上一轮 kb-ok 的真实响应（含 citations）
+        # 已进进程内缓存，缓存命中会连 citations 一起原样回放（api/main.py 缓存重建分支），
+        # 打掉知识注入的反证就不再是一次"真实执行"。清理属 harness 卫生，断言不动。
+        from core.response_cache import CACHE as _resp_cache
+        _resp_cache.clear()
         try:
             report2 = run_e2e([CASES[0]])
             kb2 = _case(report2, "kb-ok")

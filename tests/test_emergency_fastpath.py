@@ -77,10 +77,24 @@ def test_precheck():
 
 def test_wiring_static():
     src = (Path(__file__).resolve().parents[1] / "api" / "main.py").read_text(encoding="utf-8")
-    i_pre = src.find("precheck(req.message)")
-    i_gate = src.find("_acquire_with_timeout(_CHAT_GATE")
-    record("FastPath 在普通对话闸门之前完成预检分流", 0 <= i_pre < i_gate,
-           f"precheck@{i_pre} chat_gate@{i_gate}")
+    # 历史与变更理由（2026-11-07 契约同步，fix_mode=test-sync，产品代码零改动）：
+    # 原断言 i_gate = src.find("_acquire_with_timeout(_CHAT_GATE") 锁的是单闸门时代写法。
+    # 2026-10-29 提交 abef346 为修闸门容量永久泄漏引入双快车道，普通闸门获取改为：
+    #   对话处理器：_lane = _FAST_GATE if ... else _CHAT_GATE
+    #              → await _acquire_with_timeout(_lane, _CHAT_QUEUE_TIMEOUT, "对话")（api/main.py:1263-1264）
+    #   SSE 流式端点：lane = _FAST_GATE if ... else _CHAT_GATE
+    #              → await _acquire_with_timeout(lane, _CHAT_QUEUE_TIMEOUT, "对话")（api/main.py:2369-2374）
+    # 旧字面串自此在 api/main.py 中不存在——本断言 born-red（测试入库提交 bf3f7c5 里就找不到
+    # 该串，从未绿过；证据：scratch/sm-loop/handoff/SM-01/red-repros/test_emergency_fastpath.py.md）。
+    # 现改为锁同一安全性质（应急预检分流先于普通闸门排队），并把覆盖面从仅非流式端点
+    # 升级为两个端点（非流式 /chat + SSE 流式）都查；仍为静态顺序断言，非弱化。
+    i_pre = src.find("sig = emergency.precheck(req.message)")       # 非流式 /chat 预检（api/main.py:1251）
+    i_gate = src.find("await _acquire_with_timeout(_lane")          # 非流式 /chat 普通闸门排队（api/main.py:1264）
+    i_pre_sse = src.find("sig = emergency.precheck(_req.message)")  # SSE 流式预检（api/main.py:2338）
+    i_gate_sse = src.find("await _acquire_with_timeout(lane")       # SSE 流式普通闸门排队（api/main.py:2374）
+    record("FastPath 在普通对话闸门之前完成预检分流",
+           0 <= i_pre < i_gate and 0 <= i_pre_sse < i_gate_sse,
+           f"precheck@{i_pre} chat_gate@{i_gate} precheck_sse@{i_pre_sse} chat_gate_sse@{i_gate_sse}")
 
     i_emg = src.find("_EMERGENCY_GATE = asyncio.Semaphore")
     record("应急通道使用独立有界闸门（不复用 _CHAT_GATE）",
