@@ -30,6 +30,7 @@ load_dotenv()
 # 紧急消息本地快速预检（零 LLM/零 IO）：复用 core.intent_recognizer 的 CRITICAL 词表与组合规则，
 # 在普通对话闸门之前完成分流；未命中的紧急消息仍走原链路由 orchestrator 模板兜底。
 from core import emergency  # noqa: E402  （需在 _ROOT 入 sys.path 之后导入）
+from core import audit_store  # noqa: E402  （SM-10：idem_hash/canonical_json 唯一出处）
 from core import auth as subject_auth  # noqa: E402  （S-05：服务端主体与数据隔离）
 
 logging.basicConfig(
@@ -918,9 +919,25 @@ async def ticket_progress(request_id: str,
 
 
 # ── 隐患工单闭环（分层触发：HIGH+ 自动建单 / MEDIUM 确认卡；对齐双重预防机制）──
+def _hazard_ticket_params(decision: Dict[str, Any], brief: Dict[str, Any]) -> Dict[str, Any]:
+    """由闸门裁决推导建单业务参数（title/priority/due_ts/severity/responsible_dept）。
+    建单参数的唯一推导点：无键路径 _create_hazard_ticket 与带键事务路径
+    consume_hazard_suggestion 的 new_ticket_fn 共用（SM-10 决策 §2.1）。"""
+    priority = "high" if decision.get("severity") == "major" else "normal"
+    title = decision.get("summary") or f"隐患上报: {brief.get('message_digest', '')[:60]}"
+    try:
+        deadline_h = float(decision.get("deadline_hours") or 168)
+    except (TypeError, ValueError):
+        deadline_h = 168.0
+    return {"title": title, "priority": priority,
+            "due_ts": time.time() + deadline_h * 3600,
+            "severity": decision.get("severity", ""),
+            "responsible_dept": decision.get("dept", "")}
+
+
 def _create_hazard_ticket(audit, decision: Dict[str, Any], brief: Dict[str, Any],
                           request_id: str, user_id: str, actor: str) -> tuple:
-    """按闸门裁决建隐患工单。去重先行：同用户 24h 内同实体（设备/区域/化学品）
+    """按闸门裁决建隐患工单（无键路径）。去重先行：同用户 24h 内同实体（设备/区域/化学品）
     未关闭隐患单不重复建，合并 repeat_report 事件（防工单贬值）。返回 (ticket_id, merged)。"""
     dup = audit.find_open_hazard_duplicate(user_id, brief.get("entities") or {})
     if dup is not None:
@@ -929,17 +946,11 @@ def _create_hazard_ticket(audit, decision: Dict[str, Any], brief: Dict[str, Any]
             note="24 小时内同实体重复上报，合并进本工单",
             detail={"request_id": request_id, "severity": decision.get("severity", "")})
         return dup["id"], True
-    priority = "high" if decision.get("severity") == "major" else "normal"
-    title = decision.get("summary") or f"隐患上报: {brief.get('message_digest', '')[:60]}"
-    try:
-        deadline_h = float(decision.get("deadline_hours") or 168)
-    except (TypeError, ValueError):
-        deadline_h = 168.0
+    params = _hazard_ticket_params(decision, brief)
+    title = params.pop("title")
     tid = audit.create_ticket(
-        title, type_="hazard", priority=priority, source_request_id=request_id,
-        due_ts=time.time() + deadline_h * 3600, brief=brief, actor=actor,
-        user_id=user_id, severity=decision.get("severity", ""),
-        responsible_dept=decision.get("dept", ""))
+        title, type_="hazard", source_request_id=request_id, brief=brief, actor=actor,
+        user_id=user_id, **params)
     return tid, False
 
 
@@ -1002,16 +1013,34 @@ class HazardConfirmRequest(BaseModel):
     conv_id: str = ""
 
 
+def _hazard_confirm_text(request_id: str, decision: Dict[str, Any]) -> str:
+    """派单 webhook 文本（无键路径与带键事务路径共用同一构造，避免双份漂移）。"""
+    return (f"【SafetyMind 隐患工单】编号 {request_id}\n{decision.get('summary', '')}\n"
+            f"级别: {'重大' if decision.get('severity') == 'major' else '一般'}"
+            f" · 派发: {decision.get('dept', '安环部')}"
+            f" · 限期: {decision.get('deadline_hours', '')} 小时\n"
+            f"时间: {time.strftime('%m-%d %H:%M:%S')}\n请责任部门限期整改，验收走工单五阶段。")
+
+
 @app.post("/hazard/confirm", tags=["审计"])
 async def hazard_confirm(body: HazardConfirmRequest,
-                         x_user_token: str = Header(default="", alias="X-User-Token")):
+                         x_user_token: str = Header(default="", alias="X-User-Token"),
+                         x_idempotency_key: str = Header(default="", alias="X-Idempotency-Key")):
     """确认上报建议 → 建隐患工单（brief 阶段起步，五阶段回路闭环）。
     建议不存在/已处理/已过期回 404；重复上报自动合并（merged=true）。
 
     S-05：多用户形态下建议归属必须与服务端主体一致，否则 403（改 user_id 不能越权）；
-    建议不存在/已处理仍按既有语义优先回 404。"""
+    建议不存在/已处理仍按既有语义优先回 404。
+
+    SM-10：携带 X-Idempotency-Key 时走"预留→去重→工单→标记→入队"单写事务
+    （core/audit_store.consume_hazard_suggestion）——同键同内容重放原收据（200+replayed）、
+    同键异内容冲突行先落库再 409、任一步失败零半提交；无键请求语义逐字节不变。"""
     if _audit is None:
         raise HTTPException(503, "审计存储未启用")
+    idem_key = (x_idempotency_key or "").strip()
+    if idem_key:
+        return _hazard_confirm_idempotent(body, idem_key, x_user_token)
+    # ── 无键路径：五步维持现状各自动作（既有契约与全部既有测试零变化）────────
     sug = _audit.get_hazard_suggestion(body.request_id)
     if sug is None:
         # 过期 ≠ 不存在（SM-01 破坏性演练口径，slice3-design.md）：建议行还在库里但
@@ -1036,14 +1065,55 @@ async def hazard_confirm(body: HazardConfirmRequest,
                                         body.request_id, user_id, actor=user_id)
     _audit.mark_hazard_suggestion(body.request_id, "merged" if merged else "confirmed",
                                   ticket_id=tid)
-    _enqueue_ticket_notification(
-        tid, body.request_id,
-        f"【SafetyMind 隐患工单】编号 {body.request_id}\n{decision.get('summary', '')}\n"
-        f"级别: {'重大' if decision.get('severity') == 'major' else '一般'}"
-        f" · 派发: {decision.get('dept', '安环部')}"
-        f" · 限期: {decision.get('deadline_hours', '')} 小时\n"
-        f"时间: {time.strftime('%m-%d %H:%M:%S')}\n请责任部门限期整改，验收走工单五阶段。")
+    _enqueue_ticket_notification(tid, body.request_id,
+                                 _hazard_confirm_text(body.request_id, decision))
     return {"ok": True, "ticket_id": tid, "merged": merged}
+
+
+def _hazard_confirm_idempotent(body: HazardConfirmRequest, idem_key: str,
+                               x_user_token: str) -> Dict[str, Any]:
+    """带 X-Idempotency-Key 的确认消费（SM-10 决策 §2.1/§2.2）。
+
+    服务端主体与内容哈希：subject 取服务端解析结果（本地单人形态=请求声明的生效
+    user_id，多用户形态=服务端主体 id；改 user_id 不换主体，跨主体键天然隔离）；
+    request_hash = sha256(canonical_json({subject, conv_id}))——同键重试必须逐字段
+    同内容，异内容即冲突（409 + conflicted 痕可回放）。"""
+    webhook = os.getenv("ESCALATION_WEBHOOK_URL", "").strip()
+    if _isolation_enforced():
+        subject_id = _subject_for(x_user_token, body.user_id).subject_id
+        require_owner: Optional[str] = subject_id
+    else:
+        subject_id = body.user_id or "anonymous"
+        require_owner = None
+    request_hash = audit_store.idem_hash({"subject": subject_id, "conv_id": body.conv_id})
+    result = _audit.consume_hazard_suggestion(
+        request_id=body.request_id, user_id=subject_id, actor=subject_id,
+        idem_action="hazard_confirm", idem_subject=subject_id, idem_key=idem_key,
+        request_hash=request_hash, require_owner=require_owner,
+        new_ticket_fn=lambda d, b: _hazard_ticket_params(d, b),
+        notify_fn=lambda d: {"channel": webhook,
+                             "text": _hazard_confirm_text(body.request_id, d),
+                             "reason": "create"})
+    kind = result.get("kind")
+    if kind == "replayed":
+        # 请求重试：不产生任何业务行，重放原收据 + replayed 标记
+        return {**dict(result.get("receipt") or {}), "replayed": True}
+    if kind == "conflict":
+        raise HTTPException(409, detail={
+            "error_code": "IDEMPOTENCY_CONFLICT",
+            "message": "同一幂等键携带了不同请求内容（同键必须逐字段同内容重试）",
+            "expected": (result.get("detail") or {}).get("expected"),
+            "current": (result.get("detail") or {}).get("current"),
+        })
+    if kind == "forbidden":
+        raise HTTPException(403, "无权处理该上报事项")
+    if kind == "expired":
+        # 过期走既有 SM-01 契约：独立事务落 expired 痕 + 409（与幂等冲突错误码区分）
+        _audit.mark_hazard_suggestion(body.request_id, "expired")
+        raise HTTPException(409, "上报建议已过期（24 小时内有效），请重新上报后再确认")
+    if kind != "applied":
+        raise HTTPException(404, "上报建议不存在、已处理或已过期（24 小时内有效）")
+    return {"ok": True, "ticket_id": result["ticket_id"], "merged": result["merged"]}
 
 
 class TicketPatchInput(BaseModel):
@@ -1692,42 +1762,38 @@ def _outbox_notify_code(idempotency_key: str, channel: str) -> str:
 
 def _emergency_ticket_and_outbox(req, sig, rid: str, intent_value: str,
                                  status: Dict[str, Any]) -> bool:
-    """升级事件 + 应急工单 + outbox 行（幂等：同一上报编号不重复建单）。
+    """升级事件 + 应急工单 + outbox 行（SM-10 §2.4 同号竞态收敛到权威入口）。
 
-    建单与待发送记录在同一次持锁/同一次 commit 内落库；未配置渠道仍入队。
+    幂等预留（hazard_ops applied 行，键=emergency:{rid}）+ add_upgrade + create_ticket
+    （含 outbox 同事务入队）收进一个 BEGIN IMMEDIATE：并发同 rid 的败者撞部分唯一
+    索引 → 重放已有 ticket_id，绝不新建第二张单/第二条升级事件；同 rid 异内容落
+    conflicted 痕可回放但仍重放既有单（快速分流绝不抛出，行为零弱化）。未配置渠道仍入队。
     """
     webhook = os.getenv("ESCALATION_WEBHOOK_URL", "").strip()
     key = f"emergency:{rid}:webhook"
-    existing = _audit.find_ticket_by_request(rid, "emergency")
-    if existing:
-        status["ticket_id"] = int(existing)
-        status["notify"] = _outbox_notify_code(key, webhook)
-        return True
-    upgrade_id = _audit.add_upgrade(rid, req.user_id, req.conv_id or "", req.message, intent_value)
     digest = " ".join(str(req.message or "").split())[:80]
-    ticket_id = _audit.create_ticket(
-        f"应急升级: {digest[:60]}", type_="emergency", priority="critical",
-        source_request_id=rid,
+    result = _audit.reserve_emergency_ticket(
+        idem_key=key, target=rid,
+        request_hash=audit_store.idem_hash(
+            {"subject": "", "rid": rid, "message": req.message, "intent": intent_value}),
+        user_id=req.user_id, conv_id=req.conv_id or "", message=req.message,
+        intent_value=intent_value,
+        title=f"应急升级: {digest[:60]}",
         brief={"intent": intent_value, "urgency": "critical",
                "entities": emergency.entities(req.message),
                "message_digest": digest,
                "routing_reason": "紧急预检快速分流（零 LLM）",
                "request_id": rid},
-        notification={
-            "idempotency_key": key,
-            "channel": webhook,
-            "payload": {
-                "request_id": rid,
-                "text": f"【SafetyMind 应急升级】编号 {rid}\n内容: {digest[:60]}\n"
-                        f"时间: {time.strftime('%m-%d %H:%M:%S')}\n"
-                        f"紧急预检已自动建单并留痕，请值班确认。",
-                "timeline": {"note": "值班 webhook 已实收（紧急预检快速分流建单时发出）",
-                             "to_stage": "brief", "request_id": rid},
-            },
+        channel=webhook,
+        payload={
             "request_id": rid,
-            "upgrade_id": upgrade_id,
+            "text": f"【SafetyMind 应急升级】编号 {rid}\n内容: {digest[:60]}\n"
+                    f"时间: {time.strftime('%m-%d %H:%M:%S')}\n"
+                    f"紧急预检已自动建单并留痕，请值班确认。",
+            "timeline": {"note": "值班 webhook 已实收（紧急预检快速分流建单时发出）",
+                         "to_stage": "brief", "request_id": rid},
         })
-    status["ticket_id"] = int(ticket_id)
+    status["ticket_id"] = int(result.get("ticket_id") or 0)
     status["notify"] = _outbox_notify_code(key, webhook)
     return True
 
