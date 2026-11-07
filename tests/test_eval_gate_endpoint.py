@@ -158,6 +158,12 @@ def test_gate_passes_on_real_execution_evidence():
 
         # 直接跑 runner 复核"证据来自实际执行"：把 KM 关掉后同一用例必须失败
         api_main._tool_manager = None
+        # 反证前清空回复缓存（SM-01，2026-11-07）：上一轮 ok-citation 的真实响应（含
+        # citations）已进进程内缓存，缓存命中会连 citations 一起原样回放（api/main.py
+        # 缓存重建分支），禁用知识库的反证就不再是一次"真实执行"。
+        # 清理属 harness 卫生，断言不动。
+        from core.response_cache import CACHE as _resp_cache
+        _resp_cache.clear()
         report = loop.run_until_complete(
             __import__("evaluation.e2e_runner", fromlist=["run_e2e_async"]).run_e2e_async(
                 [{"id": "ok-citation", "message": "动火作业票的有效期是怎么规定的",

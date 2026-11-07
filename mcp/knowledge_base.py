@@ -51,6 +51,31 @@ def get_corpus_provider() -> Optional[Callable[[str, Optional[List[str]]], Any]]
     return CORPUS_PROVIDER
 
 
+def _l2_unit_score_mode(embedding_function: Any, collection_metadata: Any) -> bool:
+    """score 口径判定（SM-01 簇 A 修复，2026-11-07）：本地 n-gram 嵌入 + 默认 L2 空间 → True。
+
+    集合未显式设 hnsw:space 时 ChromaDB 默认 **L2 空间**，query 返回的 dist 是
+    平方欧氏距离；本地 n-gram 向量恒为单位向量（core/local_embedding.py 归一化保证），
+    此时 dist = 2 − 2·cos，真实余弦 = 1 − dist/2。旧口径 `1 − dist` = 2cos − 1，
+    零点落在 cos=0.5，词面真实相关的命中（cos≈0.2~0.4）得到系统性负分，
+    被 api/main.py 的 SAFETYMIND_RAG_MIN_SCORE 默认 0.0 全数过滤。
+
+    BGE / 服务器模式的生产行为按旧口径标定（2026-10-29 precision 实测即旧口径），
+    为保持生产默认路径零变化，本换算只对本地 n-gram 嵌入生效；
+    显式声明非 L2 空间的集合公式前提不成立，同样不换算。
+    """
+    if embedding_function is None:
+        return False
+    try:
+        name = str(embedding_function.name())
+    except Exception:
+        return False
+    if not name.startswith("safetymind-local-ngram"):
+        return False
+    space = str((collection_metadata or {}).get("hnsw:space") or "").strip().lower()
+    return space in ("", "l2")
+
+
 def run_corpus_provider(query: str, scopes: Optional[List[str]] = None) -> Optional[Dict[str, Any]]:
     """调用已注册的 corpus 检索；未注册/失败返回 None（不阻断既有链路）。"""
     fn = CORPUS_PROVIDER
@@ -140,6 +165,10 @@ class KnowledgeBase:
         self._chroma_path = chroma_path
         self._embed_fn = embedding_function
         self._embed_suffix = suffix
+        # 得分口径（SM-01 簇 A 修复）：n-gram + 默认 L2 空间 → score 输出真实余弦，
+        # 见 _l2_unit_score_mode 与 _similarity_from_dist。
+        self._l2_unit_score = _l2_unit_score_mode(
+            embedding_function, getattr(self._collection, "metadata", None))
         self._recovery_lock = threading.Lock()
         self._recovered_at = 0.0
         # 父块集合：整篇文档，命中子块后取回完整上下文（仅为批量 get 的载体，不参与检索）
@@ -331,7 +360,7 @@ class KnowledgeBase:
                     "snippet":       doc,
                     "snippet_short": doc[:300],
                     "context_blob":  "",
-                    "score":         round(1.0 - dist, 4),
+                    "score":         self._similarity_from_dist(dist),
                     "chunk":         meta.get("chunk_index", 0),
                 }
                 item.update(self._identity_fields(doc, meta))
@@ -349,7 +378,7 @@ class KnowledgeBase:
         for doc, meta, dist in hits:
             meta = meta or {}
             parent_id = meta.get("parent_id", "")
-            score = round(1.0 - dist, 4)  # ChromaDB 返回距离，转为相似度
+            score = self._similarity_from_dist(dist)  # ChromaDB 返回距离，转为相似度
             if not parent_id or parent_id not in best_by_parent or score > best_by_parent[parent_id]["score"]:
                 best_by_parent[parent_id] = {
                     "parent_id": parent_id,
@@ -414,6 +443,22 @@ class KnowledgeBase:
         asyncio.to_thread 会复制当前 contextvars，故请求级 SCOPES_CONTEXT 在线程内同样可见。
         """
         return await asyncio.to_thread(self.search, query, top_k, scopes)
+
+    def _similarity_from_dist(self, dist) -> float:
+        """Chroma 距离 → 对外 score（SM-01 簇 A 修复，2026-11-07）。
+
+        默认（BGE / 服务器模式，生产行为零变化）：`1.0 − dist`，与历史口径逐位一致。
+        本地 n-gram 嵌入 + 默认 L2（平方欧氏）空间：dist = 2 − 2·cos（单位向量），
+        换算为真实余弦 `1.0 − dist/2`。旧口径在该空间下等于 2cos − 1，零点落在
+        cos=0.5 而非"无关/正交"，词面真实相关的命中（cos≈0.2~0.4）系统性为负，
+        被 api/main.py 的 SAFETYMIND_RAG_MIN_SCORE 默认 0.0 全数过滤
+        （2026-11-07 红项根因：citations=[]、knowledge_used=False）。
+        换算后 0.0 阈值恢复其注释声称的余弦语义；父子聚合与排序不受影响
+        （仿射变换严格保序，并列关系也保持）。生效条件见 _l2_unit_score_mode。
+        """
+        if self._l2_unit_score:
+            return round(1.0 - float(dist) / 2.0, 4)
+        return round(1.0 - dist, 4)
 
     def list_documents(self) -> List[Dict[str, Any]]:
         """
@@ -599,6 +644,9 @@ class KnowledgeBase:
             metadata={"description": "SafetyMind RAG 知识库（父块·整篇）"},
             embedding_function=self._embed_fn,
         )
+        # 重建后的集合元数据与嵌入函数沿用 init 选择，得分口径随之重算（保持判定一致）
+        self._l2_unit_score = _l2_unit_score_mode(
+            self._embed_fn, getattr(self._collection, "metadata", None))
 
     def bind_scopes(self, scopes: Optional[List[str]]):
         """绑定本次请求的资料范围（contextvar），返回 token 供 reset。"""

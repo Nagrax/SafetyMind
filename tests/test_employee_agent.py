@@ -344,7 +344,13 @@ def t10_routing_penalty_loop():
 def t11_contract_fields():
     from agents.agent_orchestrator import OrchestratorResult
     names = [f.name for f in fields(OrchestratorResult)]
+    # 契约同步（2026-11-07）：2026-10-29 提交 abef346 在 `escalated` 与 `latency_ms` 之间
+    # additive 新增 `escalation_basis`（agents/agent_orchestrator.py:155，区分升级的确定性
+    # 依据 urgency/intent/model_hint/safety_net，`escalated` 语义不变；语义与行为不变性由
+    # tests/test_escalation_basis.py 专门回归承担）。此处把契约快照同步到当前已验收版本：
+    # 断言仍是整表相等，只补字段、不删断言、不弱化。
     expected = ["request_id", "response", "agent_type", "intent", "escalated",
+                "escalation_basis",
                 "latency_ms", "agent_types", "primary_agent", "supporting_agents",
                 "routing_reason", "routing_confidence",
                 "tool_trace"]  # P0-A：末尾追加的工具调用轨迹（additive，默认空列表）
