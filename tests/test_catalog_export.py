@@ -5,7 +5,8 @@
 #   目录快照导入 → source 行数/受控引用/状态只到 catalog_registered 或 link_exported；
 #   与 2640 对账（catalog_only scope，差异可解释且明确「不能声称文件全量」）；
 #   分享维度预核验（唯一分享数/复用/多名复用/needs_manual_verify）；
-#   阻塞登记落盘到 D:/SafetyMindData/corpus/reports/blocked_items.json 且结构可断言。
+#   阻塞登记落盘到资料根（SAFETYMIND_CORPUS_ROOT 旋钮，默认 D:/SafetyMindData/corpus）
+#   的 reports/blocked_items.json 且结构可断言；测试走旋钮落隔离目录，不重写真实报告。
 import json
 import os
 import shutil
@@ -21,7 +22,6 @@ from corpus.manifest import CorpusManifest, _SECRET_RE  # noqa: E402
 
 RESULTS = []
 SCRATCH = Path("D:/claudecode/scratch/sm-corpus-20261019")  # 临时产物只落 D 盘（铁律 7）
-REAL_REPORTS = Path("D:/SafetyMindData/corpus/reports")
 _TMPS = []
 SECRET = "SECRETPWD888"
 SHARE_A = "https://pan.quark.cn/s/abcdEF"
@@ -227,33 +227,43 @@ def test_snapshot_shapes():
 
 # ── 5. 阻塞登记落盘 ──────────────────────────────────────────────────────────
 def test_blocked_register():
-    # 明确写入真实资料根目录（交付要求），不依赖环境变量
-    r = catalog_export.blocked_register("D:/SafetyMindData/corpus")
-    path = REAL_REPORTS / "blocked_items.json"
-    record("blocked_items.json 落 D 盘报告目录",
-           path.is_file() and path.as_posix().startswith("D:/SafetyMindData/corpus/reports/"),
-           f"{path}")
-    data = json.loads(path.read_text(encoding="utf-8"))
-    keys = {"blocker", "why", "needs", "what_can_still_run", "next_action"}
-    record("条目数与非空字段齐全",
-           data["count"] == 5 and len(data["blockers"]) == 5
-           and all(keys <= set(b) and all(b[k] for k in keys) for b in data["blockers"]),
-           f"{data.get('count')}")
-    text = json.dumps(data, ensure_ascii=False)
-    record("阻塞登记不含凭据赋值",
-           SECRET not in text and not catalog_export._CRED_ASSIGN_RE.search(text))
-    record("登记了微信会话/Storage 不可得",
-           any("微信小程序会话" in b["blocker"] for b in data["blockers"]))
-    record("登记了网盘登录不可得",
-           any("网盘登录" in b["blocker"] for b in data["blockers"]))
-    record("登记了无法取得远端完整文件清单",
-           any("远端完整文件清单" in b["blocker"] for b in data["blockers"]))
-    record("登记了容量预算与 D 盘现状（含实测值）",
-           any("容量预算" in b["blocker"] for b in data["blockers"])
-           and data.get("disk_free_gib", 0) > 0)
-    record("登记了 1698 自有时段无原件",
-           any("1698" in b["blocker"] for b in data["blockers"]))
-    record("返回值与落盘一致", r["count"] == data["count"] and r["blockers"] == data["blockers"])
+    # SM-01 隔离（2026-11-07）：复用既有旋钮 SAFETYMIND_CORPUS_ROOT（corpus/paths.py），
+    # 登记文件落到本次运行隔离目录——测试不再重写共享语料库存储里的真实报告；
+    # 未设旋钮时 blocked_register() 默认根仍是真实资料根（现行为不变，产品代码未改）。
+    # 唯一被调整的断言条件：原硬编码共享前缀 startswith("D:/SafetyMindData/corpus/reports/")
+    # 改为同强度的"D 盘 + reports/ 目录"检查（隔离根也在 D 盘）；record 名称与其余断言不动。
+    tmp = tmp_dir("blocked_reg_")
+    prev = set_root(tmp)
+    try:
+        r = catalog_export.blocked_register()
+        path = Path(r["report_files"][0])   # 落盘位置以返回值为准（与写入同源）
+        record("blocked_items.json 落 D 盘报告目录",
+               path.is_file() and path.drive.upper() == "D:" and path.parent.name == "reports",
+               f"{path}")
+        data = json.loads(path.read_text(encoding="utf-8"))
+        keys = {"blocker", "why", "needs", "what_can_still_run", "next_action"}
+        record("条目数与非空字段齐全",
+               data["count"] == 5 and len(data["blockers"]) == 5
+               and all(keys <= set(b) and all(b[k] for k in keys) for b in data["blockers"]),
+               f"{data.get('count')}")
+        text = json.dumps(data, ensure_ascii=False)
+        record("阻塞登记不含凭据赋值",
+               SECRET not in text and not catalog_export._CRED_ASSIGN_RE.search(text))
+        record("登记了微信会话/Storage 不可得",
+               any("微信小程序会话" in b["blocker"] for b in data["blockers"]))
+        record("登记了网盘登录不可得",
+               any("网盘登录" in b["blocker"] for b in data["blockers"]))
+        record("登记了无法取得远端完整文件清单",
+               any("远端完整文件清单" in b["blocker"] for b in data["blockers"]))
+        record("登记了容量预算与 D 盘现状（含实测值）",
+               any("容量预算" in b["blocker"] for b in data["blockers"])
+               and data.get("disk_free_gib", 0) > 0)
+        record("登记了 1698 自有时段无原件",
+               any("1698" in b["blocker"] for b in data["blockers"]))
+        record("返回值与落盘一致", r["count"] == data["count"] and r["blockers"] == data["blockers"])
+    finally:
+        restore_root(prev)
+        shutil.rmtree(tmp, ignore_errors=True)
 
 
 if __name__ == "__main__":
