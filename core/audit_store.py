@@ -747,6 +747,29 @@ class AuditStore:
                  json.dumps(payload, ensure_ascii=False)))
             self._con.commit()
 
+    def classify_hazard_suggestion(self, request_id: str,
+                                   max_age_hours: float = 24.0) -> str:
+        """建议行状态判定（只读，不改任何状态）：missing / handled / expired / pending。
+
+        与 get_hazard_suggestion 的过滤条件同源（pending = 存在且未处理且未过期）；
+        供确认端点区分"不存在/已处理（404）"与"已过期（409 冲突）"两种拒绝口径——
+        过期不是"不存在"：行还在库里，必须给用户一个可行动的冲突结论（重新上报），
+        且落 expired 痕后同收据重新上报即可回放（INSERT OR REPLACE 复位 pending）。
+        已落 expired 痕的行重复确认仍按 expired（幂等冲突，不回退成 404）。"""
+        with self._lock:
+            row = self._con.execute(
+                "SELECT status, ticket_id, created_ts FROM hazard_suggestions"
+                " WHERE request_id=?", (request_id,)).fetchone()
+        if row is None:
+            return "missing"
+        if row["status"] == "expired":
+            return "expired"
+        if row["status"] != "pending" or row["ticket_id"] is not None:
+            return "handled"
+        if time.time() - row["created_ts"] > max_age_hours * 3600:
+            return "expired"
+        return "pending"
+
     def get_hazard_suggestion(self, request_id: str,
                               max_age_hours: float = 24.0) -> Optional[Dict[str, Any]]:
         """取待确认建议（pending、未建单、未过期）；无则 None（端点据此回 404）。"""

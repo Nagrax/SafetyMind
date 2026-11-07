@@ -1014,6 +1014,13 @@ async def hazard_confirm(body: HazardConfirmRequest,
         raise HTTPException(503, "审计存储未启用")
     sug = _audit.get_hazard_suggestion(body.request_id)
     if sug is None:
+        # 过期 ≠ 不存在（SM-01 破坏性演练口径，slice3-design.md）：建议行还在库里但
+        # 已过 24h 有效期时回 **409 冲突** 并落 expired 痕（不再滞留 pending）——
+        # 同收据重新上报即复位 pending，可回放；其余（真不存在/已确认/已合并）仍 404。
+        state = _audit.classify_hazard_suggestion(body.request_id)
+        if state == "expired":
+            _audit.mark_hazard_suggestion(body.request_id, "expired")
+            raise HTTPException(409, "上报建议已过期（24 小时内有效），请重新上报后再确认")
         raise HTTPException(404, "上报建议不存在、已处理或已过期（24 小时内有效）")
     payload = sug.get("payload") or {}
     decision = payload.get("decision") or {}
