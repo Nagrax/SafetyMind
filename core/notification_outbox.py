@@ -7,7 +7,13 @@
     测试注入假函数），本模块自身绝不发起网络请求、也绝不抛出。
 
 状态语义见 core/audit_store.py 的 notification outbox 段：
-pending 待发 / sending 投递中 / sent 渠道已受理 / ack 接收方或人工已确认 / failed 重试中或失败待处理。
+waiting 待配置 / pending 待发 / sending 投递中 / sent 渠道已受理 / ack 接收方或人工已确认
+/ failed 重试中 / failed_exhausted 失败耗尽（仅供人工重放）。
+
+投递语义（SM-11 §2.7 披露）：**at-least-once**。渠道已受理（外部事实）与本地标记
+sent（本地事实）之间存在不可消除的崩溃窗口（sender 返回后、mark 前）——窗口内进程
+死亡 → reap 复位 → 同一行重投。重投 payload 逐字节相同且顶层带 idempotency_key，
+下游按该键去重实现业务恰好一次；不引入分布式事务/两阶段提交/下游回查。
 """
 import json
 import logging
@@ -32,13 +38,19 @@ def deliver_pending(audit, sender: Callable[[str, Dict[str, Any]], bool],
     1) 先 audit.reap_stale_sending(stale_s) 复位悬挂 sending（进程被终止的残行）；
     2) audit.claim_pending_notifications(batch, max_attempts) 原子领取；
     3) 逐行调用 sender(url, payload)（同步可调用；允许抛异常，异常按失败处理）；
-    4) 成功 → mark_notification_sent(id)（并调 on_sent 回调补痕）；失败 →
-       mark_notification_failed(id, error, backoff_seconds(attempts))；
-    5) 返回 {"claimed","sent","failed","reaped","details"}。
+    4) 成功 → mark_notification_sent(id, generation=领取代次)（并调 on_sent 回调补痕）；
+       失败 → mark_notification_failed(id, error, backoff_seconds(attempts),
+       max_attempts, generation=领取代次)——生产路径全受领取代次守卫（SM-11 §2.5），
+       达 max_attempts 落 failed_exhausted 终态；对应 (kind,channel) 健康桶计数/清零；
+    5) 返回 {"claimed","sent","failed","reaped","details","health_alerts"}；
+       health_alerts = 连败达 FAILURES_BEFORE_ERROR 的 (kind,channel) 桶（api 循环据此告警）。
 
     payload JSON 损坏时按失败处理并记清 last_error，绝不静默丢弃。单行失败不影响其余行。
+    投递语义 at-least-once（见模块 docstring）：同一行在崩溃窗口后可能重投，
+    下游按 payload.idempotency_key 去重。
     """
-    out: Dict[str, Any] = {"claimed": 0, "sent": 0, "failed": 0, "reaped": 0, "details": []}
+    out: Dict[str, Any] = {"claimed": 0, "sent": 0, "failed": 0, "reaped": 0,
+                           "details": [], "health_alerts": []}
     try:
         out["reaped"] = int(audit.reap_stale_sending(stale_s) or 0)
     except Exception as ex:                                   # 复位失败不影响投递
@@ -52,6 +64,7 @@ def deliver_pending(audit, sender: Callable[[str, Dict[str, Any]], bool],
     out["claimed"] = len(rows)
     for row in rows:
         nid = row.get("id")
+        generation = row.get("claim_generation")               # 领取代次：回执校验凭证
         err = ""
         try:
             payload = json.loads(row.get("payload") or "{}")
@@ -71,7 +84,7 @@ def deliver_pending(audit, sender: Callable[[str, Dict[str, Any]], bool],
 
         if ok:
             try:
-                audit.mark_notification_sent(nid)
+                audit.mark_notification_sent(nid, generation=generation)
             except Exception as ex:
                 logger.warning(f"outbox 标记送达失败(id={nid}): {ex}")
             out["sent"] += 1
@@ -86,10 +99,16 @@ def deliver_pending(audit, sender: Callable[[str, Dict[str, Any]], bool],
             try:
                 audit.mark_notification_failed(
                     nid, err or "投递失败",
-                    backoff_seconds(row.get("attempts", 1), base_s, cap_s))
+                    backoff_seconds(row.get("attempts", 1), base_s, cap_s),
+                    max_attempts=max_attempts, generation=generation)
             except Exception as ex:
                 logger.warning(f"outbox 标记失败状态失败(id={nid}): {ex}")
             out["failed"] += 1
             out["details"].append({"id": nid, "key": row.get("idempotency_key"),
                                    "ok": False, "error": err})
+    try:                                                      # 健康项告警（达阈桶，api 层据此告警一次）
+        out["health_alerts"] = [h for h in (audit.notification_health() or [])
+                                if h.get("breached_ts")]
+    except Exception as ex:
+        logger.warning(f"outbox 健康项读取失败: {ex}")
     return out

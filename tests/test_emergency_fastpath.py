@@ -164,10 +164,23 @@ async def _async_main():
            json.dumps(tk, ensure_ascii=False, default=str))
     rows = {r["idempotency_key"]: r for r in store.list_notifications()}
     n1 = rows.get("emergency:emg-fp-1:webhook")
-    record("未配置渠道仍入 outbox：pending + last_error='未配置通知渠道'（绝不写成 sent）",
-           bool(n1) and n1["status"] == "pending" and n1["last_error"] == "未配置通知渠道"
+    # SM-11 §2.8.1 契约迁移点：旧断言"伪装 pending"升级为显式 waiting + 三条更强断言
+    record("未配置渠道仍入 outbox：waiting（待配置）+ last_error='未配置通知渠道'（绝不写成 sent）",
+           bool(n1) and n1["status"] == "waiting" and n1["last_error"] == "未配置通知渠道"
            and n1["channel_configured"] is False and n1["ticket_id"] == tid,
            json.dumps(n1, ensure_ascii=False, default=str))
+    record("waiting 行不耗 attempts、不计失败（Later 语义，零弱化应急路径记录）",
+           bool(n1) and n1["attempts"] == 0
+           and store.notification_stats().get("failed") == 0
+           and store.notification_stats().get("waiting") == 1,
+           f"n1={json.dumps(n1, ensure_ascii=False, default=str)} "
+           f"stats={store.notification_stats()}")
+    moved = store.adopt_waiting_notifications("http://127.0.0.1:9/hook")
+    n1b = store.get_notification(n1["id"]) if n1 else None
+    record("补配置后 waiting 行经 adopt 恢复为待发（迁移 1 行 → pending、attempts 仍 0）",
+           moved == 1 and bool(n1b) and n1b["status"] == "pending"
+           and n1b["attempts"] == 0 and store.notification_stats().get("waiting") == 0,
+           f"moved={moved} n1b={json.dumps(n1b, ensure_ascii=False, default=str)}")
 
     # ── B) 已配置渠道：行为 pending，状态为"待发送"，不声称送达 ──
     os.environ["ESCALATION_WEBHOOK_URL"] = "http://127.0.0.1:9/hook"

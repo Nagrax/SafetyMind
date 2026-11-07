@@ -411,8 +411,10 @@ async def lifespan(app: FastAPI):
         except Exception as ex:
             logger.warning(f"审计存储初始化失败（对话不受影响）: {ex}")
 
-    # 隐患工单逾期巡检（PerformanceMonitor 同款后台循环模式）：首次逾期记
-    # overdue_notify 时间线并发值班 webhook（check_overdue_tickets 幂等，只发一次）；
+    # 隐患工单逾期巡检（PerformanceMonitor 同款后台循环模式）：首次逾期记 overdue_notify
+    # 时间线并同事务入队值班 webhook 通知（SM-11：判重→记事件→入队收敛为 AuditStore 内
+    # 单个 BEGIN IMMEDIATE，api 层不再自行 enqueue——崩溃窗口与跨进程重复事件已消除）；
+    # 未配置渠道入 waiting 待配置行（不耗 attempts 不计失败），outbox 循环补配置后 adopt 恢复。
     # SAFETYMIND_HAZARD_OVERDUE_CHECK=0 关闭。失败只告警，绝不影响主服务。
     hazard_overdue_task = None
     if _audit is not None and os.getenv("SAFETYMIND_HAZARD_OVERDUE_CHECK", "1") == "1":
@@ -420,12 +422,11 @@ async def lifespan(app: FastAPI):
             interval = float(os.getenv("SAFETYMIND_HAZARD_OVERDUE_CHECK_S", "300"))
             while True:
                 try:
-                    for t in _audit.check_overdue_tickets():
-                        _enqueue_ticket_notification(
-                            t["id"], t.get("source_request_id", ""),
-                            f"【SafetyMind 工单逾期】#{t['id']} {t['title']}\n"
-                            f"整改期限已过仍未闭环，请立即督办。\n"
-                            f"时间: {time.strftime('%m-%d %H:%M:%S')}", reason="overdue")
+                    webhook = os.getenv("ESCALATION_WEBHOOK_URL", "").strip()
+                    newly = await asyncio.to_thread(
+                        _audit.check_overdue_tickets, webhook)
+                    if newly:
+                        logger.info(f"隐患逾期巡检：新逾期 {len(newly)} 张已记事件并入队通知")
                 except Exception as ex:
                     logger.warning(f"隐患逾期巡检失败: {ex}")
                 await asyncio.sleep(interval)
@@ -449,6 +450,11 @@ async def lifespan(app: FastAPI):
 
             while True:
                 try:
+                    webhook = os.getenv("ESCALATION_WEBHOOK_URL", "").strip()
+                    if webhook:   # 补配置后恢复 waiting 待配置行（SM-11 §2.3；无 webhook 零调用零开销）
+                        moved = await asyncio.to_thread(_audit.adopt_waiting_notifications, webhook)
+                        if moved:
+                            logger.info(f"outbox 渠道已配置：{moved} 条 waiting 待配置通知恢复待发")
                     stats = await asyncio.to_thread(
                         deliver_pending, _audit, _sender, batch, max_attempts,
                         5.0, 300.0, 120.0, _on_outbox_sent)
@@ -456,6 +462,9 @@ async def lifespan(app: FastAPI):
                         logger.info(
                             f"outbox 投递：领取 {stats['claimed']} / 送达 {stats['sent']}"
                             f" / 失败 {stats['failed']} / 悬挂复位 {stats['reaped']}")
+                    alerts = stats.get("health_alerts") or []
+                    if alerts:   # 连败达 FAILURES_BEFORE_ERROR 的 (kind,channel) 桶，告警一次
+                        logger.warning(f"通知渠道健康告警（连败达阈值）: {alerts}")
                 except Exception as ex:
                     logger.warning(f"outbox 投递循环失败（不影响服务）: {ex}")
                 await asyncio.sleep(interval)
@@ -958,9 +967,12 @@ def _enqueue_ticket_notification(ticket_id: int, request_id: str, text: str,
                                  reason: str = "create") -> int:
     """工单通知入 outbox（幂等键 ticket:{id}:{reason}:webhook）。
 
-    未配置渠道时仍入队（channel='' + last_error='未配置通知渠道'），绝不伪装成已送达；
-    实际投递与"已实收"时间线由后台 worker 在渠道真正受理（sent）后经 _on_outbox_sent 补写。
-    reason: create（建单/确认卡派单）| overdue（逾期巡检升级提醒）。
+    未配置渠道时仍入队（waiting 待配置行 + last_error='未配置通知渠道'），绝不伪装成
+    已送达，补配置后经 adopt 恢复投递；实际投递与"已实收"时间线由后台 worker 在渠道
+    真正受理（sent）后经 _on_outbox_sent 补写。
+    reason → kind（SM-11 §2.2 事件分类）：create（建单/确认卡派单）→ notify；
+    overdue（逾期巡检升级提醒）→ overdue（仅限既有调用方兼容，逾期主路径已收敛进
+    AuditStore.check_overdue_tickets 同事务入队）。
     """
     if _audit is None:
         return 0
@@ -972,7 +984,8 @@ def _enqueue_ticket_notification(ticket_id: int, request_id: str, text: str,
             payload={"request_id": request_id, "text": text,
                      "timeline": {"ticket_id": ticket_id, "note": "派单 webhook 已实收",
                                   "to_stage": "brief", "request_id": request_id}},
-            request_id=request_id, ticket_id=ticket_id)
+            request_id=request_id, ticket_id=ticket_id,
+            kind="overdue" if reason == "overdue" else "notify")
     except Exception as ex:                                    # 入队失败只告警，不阻断对话
         logger.warning(f"工单通知入队失败（ticket #{ticket_id}）: {ex}")
         return 0

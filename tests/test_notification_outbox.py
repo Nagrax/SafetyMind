@@ -214,15 +214,21 @@ def test_deliver_pending_with_fake_sender():
            and bool(store.get_notification(false_id)["last_error"]),
            store.get_notification(false_id)["last_error"])
 
-    # 未配置渠道（channel=''）永不被领取，但 pending 与原因可见
+    # 未配置渠道（channel=''）→ waiting（待配置）：永不被领取，与"待发"分开可见
+    # （SM-11 §2.8.1 契约迁移点：旧断言"伪装 pending"升级为显式 waiting + 三条更强断言）
     none_id = store.enqueue_notification("d4", "", {"request_id": "d", "text": "t"})
     res2 = deliver_pending(store, sender, batch=10, base_s=3600.0)
     n = store.get_notification(none_id)
-    record("未配置渠道：入队但永不被领取(pending+last_error='未配置通知渠道')",
-           res2["claimed"] == 0 and n["status"] == "pending"
+    record("未配置渠道：入队即 waiting（待配置，不再伪装 pending）且永不被领取",
+           res2["claimed"] == 0 and n["status"] == "waiting"
            and n["last_error"] == "未配置通知渠道" and n["channel_configured"] is False
-           and store.notification_stats().get("pending") == 1,
+           and store.notification_stats().get("waiting") == 1
+           and store.notification_stats().get("pending") == 0,
            json.dumps(n, ensure_ascii=False, default=str))
+    record("waiting 行不耗 attempts、不计失败（Later 语义）",
+           n["attempts"] == 0 and res2["failed"] == 0
+           and store.notification_stats().get("failed") == 2,
+           f"attempts={n['attempts']} res2={json.dumps(res2, ensure_ascii=False, default=str)}")
 
     # payload JSON 损坏：记失败不静默丢弃
     bad_id = store.enqueue_notification("d5", "http://hook.local/ok", {"request_id": "e", "text": "t"})
@@ -246,6 +252,17 @@ def test_deliver_pending_with_fake_sender():
            set(store.notification_stats()) >= {"pending", "sending", "sent", "ack", "failed"}
            and store.notification_stats()["failed"] >= 2,
            json.dumps(store.notification_stats(), ensure_ascii=False))
+
+    # SM-11 §2.3 裁决点 4：补配置后 waiting 行经 adopt 恢复可领取（第三条强断言）
+    moved = store.adopt_waiting_notifications("http://hook.local/ok")
+    rec = store.claim_pending_notifications(limit=5, max_attempts=5)
+    for r in rec:
+        store.mark_notification_sent(r["id"])
+    n_after = store.get_notification(none_id)
+    record("补配置后 waiting 行经 adopt 恢复领取（迁移 1 行、恰耗 1 attempt、送达 sent）",
+           moved == 1 and n_after["status"] == "sent" and n_after["attempts"] == 1
+           and store.notification_stats().get("waiting") == 0,
+           f"moved={moved} after={json.dumps(n_after, ensure_ascii=False, default=str)}")
     store.close()
 
 

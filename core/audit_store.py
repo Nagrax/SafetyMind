@@ -25,12 +25,20 @@
   - 逾期：check_overdue_tickets 幂等记 overdue_notify 并触发值班 webhook；
   - 改判：update_ticket_fields 白名单改字段 + patch 时间线留痕（研讨阶段人工定级）。
 
-可靠通知（notification outbox，2026-10）：
+可靠通知（notification outbox，2026-10；SM-11 2026-11 增补）：
   - 工单变化与"待发送通知"同一次持锁/同一次 commit 落库（进程退出后仍可恢复投递）；
-  - 状态严格区分 pending(待发) / sending(投递中) / sent(渠道已受理) / ack(接收方或人工已确认)
-    / failed(重试中或失败待处理，达尝试上限后停在 failed 供人工重放)；
-  - 未配置渠道仍入队（channel='' 永不被领取，last_error 记原因），绝不伪装成 sent；
-  - 幂等键唯一，重复投递不新增；悬挂 sending 由 reap_stale_sending 复位重投。
+  - 状态严格区分 waiting(待配置) / pending(待发) / sending(投递中) / sent(渠道已受理)
+    / ack(接收方或人工已确认) / failed(重试中) / failed_exhausted(失败耗尽，仅供人工重放)；
+  - 未配置渠道入 waiting（不耗 attempts、不计失败、永不被领取），补配置后经
+    adopt_waiting_notifications 恢复投递（旧空渠道行启动时一次性迁移为 waiting）；
+  - 行按 kind 分类：notify(建单/确认卡派单) / overdue(逾期巡检) / escalate(应急升级)，
+    按 (kind, channel) 维护健康项（连败 FAILURES_BEFORE_ERROR=3 次才 breached）；
+  - 领取发代次 claim_generation：送达/失败回执只能由当前代次持有者写入，
+    被 reap 复位的旧悬挂消费者复活后无法改写新消费者的投递结果；
+  - 幂等键唯一，重复投递不新增；悬挂 sending 由 reap_stale_sending 复位重投；
+  - 投递语义为 at-least-once：渠道已受理（外部事实）与本地标记 sent（本地事实）之间
+    存在不可消除的崩溃窗口，重投 payload 逐字节相同且顶层带 idempotency_key，
+    下游按该键去重实现业务恰好一次。
 """
 import hashlib
 import json
@@ -52,6 +60,11 @@ def canonical_json(obj: Any) -> str:
 def idem_hash(obj: Any) -> str:
     """请求内容哈希（SM-10 §2.2）：同键同哈希=请求重试（重放收据）、同键异哈希=冲突。"""
     return hashlib.sha256(canonical_json(obj).encode("utf-8")).hexdigest()
+
+
+# 按 (kind, channel) 健康项连败阈值（SM-11 §2.6，对标 dsh src/app/effects.ts:7）：
+# 连败 <3 不向管理层报错（per-row details 仍如实记录，只是不升级）；≥3 记 breached_ts。
+FAILURES_BEFORE_ERROR = 3
 
 _DEFAULT_DDL = """
 CREATE TABLE IF NOT EXISTS audit_log (
@@ -127,7 +140,9 @@ CREATE TABLE IF NOT EXISTS notification_outbox (
     next_attempt_ts REAL DEFAULT 0,
     last_error TEXT DEFAULT '',
     sent_ts REAL,
-    acked_ts REAL
+    acked_ts REAL,
+    kind TEXT DEFAULT 'notify',
+    claim_generation INTEGER DEFAULT 0
 );
 CREATE INDEX IF NOT EXISTS idx_audit_ts ON audit_log(ts);
 CREATE INDEX IF NOT EXISTS idx_upg_ts ON upgrade_events(ts);
@@ -153,6 +168,14 @@ CREATE TABLE IF NOT EXISTS hazard_ops (
 CREATE UNIQUE INDEX IF NOT EXISTS ux_hazard_ops_active
     ON hazard_ops(action, subject, idem_key) WHERE status='applied';
 CREATE INDEX IF NOT EXISTS idx_hazard_ops_key ON hazard_ops(action, subject, idem_key);
+-- 按 (kind, channel) 健康项（SM-11 §2.6）：连败计数 + 达阈 breached_ts；waiting 行不参与。
+CREATE TABLE IF NOT EXISTS notification_health (
+    kind TEXT NOT NULL,
+    channel TEXT NOT NULL,
+    consecutive_failures INTEGER DEFAULT 0,
+    breached_ts REAL,
+    PRIMARY KEY(kind, channel)
+);
 """
 
 # ── 五阶段回路定义（新库建表即带列；旧库由 _migrate 非破坏补列）────────────────
@@ -239,6 +262,32 @@ class AuditStore:
         except sqlite3.Error as ex:  # pragma: no cover - 迁移失败不拖垮审计存储
             self._con.rollback()
             logger.warning(f"工单五阶段迁移失败（沿用两态读取）: {ex}")
+        self._con.commit()   # 票据迁移收口后再做通知迁移（两块互不拖累）
+        # SM-11 通知 outbox 非破坏迁移：加列（kind/claim_generation）→ 存量 kind 按幂等键
+        # 分类回填（只读扫描→定向 UPDATE）→ 旧空渠道行（pending+channel=''）一次性迁移为
+        # waiting（只改状态标签，不改 channel/attempts/last_error 任何投递相关字段）。
+        # 全部幂等：重跑零行；启动时随建表迁移自然执行，无需周期性扫描。
+        try:
+            cols = {r[1] for r in self._con.execute("PRAGMA table_info(notification_outbox)")}
+            for col, ddl in (
+                ("kind", "TEXT DEFAULT 'notify'"),
+                ("claim_generation", "INTEGER DEFAULT 0"),
+            ):
+                if col not in cols:
+                    self._con.execute(f"ALTER TABLE notification_outbox ADD COLUMN {col} {ddl}")
+            self._con.execute(
+                "UPDATE notification_outbox SET kind='escalate'"
+                " WHERE kind='notify' AND (idempotency_key LIKE 'upgrade:%'"
+                " OR idempotency_key LIKE 'emergency:%')")
+            self._con.execute(
+                "UPDATE notification_outbox SET kind='overdue'"
+                " WHERE kind='notify' AND idempotency_key LIKE 'ticket:%:overdue:%'")
+            self._con.execute(
+                "UPDATE notification_outbox SET status='waiting'"
+                " WHERE status='pending' AND channel=''")
+        except sqlite3.Error as ex:  # pragma: no cover - 迁移失败不拖垮审计存储
+            self._con.rollback()
+            logger.warning(f"通知 outbox 迁移失败（沿用旧结构读取）: {ex}")
 
     def _norm_stage(self, stage: str, status: str) -> str:
         """阶段归一：stage 列缺失（理论上 _migrate 后不再出现）时按旧两态推导。"""
@@ -319,15 +368,22 @@ class AuditStore:
             return cur.rowcount > 0
 
     # ── 通知 outbox（持久待发送记录 + 送达/确认状态）────────────────────────
-    # status 语义（严格区分，不许混用）：
-    #   pending  待发（含未配置渠道：channel='' 永不被领取，last_error 记原因）
-    #   sending  投递中（worker 已领取；进程被终止会悬挂 → reap_stale_sending 复位）
-    #   sent     渠道已受理（如 HTTP 200）——不等于接收方/人工已确认
-    #   ack      接收方或人工已确认（独立事实，不得由 sent 代替）
-    #   failed   重试中/失败待处理（attempts 未达上限时退避后重试，达上限后停在此态供人工重放）
+    # status 语义（严格区分，不许混用；存储 token 不改名，通知契约名映射见决策单 §2.2）：
+    #   waiting          待配置（channel==''：永不被领取、attempts 恒 0、不计失败；
+    #                    补配置后经 adopt_waiting_notifications 恢复为 pending）
+    #   pending          待发（可领取：入队 channel≠''；adopt / replay / reap 复位后）
+    #   sending          投递中（已领取，携带当次领取代次 claim_generation；悬挂 → reap 复位）
+    #   sent             渠道已受理（如 HTTP 200）——不等于接收方/人工已确认
+    #   ack              接收方或人工已确认（独立事实，不得由 sent 代替）
+    #   failed           重试中（attempts<max，退避后可再领）
+    #   failed_exhausted 失败耗尽（attempts≥max 终态，仅供人工 replay，不与"重试中"混报）
+    # kind 事件分类：notify（建单/确认卡派单）/ overdue（逾期巡检）/ escalate（应急升级）。
+    # 投递语义 at-least-once：渠道受理（外部事实）与本地标记 sent（本地事实）间崩溃窗口
+    # 不可消除；重投 payload 逐字节相同且顶层带 idempotency_key，下游按键去重。
     _NOTIFICATION_PUBLIC_FIELDS = (
         "id", "created_ts", "idempotency_key", "request_id", "ticket_id", "upgrade_id",
         "status", "attempts", "next_attempt_ts", "last_error", "sent_ts", "acked_ts",
+        "kind", "claim_generation",
     )
 
     @staticmethod
@@ -352,18 +408,22 @@ class AuditStore:
 
     def _enqueue_locked(self, idempotency_key: str, channel: str, payload_text: str,
                         request_id: str, ticket_id: Optional[int],
-                        upgrade_id: Optional[int]) -> int:
-        """持锁内入队（供 enqueue_notification 与 create_ticket 复用，保证同事务）。
-        幂等键去重：INSERT OR IGNORE，已存在则返回既有 id。未配置渠道仍入库并记原因。"""
+                        upgrade_id: Optional[int], kind: str = "notify") -> int:
+        """持锁内入队（供 enqueue_notification / create_ticket / check_overdue_tickets
+        复用，保证同事务）。幂等键去重：INSERT OR IGNORE，已存在则返回既有 id。
+        channel 为空 → status='waiting'（待配置，不耗 attempts 不计失败，last_error 记原因），
+        非空 → 'pending'（待发）。kind：notify（默认）/ overdue / escalate。"""
         if not idempotency_key:
             return 0
-        err = "" if (channel or "").strip() else "未配置通知渠道"
+        empty_channel = not (channel or "").strip()
+        status = "waiting" if empty_channel else "pending"
+        err = "未配置通知渠道" if empty_channel else ""
         self._con.execute(
             "INSERT OR IGNORE INTO notification_outbox (created_ts, idempotency_key,"
             " channel, request_id, ticket_id, upgrade_id, payload, status, attempts,"
-            " next_attempt_ts, last_error) VALUES (?,?,?,?,?,?,?,'pending',0,0,?)",
+            " next_attempt_ts, last_error, kind) VALUES (?,?,?,?,?,?,?,?,0,0,?,?)",
             (time.time(), idempotency_key, channel or "", request_id or "", ticket_id,
-             upgrade_id, payload_text, err))
+             upgrade_id, payload_text, status, err, kind or "notify"))
         row = self._con.execute(
             "SELECT id FROM notification_outbox WHERE idempotency_key=?",
             (idempotency_key,)).fetchone()
@@ -371,13 +431,15 @@ class AuditStore:
 
     def enqueue_notification(self, idempotency_key: str, channel: str, payload: Any,
                              request_id: str = "", ticket_id: Optional[int] = None,
-                             upgrade_id: Optional[int] = None) -> int:
+                             upgrade_id: Optional[int] = None,
+                             kind: str = "notify") -> int:
         """入队一条待发送通知（幂等：同键重复投递不新增，返回既有 id）。
-        channel 传实际 webhook URL；未配置时传 '' （仍入库，last_error='未配置通知渠道'）。"""
+        channel 传实际 webhook URL；未配置时传 ''（仍入库，落 waiting 待配置行，
+        last_error='未配置通知渠道'）。kind：notify（默认）/ overdue / escalate。"""
         text = self._dumps_payload(payload, idempotency_key)   # 落库前序列化（含幂等键注入），失败不留半成品
         with self._lock:
             oid = self._enqueue_locked(idempotency_key, channel, text, request_id,
-                                       ticket_id, upgrade_id)
+                                       ticket_id, upgrade_id, kind)
             self._commit()
         return oid
 
@@ -393,6 +455,9 @@ class AuditStore:
           2) 每条 UPDATE 仍是**条件更新**（带 `status IN ('pending','failed')` 等原条件）
              并校验 rowcount，即便 BEGIN 因已在事务中而失败，也以 rowcount 兜底：
              只有真正把该行从待发改为 sending 的消费者才算领取成功。
+        领取发代次（SM-11 §2.5）：UPDATE 同步 `claim_generation=claim_generation+1`，返回行
+        携带**新代次**——送达/失败回执经 mark_notification_sent/failed 的 generation 校验，
+        只能由当前代次持有者写入（reap 复位的旧悬挂消费者复活后回执被拒）。
         next_attempt_ts 同时记录"本次领取时刻"，供 reap_stale_sending 判断悬挂时长。"""
         now = time.time() if now is None else now
         with self._lock:
@@ -409,7 +474,8 @@ class AuditStore:
                 for r in rows:
                     cur = self._con.execute(
                         "UPDATE notification_outbox SET status='sending', attempts=attempts+1,"
-                        " next_attempt_ts=? WHERE id=? AND status IN ('pending','failed')"
+                        " claim_generation=claim_generation+1, next_attempt_ts=?"
+                        " WHERE id=? AND status IN ('pending','failed')"
                         " AND channel!='' AND attempts<? AND next_attempt_ts<=?",
                         (now, r["id"], max_attempts, now))
                     if cur.rowcount != 1:
@@ -417,6 +483,7 @@ class AuditStore:
                     d = dict(r)
                     d["status"] = "sending"
                     d["attempts"] = int(d.get("attempts") or 0) + 1
+                    d["claim_generation"] = int(d.get("claim_generation") or 0) + 1
                     d["next_attempt_ts"] = now
                     claimed.append(d)
                 self._commit()
@@ -425,24 +492,62 @@ class AuditStore:
                 raise
         return claimed
 
-    def mark_notification_sent(self, notification_id: int) -> bool:
-        """渠道已受理（如 HTTP 200）：status='sent' + sent_ts；不代表接收方确认。"""
+    def mark_notification_sent(self, notification_id: int,
+                               generation: Optional[int] = None) -> bool:
+        """渠道已受理（如 HTTP 200）：status='sent' + sent_ts；不代表接收方确认。
+        generation 非空时校验领取代次（回执只能由当前代次持有者写入，rowcount=0 即丢弃）；
+        缺省（None）保持旧行为（既有测试与旧调用零破坏）。送达后对应 (kind,channel)
+        健康桶连败清零（幂等 upsert）。"""
         with self._lock:
-            cur = self._con.execute(
-                "UPDATE notification_outbox SET status='sent', sent_ts=?, last_error=''"
-                " WHERE id=?", (time.time(), notification_id))
+            row = self._con.execute(
+                "SELECT kind, channel FROM notification_outbox WHERE id=?",
+                (notification_id,)).fetchone()
+            if row is None:
+                return False
+            if generation is None:
+                cur = self._con.execute(
+                    "UPDATE notification_outbox SET status='sent', sent_ts=?, last_error=''"
+                    " WHERE id=?", (time.time(), notification_id))
+            else:
+                cur = self._con.execute(
+                    "UPDATE notification_outbox SET status='sent', sent_ts=?, last_error=''"
+                    " WHERE id=? AND claim_generation=? AND status='sending'",
+                    (time.time(), notification_id, generation))
+            if cur.rowcount > 0:
+                self._clear_health_sent_locked(row["kind"], row["channel"])
             self._commit()
             return cur.rowcount > 0
 
     def mark_notification_failed(self, notification_id: int, error: str,
-                                backoff_s: float) -> bool:
-        """投递失败：status='failed' + last_error，退避 backoff_s 秒后（attempts 未达上限时）可重试。"""
+                                backoff_s: float, max_attempts: int = 5,
+                                generation: Optional[int] = None) -> bool:
+        """投递失败：status='failed'（attempts<max_attempts，退避后可重试）或
+        'failed_exhausted'（attempts≥max_attempts 终态，仅供人工 replay）+ last_error。
+        generation 非空时校验领取代次（旧代次回执 rowcount=0 被拒，不改写当前投递）；
+        缺省（None）保持旧行为。对应 (kind,channel) 健康桶连败 +1（waiting 行进不到这里）。"""
         with self._lock:
+            row = self._con.execute(
+                "SELECT kind, channel, attempts FROM notification_outbox WHERE id=?",
+                (notification_id,)).fetchone()
+            if row is None:
+                return False
             now = time.time()
-            cur = self._con.execute(
-                "UPDATE notification_outbox SET status='failed', last_error=?,"
-                " next_attempt_ts=? WHERE id=?",
-                (str(error or "")[:500], now + max(0.0, float(backoff_s or 0.0)), notification_id))
+            exhausted = int(row["attempts"] or 0) >= int(max_attempts)
+            new_status = "failed_exhausted" if exhausted else "failed"
+            if generation is None:
+                cur = self._con.execute(
+                    "UPDATE notification_outbox SET status=?, last_error=?,"
+                    " next_attempt_ts=? WHERE id=?",
+                    (new_status, str(error or "")[:500],
+                     now + max(0.0, float(backoff_s or 0.0)), notification_id))
+            else:
+                cur = self._con.execute(
+                    "UPDATE notification_outbox SET status=?, last_error=?, next_attempt_ts=?"
+                    " WHERE id=? AND claim_generation=? AND status='sending'",
+                    (new_status, str(error or "")[:500],
+                     now + max(0.0, float(backoff_s or 0.0)), notification_id, generation))
+            if cur.rowcount > 0:
+                self._bump_health_failed_locked(row["kind"], row["channel"])
             self._commit()
             return cur.rowcount > 0
 
@@ -456,7 +561,8 @@ class AuditStore:
             return cur.rowcount > 0
 
     def reap_stale_sending(self, stale_s: float = 120.0, now: Optional[float] = None) -> int:
-        """复位悬挂 sending 行（进程被终止导致投递中悬挂）：status 回 pending，attempts 保留。
+        """复位悬挂 sending 行（进程被终止导致投递中悬挂）：status 回 pending，attempts 保留，
+        代次不动（旧代次在下一次 claim 时失效——SM-11 §2.2 转移汇总）。
         悬挂时长取 max(created_ts, next_attempt_ts)——后者是领取时刻标记（表结构无独立
         领取时间列，旧库不能 ALTER），纯粹用 created_ts 会把"积压较久的待发行"误判为悬挂。"""
         now = time.time() if now is None else now
@@ -468,6 +574,51 @@ class AuditStore:
                 (cutoff,))
             self._commit()
             return int(cur.rowcount)
+
+    def adopt_waiting_notifications(self, channel: str) -> int:
+        """补配置后恢复 waiting 行（SM-11 §2.3 裁决点 4）：channel 烙死问题的显式修复口。
+        UPDATE waiting AND channel='' → pending（清 last_error），幂等、返回迁移行数；
+        渠道为空时零调用零迁移。恢复随时可做，迁移只做一次（§2.4）。"""
+        ch = (channel or "").strip()
+        if not ch:
+            return 0
+        with self._lock:
+            cur = self._con.execute(
+                "UPDATE notification_outbox SET channel=?, status='pending', last_error=''"
+                " WHERE status='waiting' AND channel=''", (ch,))
+            self._commit()
+            return int(cur.rowcount)
+
+    # ── 按 (kind, channel) 健康项（SM-11 §2.6）──────────────────────────────
+    def _bump_health_failed_locked(self, kind: str, channel: str) -> None:
+        """投递失败：对应桶连败 +1；达 FAILURES_BEFORE_ERROR 记 breached_ts（幂等 upsert）。
+        channel 为空（waiting 行理论上进不到 mark_failed）不入桶兜底。"""
+        if not (channel or "").strip():
+            return
+        self._con.execute(
+            "INSERT INTO notification_health (kind, channel, consecutive_failures)"
+            " VALUES (?,?,1) ON CONFLICT(kind, channel) DO UPDATE SET"
+            " consecutive_failures=consecutive_failures+1,"
+            " breached_ts=CASE WHEN consecutive_failures+1>=?"
+            " THEN COALESCE(breached_ts, ?) ELSE breached_ts END",
+            (kind or "notify", channel, FAILURES_BEFORE_ERROR, time.time()))
+
+    def _clear_health_sent_locked(self, kind: str, channel: str) -> None:
+        """送达受理：对应桶连败清零并解除 breached（恢复即解除告警态，幂等 upsert）。"""
+        if not (channel or "").strip():
+            return
+        self._con.execute(
+            "INSERT INTO notification_health (kind, channel, consecutive_failures)"
+            " VALUES (?,?,0) ON CONFLICT(kind, channel) DO UPDATE SET"
+            " consecutive_failures=0, breached_ts=NULL",
+            (kind or "notify", channel))
+
+    def notification_health(self) -> List[Dict[str, Any]]:
+        """健康项清单（管理端/测试用）：(kind, channel) 粒度的连败计数与达阈时间。"""
+        with self._lock:
+            rows = self._con.execute(
+                "SELECT * FROM notification_health ORDER BY kind, channel").fetchall()
+        return [dict(r) for r in rows]
 
     def get_notification(self, notification_id: int) -> Optional[Dict[str, Any]]:
         """单条通知的对外视图（同 list_notifications 字段口径，不下发 payload/完整 URL）。"""
@@ -491,21 +642,26 @@ class AuditStore:
         return [self._notification_public(r) for r in rows]
 
     def replay_notification(self, notification_id: int) -> bool:
-        """人工重放：复位为 pending、attempts=0、退避清零、错误清空。"""
+        """人工重放：复位为 pending、attempts=0、退避清零、错误清空，代次 +1
+        （一切在途领取作废——SM-11 §2.2 转移汇总）。"""
         with self._lock:
             cur = self._con.execute(
                 "UPDATE notification_outbox SET status='pending', attempts=0,"
-                " next_attempt_ts=0, last_error='', sent_ts=NULL WHERE id=?",
+                " next_attempt_ts=0, last_error='', sent_ts=NULL,"
+                " claim_generation=claim_generation+1 WHERE id=?",
                 (notification_id,))
             self._commit()
             return cur.rowcount > 0
 
     def notification_stats(self) -> Dict[str, Any]:
-        """各状态计数 + 总数（管理端与报表用；failed 单独可见便于人工重放）。"""
+        """各状态计数 + 总数（管理端与报表用；failed 与 failed_exhausted 分开——
+        "需人工介入"清单可直查，不与"重试中"混报；waiting 单独可见——"待配置"
+        不再伪装成"待发"。键集合只增不减（SM-11 §2.8.2）。"""
         with self._lock:
             rows = self._con.execute(
                 "SELECT status, COUNT(*) AS n FROM notification_outbox GROUP BY status").fetchall()
-        out: Dict[str, Any] = {s: 0 for s in ("pending", "sending", "sent", "ack", "failed")}
+        out: Dict[str, Any] = {s: 0 for s in ("pending", "sending", "sent", "ack",
+                                              "failed", "waiting", "failed_exhausted")}
         total = 0
         for r in rows:
             out[r["status"]] = int(r["n"])
@@ -528,9 +684,10 @@ class AuditStore:
         隐患工单补充字段：severity（major/general 建议定级）、responsible_dept
         （派发部门）、user_id（上报人，去重与报表用）。
         notification（可选，默认 None = 旧行为）：形如
-        {"idempotency_key","channel","payload","request_id","ticket_id?","upgrade_id?"}，
+        {"idempotency_key","channel","payload","request_id","ticket_id?","upgrade_id?","kind?"}，
         与本行在**同一次持锁、同一次 commit** 内插入 notification_outbox——
-        "工单变化与待发送记录同事务落库"，进程退出后通知仍可恢复投递。"""
+        "工单变化与待发送记录同事务落库"，进程退出后通知仍可恢复投递。
+        kind 缺省 'notify'；应急路径传 'escalate'（SM-11 §2.2 事件分类）。"""
         if brief is None:
             brief = {"intent": "", "urgency": "", "entities": {},
                      "message_digest": _preview(title, 80),
@@ -568,7 +725,8 @@ class AuditStore:
                     notification_text,
                     notification.get("request_id", "") or source_request_id,
                     notification.get("ticket_id") or tid,
-                    notification.get("upgrade_id"))
+                    notification.get("upgrade_id"),
+                    notification.get("kind") or "notify")
             self._commit()
             return tid
 
@@ -1009,7 +1167,7 @@ class AuditStore:
                                               "to_stage": "brief", "request_id": request_id}}
                     self._enqueue_locked(key, n.get("channel", "") or "",
                                          self._dumps_payload(n_payload, key),
-                                         request_id, tid, None)
+                                         request_id, tid, None, "notify")
                 # 步骤 5：收据回填 + 统一提交
                 receipt = {"ok": True, "ticket_id": tid, "merged": merged}
                 self._con.execute("UPDATE hazard_ops SET receipt=? WHERE id=?",
@@ -1062,7 +1220,7 @@ class AuditStore:
                     source_request_id=target, brief=brief,
                     notification={"idempotency_key": idem_key, "channel": channel,
                                   "payload": payload, "request_id": target,
-                                  "upgrade_id": upgrade_id})
+                                  "upgrade_id": upgrade_id, "kind": "escalate"})
                 receipt = {"ticket_id": int(ticket_id), "upgrade_id": int(upgrade_id)}
                 self._con.execute("UPDATE hazard_ops SET receipt=? WHERE id=?",
                                   (json.dumps(receipt, ensure_ascii=False), res["op_id"]))
@@ -1111,21 +1269,58 @@ class AuditStore:
                 " AND due_ts IS NOT NULL AND due_ts<? ORDER BY due_ts ASC", (now,)).fetchall()
         return [self._ticket_dict(r) for r in rows]
 
-    def check_overdue_tickets(self) -> List[Dict[str, Any]]:
-        """逾期巡检（后台循环调用）：首次逾期的工单记 overdue_notify 时间线并返回
-        （调用方据此发 webhook）；已有该事件的不再重复返回——幂等，通知只发一次。"""
-        newly = []
+    def check_overdue_tickets(self, channel: str = "") -> List[Dict[str, Any]]:
+        """逾期巡检（后台循环调用）：判重 → 记 overdue_notify 事件 → outbox 入队（kind='overdue'）
+        收敛为**每张新逾期单一个 BEGIN IMMEDIATE**（SM-11 §2.1，SM-10 §5.2.1 同款次序：
+        写锁先行、判重在锁内）——事件与通知要么同 commit 要么同回滚，"事件已提交而通知
+        永不入队"的崩溃窗口与"两进程各记一条事件"的 check-then-act 竞态同时消除。
+        已有该事件的逾期单不重复返回——幂等，通知只发一次。
+        channel 为值班 webhook（可空：空渠道入 waiting 待配置行，不再"永不通知"）；
+        现有调用点无参调用零破坏（缺省 ''）。webhook 投递与补痕留在事务外（网络 IO
+        进事务会长持写锁且渠道半成功不可回滚）。
+        入队经 self._enqueue_locked（故障注入面，与 SM-10 同款实例属性 monkeypatch）；
+        注入失败 → 整体回滚 → 重扫自然重试（恢复的唯一重试来源）。"""
+        newly: List[Dict[str, Any]] = []
         for t in self.list_overdue_tickets():
             with self._lock:
-                dup = self._con.execute(
-                    "SELECT 1 FROM ticket_timeline WHERE ticket_id=? AND action='overdue_notify'",
-                    (t["id"],)).fetchone()
-            if dup is None:
-                ok = self.record_ticket_event(
-                    t["id"], "overdue_notify", actor="system",
-                    note=f"整改期限已过（逾期 {round((time.time() - t['due_ts']) / 3600, 1)}h），升级提醒",
-                    to_stage=t["stage"])
-                if ok:
+                self._con.execute("BEGIN IMMEDIATE")
+                self._in_tx = True
+                appended = False
+                try:
+                    dup = self._con.execute(
+                        "SELECT 1 FROM ticket_timeline WHERE ticket_id=?"
+                        " AND action='overdue_notify'", (t["id"],)).fetchone()
+                    if dup is None:
+                        ok = self.record_ticket_event(
+                            t["id"], "overdue_notify", actor="system",
+                            note=f"整改期限已过（逾期 {round((time.time() - t['due_ts']) / 3600, 1)}h），升级提醒",
+                            to_stage=t["stage"])
+                        if ok:
+                            key = f"ticket:{t['id']}:overdue:webhook"
+                            text = (f"【SafetyMind 工单逾期】#{t['id']} {t['title']}\n"
+                                    f"整改期限已过仍未闭环，请立即督办。\n"
+                                    f"时间: {time.strftime('%m-%d %H:%M:%S')}")
+                            payload = {"request_id": t.get("source_request_id", ""),
+                                       "text": text,
+                                       "timeline": {"ticket_id": t["id"],
+                                                    "note": "派单 webhook 已实收",
+                                                    "to_stage": "brief",
+                                                    "request_id": t.get("source_request_id", "")}}
+                            self._enqueue_locked(key, channel,
+                                                 self._dumps_payload(payload, key),
+                                                 t.get("source_request_id", ""), t["id"],
+                                                 None, "overdue")
+                            appended = True
+                    self._con.commit()
+                except BaseException:
+                    try:
+                        self._con.rollback()
+                    except sqlite3.Error:
+                        pass
+                    raise
+                finally:
+                    self._in_tx = False
+                if appended:
                     newly.append(t)
         return newly
 
