@@ -32,15 +32,26 @@
   - 未配置渠道仍入队（channel='' 永不被领取，last_error 记原因），绝不伪装成 sent；
   - 幂等键唯一，重复投递不新增；悬挂 sending 由 reap_stale_sending 复位重投。
 """
+import hashlib
 import json
 import logging
 import os
 import sqlite3
 import threading
 import time
-from typing import Any, Dict, List, Optional
+from typing import Any, Callable, Dict, List, Optional
 
 logger = logging.getLogger(__name__)
+
+
+def canonical_json(obj: Any) -> str:
+    """幂等内容哈希的规范化序列化：键排序 + 紧凑分隔符（同内容必同串）。"""
+    return json.dumps(obj, sort_keys=True, ensure_ascii=False, separators=(",", ":"))
+
+
+def idem_hash(obj: Any) -> str:
+    """请求内容哈希（SM-10 §2.2）：同键同哈希=请求重试（重放收据）、同键异哈希=冲突。"""
+    return hashlib.sha256(canonical_json(obj).encode("utf-8")).hexdigest()
 
 _DEFAULT_DDL = """
 CREATE TABLE IF NOT EXISTS audit_log (
@@ -123,6 +134,25 @@ CREATE INDEX IF NOT EXISTS idx_upg_ts ON upgrade_events(ts);
 CREATE INDEX IF NOT EXISTS idx_ticket_status ON tickets(status);
 CREATE INDEX IF NOT EXISTS idx_ttimeline_ticket ON ticket_timeline(ticket_id);
 CREATE INDEX IF NOT EXISTS idx_outbox_status ON notification_outbox(status, next_attempt_ts);
+CREATE TABLE IF NOT EXISTS hazard_ops (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    created_ts REAL NOT NULL,
+    action TEXT NOT NULL,
+    subject TEXT NOT NULL DEFAULT '',
+    idem_key TEXT NOT NULL,
+    target TEXT NOT NULL DEFAULT '',
+    request_hash TEXT NOT NULL,
+    status TEXT NOT NULL,
+    receipt TEXT DEFAULT '',
+    error_code TEXT DEFAULT '',
+    detail TEXT DEFAULT ''
+);
+-- 部分唯一索引（SM-10 幂等预留裁决）：只有 applied 行参与唯一约束——replayed/conflicted
+-- 痕不占键，同键重放/冲突审计可无限追加。并发裁决：INSERT 撞此索引（语句级回滚）→
+-- 重查 applied 行 → 同哈希=重放收据 / 异哈希=冲突痕先落库再 409。
+CREATE UNIQUE INDEX IF NOT EXISTS ux_hazard_ops_active
+    ON hazard_ops(action, subject, idem_key) WHERE status='applied';
+CREATE INDEX IF NOT EXISTS idx_hazard_ops_key ON hazard_ops(action, subject, idem_key);
 """
 
 # ── 五阶段回路定义（新库建表即带列；旧库由 _migrate 非破坏补列）────────────────
@@ -154,13 +184,25 @@ class AuditStore:
         self._path = db_path or os.getenv(
             "AUDIT_DB_PATH", os.path.join("data", "audit.db"))
         os.makedirs(os.path.dirname(self._path) or ".", exist_ok=True)
-        self._lock = threading.Lock()
+        # RLock（可重入）：SM-10 多步消费事务在持锁内复用既有写入方法
+        # （create_ticket / mark_hazard_suggestion / record_ticket_event），
+        # 这些方法会再次 acquire 同一把锁——Lock 会死锁，RLock 允许嵌套。
+        self._lock = threading.RLock()
+        # 显式多步事务标记（持锁内读写）：置位期间各写入方法**不提前 commit**，
+        # 由事务收口统一 commit / 任一步失败整体 rollback（零半提交）。
+        self._in_tx = False
         self._con = sqlite3.connect(self._path, check_same_thread=False)
         self._con.row_factory = sqlite3.Row
         with self._lock:
             self._con.execute("PRAGMA journal_mode=WAL")
             self._con.executescript(_DEFAULT_DDL)
             self._migrate_locked()
+            self._commit()
+
+    def _commit(self) -> None:
+        """提交当前写事务。显式多步事务（_in_tx=True）期间不提交——收口统一 commit，
+        保证"预留→去重→工单→标记→入队"要么全提交要么全回滚（SM-10 §2.1）。"""
+        if not self._in_tx:
             self._con.commit()
 
     def _migrate_locked(self) -> None:
@@ -230,7 +272,7 @@ class AuditStore:
                 (time.time(), request_id, user_id, conv_id, _preview(message),
                  intent, urgency, int(escalated), latency_ms,
                  int(degraded), int(knowledge_used)))
-            self._con.commit()
+            self._commit()
 
     def list_audit(self, limit: int = 100, escalated_only: bool = False) -> List[Dict[str, Any]]:
         with self._lock:
@@ -249,7 +291,7 @@ class AuditStore:
                 "INSERT INTO upgrade_events (ts, request_id, user_id, conv_id,"
                 " message_preview, intent) VALUES (?,?,?,?,?,?)",
                 (time.time(), request_id, user_id, conv_id, _preview(message), intent))
-            self._con.commit()
+            self._commit()
             return cur.lastrowid
 
     def mark_notified(self, upgrade_id: int, channel: str) -> None:
@@ -257,7 +299,7 @@ class AuditStore:
             self._con.execute(
                 "UPDATE upgrade_events SET notified=1, notify_channel=? WHERE id=?",
                 (channel, upgrade_id))
-            self._con.commit()
+            self._commit()
 
     def list_upgrades(self, limit: int = 50, unacked_only: bool = False) -> List[Dict[str, Any]]:
         with self._lock:
@@ -273,7 +315,7 @@ class AuditStore:
             cur = self._con.execute(
                 "UPDATE upgrade_events SET ack=1, ack_ts=? WHERE id=? AND ack=0",
                 (time.time(), upgrade_id))
-            self._con.commit()
+            self._commit()
             return cur.rowcount > 0
 
     # ── 通知 outbox（持久待发送记录 + 送达/确认状态）────────────────────────
@@ -289,11 +331,15 @@ class AuditStore:
     )
 
     @staticmethod
-    def _dumps_payload(payload: Any) -> str:
+    def _dumps_payload(payload: Any, idempotency_key: str = "") -> str:
         """payload 允许 dict（落 JSON 字符串）或已是字符串（原样保留）。
-        不可序列化时直接抛错——调用方在持锁/落库前调用，保证不留半成品行。"""
+        不可序列化时直接抛错——调用方在持锁/落库前调用，保证不留半成品行。
+        idempotency_key 非空时注入 payload 顶层（SM-10 §2.5.3）：渠道侧按它对
+        reap 重投的同一行去重——重投 payload 逐字节相同、行数恒 1。"""
         if isinstance(payload, str):
             return payload
+        if idempotency_key and isinstance(payload, dict) and "idempotency_key" not in payload:
+            payload = {**payload, "idempotency_key": idempotency_key}
         return json.dumps(payload, ensure_ascii=False)
 
     def _notification_public(self, row: sqlite3.Row) -> Dict[str, Any]:
@@ -328,11 +374,11 @@ class AuditStore:
                              upgrade_id: Optional[int] = None) -> int:
         """入队一条待发送通知（幂等：同键重复投递不新增，返回既有 id）。
         channel 传实际 webhook URL；未配置时传 '' （仍入库，last_error='未配置通知渠道'）。"""
-        text = self._dumps_payload(payload)      # 落库前序列化，失败不留半成品
+        text = self._dumps_payload(payload, idempotency_key)   # 落库前序列化（含幂等键注入），失败不留半成品
         with self._lock:
             oid = self._enqueue_locked(idempotency_key, channel, text, request_id,
                                        ticket_id, upgrade_id)
-            self._con.commit()
+            self._commit()
         return oid
 
     def claim_pending_notifications(self, limit: int = 10, max_attempts: int = 5,
@@ -373,7 +419,7 @@ class AuditStore:
                     d["attempts"] = int(d.get("attempts") or 0) + 1
                     d["next_attempt_ts"] = now
                     claimed.append(d)
-                self._con.commit()
+                self._commit()
             except sqlite3.Error:
                 self._con.rollback()
                 raise
@@ -385,7 +431,7 @@ class AuditStore:
             cur = self._con.execute(
                 "UPDATE notification_outbox SET status='sent', sent_ts=?, last_error=''"
                 " WHERE id=?", (time.time(), notification_id))
-            self._con.commit()
+            self._commit()
             return cur.rowcount > 0
 
     def mark_notification_failed(self, notification_id: int, error: str,
@@ -397,7 +443,7 @@ class AuditStore:
                 "UPDATE notification_outbox SET status='failed', last_error=?,"
                 " next_attempt_ts=? WHERE id=?",
                 (str(error or "")[:500], now + max(0.0, float(backoff_s or 0.0)), notification_id))
-            self._con.commit()
+            self._commit()
             return cur.rowcount > 0
 
     def ack_notification(self, notification_id: int, actor: str = "") -> bool:
@@ -406,7 +452,7 @@ class AuditStore:
             cur = self._con.execute(
                 "UPDATE notification_outbox SET status='ack', acked_ts=? WHERE id=? AND status!='ack'",
                 (time.time(), notification_id))
-            self._con.commit()
+            self._commit()
             return cur.rowcount > 0
 
     def reap_stale_sending(self, stale_s: float = 120.0, now: Optional[float] = None) -> int:
@@ -420,7 +466,7 @@ class AuditStore:
                 "UPDATE notification_outbox SET status='pending'"
                 " WHERE status='sending' AND MAX(created_ts, COALESCE(next_attempt_ts, 0))<?",
                 (cutoff,))
-            self._con.commit()
+            self._commit()
             return int(cur.rowcount)
 
     def get_notification(self, notification_id: int) -> Optional[Dict[str, Any]]:
@@ -451,7 +497,7 @@ class AuditStore:
                 "UPDATE notification_outbox SET status='pending', attempts=0,"
                 " next_attempt_ts=0, last_error='', sent_ts=NULL WHERE id=?",
                 (notification_id,))
-            self._con.commit()
+            self._commit()
             return cur.rowcount > 0
 
     def notification_stats(self) -> Dict[str, Any]:
@@ -492,7 +538,8 @@ class AuditStore:
         # payload 序列化在持锁之前完成：不可序列化直接抛错，不留半成品行。
         notification_text = None
         if notification:
-            notification_text = self._dumps_payload(notification.get("payload", {}))
+            notification_text = self._dumps_payload(notification.get("payload", {}),
+                                                    notification.get("idempotency_key", ""))
         with self._lock:
             cur = self._con.execute(
                 "INSERT INTO tickets (created_ts, title, type, priority, assignee,"
@@ -522,7 +569,7 @@ class AuditStore:
                     notification.get("request_id", "") or source_request_id,
                     notification.get("ticket_id") or tid,
                     notification.get("upgrade_id"))
-            self._con.commit()
+            self._commit()
             return tid
 
     def _ticket_row_locked(self, ticket_id: int) -> Optional[sqlite3.Row]:
@@ -592,20 +639,43 @@ class AuditStore:
                                  f" → {STAGE_LABELS.get(to_stage, to_stage)}"}
             now = time.time()
             closing = to_stage in ("accept", "reject")
+            # 条件更新（SM-10 §2.3.4）："读 stage → 校验 → UPDATE"的 check-then-act 在
+            # 并发下有两个赢者——WHERE stage=? 兜底，败者 rowcount=0 落结构化冲突 + 审计行。
             if closing:
-                self._con.execute(
-                    "UPDATE tickets SET stage=?, status='closed', closed_ts=? WHERE id=?",
-                    (to_stage, now, ticket_id))
+                cur = self._con.execute(
+                    "UPDATE tickets SET stage=?, status='closed', closed_ts=?"
+                    " WHERE id=? AND stage=?",
+                    (to_stage, now, ticket_id, from_stage))
             else:  # 回退/推进到中间阶段：恢复在办态，闭环时长随之失效
+                cur = self._con.execute(
+                    "UPDATE tickets SET stage=?, status='open', closed_ts=NULL"
+                    " WHERE id=? AND stage=?",
+                    (to_stage, ticket_id, from_stage))
+            if cur.rowcount != 1:
+                latest = self._ticket_row_locked(ticket_id)
+                current_stage = self._norm_stage(latest["stage"], latest["status"]) \
+                    if latest is not None else from_stage
+                conflict_detail = {"expected": {"stage": from_stage},
+                                   "current": {"stage": current_stage},
+                                   "requested": to_stage}
                 self._con.execute(
-                    "UPDATE tickets SET stage=?, status='open', closed_ts=NULL WHERE id=?",
-                    (to_stage, ticket_id))
+                    "INSERT INTO ticket_timeline (ticket_id, ts, action, from_stage,"
+                    " to_stage, actor, note, detail) VALUES (?,?,?,?,?,?,?,?)",
+                    (ticket_id, now, "stage_conflict", from_stage, "",
+                     actor or "system", "工单阶段已被并发修改，本次流转被拒",
+                     json.dumps(conflict_detail, ensure_ascii=False)))
+                self._commit()
+                return {"ok": False, "kind": "conflict", "from_stage": from_stage,
+                        "current_stage": current_stage,
+                        "error": f"工单阶段已被并发修改（当前 "
+                                 f"{STAGE_LABELS.get(current_stage, current_stage)}），"
+                                 f"请刷新后重试"}
             self._con.execute(
                 "INSERT INTO ticket_timeline (ticket_id, ts, action, from_stage,"
                 " to_stage, actor, note, detail) VALUES (?,?,?,?,?,?,?,?)",
                 (ticket_id, now, "stage_change", from_stage, to_stage,
                  actor, note, json.dumps(detail or {}, ensure_ascii=False)))
-            self._con.commit()
+            self._commit()
             new_row = self._ticket_row_locked(ticket_id)
             return {"ok": True, "from_stage": from_stage, "to_stage": to_stage,
                     "ticket": self._ticket_dict(new_row)}
@@ -622,7 +692,7 @@ class AuditStore:
                 " to_stage, actor, note, detail) VALUES (?,?,?,?,?,?,?,?)",
                 (ticket_id, time.time(), action, from_stage, to_stage,
                  actor, note, json.dumps(detail or {}, ensure_ascii=False)))
-            self._con.commit()
+            self._commit()
         return True
 
     def get_ticket_timeline(self, ticket_id: int) -> Optional[List[Dict[str, Any]]]:
@@ -729,7 +799,7 @@ class AuditStore:
                 " to_stage, actor, note, detail) VALUES (?,?,?,?,?,?,?,?)",
                 (ticket_id, now, "legacy_close", self._norm_stage(row["stage"], row["status"]),
                  "accept", "admin", "旧接口闭环，视同验收完成", ""))
-            self._con.commit()
+            self._commit()
             return True
 
     # ── 隐患工单（hazard gate 暂存/去重/逾期/改判）──────────────────────────
@@ -745,7 +815,7 @@ class AuditStore:
                 " VALUES (?,?,?,?,?,NULL,'pending')",
                 (request_id, time.time(), user_id, conv_id,
                  json.dumps(payload, ensure_ascii=False)))
-            self._con.commit()
+            self._commit()
 
     def classify_hazard_suggestion(self, request_id: str,
                                    max_age_hours: float = 24.0) -> str:
@@ -795,8 +865,217 @@ class AuditStore:
             cur = self._con.execute(
                 "UPDATE hazard_suggestions SET status=?, ticket_id=COALESCE(?, ticket_id)"
                 " WHERE request_id=?", (status, ticket_id, request_id))
-            self._con.commit()
+            self._commit()
             return cur.rowcount > 0
+
+    # ── SM-10：带显式幂等键的写入事务（预留→去重→工单→标记→入队 单 BEGIN IMMEDIATE）──
+    def _reserve_op_locked(self, action: str, subject: str, idem_key: str,
+                           target: str, request_hash: str) -> Dict[str, Any]:
+        """持锁 + 显式事务内插入幂等预留行（status='applied'）。
+
+        撞部分唯一索引（并发或顺序上的同键重放/冲突）→ 语句级回滚、事务仍活 →
+        重查已 applied 行裁决：同哈希 → 追加 replayed 痕并返回原收据（重放唯一数据源）；
+        异哈希 → conflicted 痕先落库（expected/current 双方哈希，可事后回放）再由调用方抛 409。
+        返回 {"kind": "reserved", "op_id": ...} | {"kind": "replayed", "receipt": ...}
+            | {"kind": "conflict", "detail": ...}。"""
+        try:
+            cur = self._con.execute(
+                "INSERT INTO hazard_ops (created_ts, action, subject, idem_key, target,"
+                " request_hash, status, receipt) VALUES (?,?,?,?,?,?,'applied','')",
+                (time.time(), action, subject, idem_key, target, request_hash))
+            return {"kind": "reserved", "op_id": int(cur.lastrowid or 0)}
+        except sqlite3.IntegrityError:
+            row = self._con.execute(
+                "SELECT * FROM hazard_ops WHERE action=? AND subject=? AND idem_key=?"
+                " AND status='applied' ORDER BY id DESC LIMIT 1",
+                (action, subject, idem_key)).fetchone()
+            if row is not None and row["request_hash"] == request_hash and row["receipt"]:
+                self._con.execute(
+                    "INSERT INTO hazard_ops (created_ts, action, subject, idem_key, target,"
+                    " request_hash, status) VALUES (?,?,?,?,?,?,'replayed')",
+                    (time.time(), action, subject, idem_key, target, request_hash))
+                # replayed 痕的提交由调用方收口（痕不参与唯一裁决）
+                return {"kind": "replayed", "receipt": json.loads(row["receipt"])}
+            detail = {
+                "expected": {"request_hash": row["request_hash"] if row else "",
+                             "target": row["target"] if row else ""},
+                "current": {"request_hash": request_hash, "target": target},
+            }
+            self._con.execute(
+                "INSERT INTO hazard_ops (created_ts, action, subject, idem_key, target,"
+                " request_hash, status, error_code, detail)"
+                " VALUES (?,?,?,?,?,?,'conflicted',?,?)",
+                (time.time(), action, subject, idem_key, target, request_hash,
+                 "IDEMPOTENCY_CONFLICT", json.dumps(detail, ensure_ascii=False)))
+            # 冲突行先落库再抛（映射文档 §1：冲突也是审计行）；提交由调用方收口
+            return {"kind": "conflict", "detail": detail}
+
+    def consume_hazard_suggestion(
+            self, request_id: str, user_id: str, actor: str,
+            idem_action: str, idem_subject: str, idem_key: str, request_hash: str,
+            new_ticket_fn: Optional[Callable[[Dict[str, Any], Dict[str, Any]],
+                                             Dict[str, Any]]] = None,
+            notify_fn: Optional[Callable[[Dict[str, Any]], Dict[str, Any]]] = None,
+            require_owner: Optional[str] = None,
+            max_age_hours: float = 24.0) -> Dict[str, Any]:
+        """带显式幂等键的确认消费（SM-10 §2.1 五步一个 BEGIN IMMEDIATE 写事务）：
+
+          1. 幂等预留（hazard_ops applied 行，撞唯一索引=重放/冲突裁决，见 _reserve_op_locked）；
+          2. 建议行判定 + 去重 + 工单变更（未命中→建 tickets+timeline；命中→repeat_report 一行）；
+          3. 建议状态迁移 pending→confirmed/merged（+ticket_id）；
+          4. outbox 入队（INSERT OR IGNORE，同键不新增）；
+          5. 收据回填 hazard_ops.receipt → 统一 commit。
+
+        任一步失败（含故障注入）→ 全体回滚：建议仍 pending、零工单、零时间线、零 outbox 行、
+        预留行消失，同键重试重新执行完整消费（零半提交）。
+
+        **预留裁决先于建议读取**：同键并发/重试的第二消费者在预留步即拿到原收据返回，
+        绝不读建议行（赢家提交后建议已 handled，先读会误 404——T1 竞态的根因）。
+        建议不在 pending（missing/handled）→ 回滚（预留行消失）→ 调用方 404；
+        已过期 → 回滚 → 调用方走既有 expired 独立事务 + 409（SM-01 契约保留）。
+
+        new_ticket_fn(decision, brief) → create_ticket 的业务参数（title/priority/due_ts/
+        severity/responsible_dept，由 api 层单一推导）；notify_fn(decision) →
+        {"channel","text","reason"}（outbox payload 由本方法组装并注入幂等键）。
+        返回 kind: applied（含 ticket_id/merged/receipt）/ replayed（含 receipt）/
+        conflict（含 detail）/ forbidden / rejected（state=missing|handled）/ expired。
+        require_owner 非 None 时校验建议归属（隔离形态的服务端主体），不一致回滚并回 forbidden。"""
+        with self._lock:
+            self._con.execute("BEGIN IMMEDIATE")
+            self._in_tx = True
+            try:
+                res = self._reserve_op_locked(idem_action, idem_subject, idem_key,
+                                              request_id, request_hash)
+                if res["kind"] in ("replayed", "conflict"):
+                    self._con.commit()   # 裁决痕收口（重放/冲突不产生任何业务行）
+                    return res
+                # 事务内读建议行（此刻建议状态在写锁保护下，无 check-then-act 窗口）
+                row = self._con.execute(
+                    "SELECT * FROM hazard_suggestions WHERE request_id=?",
+                    (request_id,)).fetchone()
+                if row is None:
+                    self._con.rollback()
+                    return {"kind": "rejected", "state": "missing"}
+                # 归属校验（S-05，隔离形态）：主体不一致 → 回滚预留行 → 调用方 403。
+                # 事务内判定避免"先读后写"窗口，且 403 与 404 的既有优先级不变。
+                if require_owner is not None and str(row["user_id"] or "") != require_owner:
+                    self._con.rollback()
+                    return {"kind": "forbidden"}
+                if row["status"] == "expired":
+                    self._con.rollback()
+                    return {"kind": "expired"}
+                if row["status"] != "pending" or row["ticket_id"] is not None:
+                    self._con.rollback()
+                    return {"kind": "rejected", "state": "handled"}
+                if time.time() - row["created_ts"] > max_age_hours * 3600:
+                    self._con.rollback()
+                    return {"kind": "expired"}
+                try:
+                    payload = json.loads(row["payload"]) if row["payload"] else {}
+                except (ValueError, TypeError):
+                    payload = None
+                if not isinstance(payload, dict):
+                    self._con.rollback()
+                    return {"kind": "rejected", "state": "handled"}
+                decision = payload.get("decision") or {}
+                brief = payload.get("brief") or {}
+                # 步骤 2：去重判定（self.find_open_hazard_duplicate 为测试注入点）与其结果写入
+                dup = self.find_open_hazard_duplicate(
+                    user_id, brief.get("entities") or {})
+                if dup is not None:
+                    tid, merged = int(dup["id"]), True
+                    self.record_ticket_event(
+                        tid, "repeat_report", actor=actor,
+                        note="24 小时内同实体重复上报，合并进本工单",
+                        detail={"request_id": request_id,
+                                "severity": str(decision.get("severity", "") or "")})
+                else:
+                    p = dict(new_ticket_fn(decision, brief) if new_ticket_fn else {})
+                    title = p.pop("title", "")
+                    tid = self.create_ticket(
+                        title, type_="hazard", source_request_id=request_id,
+                        brief=brief, actor=actor, user_id=user_id, **p)
+                    merged = False
+                # 步骤 3：建议状态迁移（self.mark_hazard_suggestion 为测试注入点；
+                # RLock 重入 + _in_tx 期间不提前 commit）
+                self.mark_hazard_suggestion(
+                    request_id, "merged" if merged else "confirmed", ticket_id=tid)
+                # 步骤 4：outbox 入队（同事务，对齐应急路径 create_ticket+outbox 形态）
+                if notify_fn is not None:
+                    n = notify_fn(decision) or {}
+                    key = f"ticket:{tid}:{n.get('reason') or 'create'}:webhook"
+                    n_payload = {"request_id": request_id, "text": str(n.get("text", "")),
+                                 "timeline": {"ticket_id": tid, "note": "派单 webhook 已实收",
+                                              "to_stage": "brief", "request_id": request_id}}
+                    self._enqueue_locked(key, n.get("channel", "") or "",
+                                         self._dumps_payload(n_payload, key),
+                                         request_id, tid, None)
+                # 步骤 5：收据回填 + 统一提交
+                receipt = {"ok": True, "ticket_id": tid, "merged": merged}
+                self._con.execute("UPDATE hazard_ops SET receipt=? WHERE id=?",
+                                  (json.dumps(receipt, ensure_ascii=False),
+                                   res["op_id"]))
+                self._con.commit()
+                return {"kind": "applied", "ticket_id": tid, "merged": merged,
+                        "receipt": receipt}
+            except BaseException:
+                try:
+                    self._con.rollback()
+                except sqlite3.Error:
+                    pass
+                raise
+            finally:
+                self._in_tx = False
+
+    def reserve_emergency_ticket(self, idem_key: str, target: str, request_hash: str,
+                                 user_id: str, conv_id: str, message: str,
+                                 intent_value: str, title: str, brief: Dict[str, Any],
+                                 channel: str, payload: Dict[str, Any]) -> Dict[str, Any]:
+        """应急快速分流建单（SM-10 §2.4）：幂等预留 + 升级事件 + 建单（含 outbox 同事务入队）
+        一个 BEGIN IMMEDIATE——同一上报编号绝不产生第二张单/第二条升级事件。
+
+        败者撞唯一索引 → 重查 applied 行 → 重放已有 ticket_id（绝不新建）；
+        同 rid 异内容落 conflicted 痕可回放，但**仍重放既有单**（快速分流绝不抛出、
+        行为零弱化：同号检查的既有幂等语义保持）。返回 {"kind": "applied"|"replayed",
+        "ticket_id", "receipt"?}。"""
+        with self._lock:
+            self._con.execute("BEGIN IMMEDIATE")
+            self._in_tx = True
+            try:
+                res = self._reserve_op_locked("emergency_ticket", "", idem_key,
+                                              target, request_hash)
+                if res["kind"] == "replayed":
+                    self._con.commit()
+                    return {"kind": "replayed",
+                            "ticket_id": int(res["receipt"].get("ticket_id") or 0)}
+                if res["kind"] == "conflict":
+                    row = self._con.execute(
+                        "SELECT receipt FROM hazard_ops WHERE action=? AND subject=?"
+                        " AND idem_key=? AND status='applied' ORDER BY id DESC LIMIT 1",
+                        ("emergency_ticket", "", idem_key)).fetchone()
+                    receipt = json.loads(row["receipt"]) if row and row["receipt"] else {}
+                    self._con.commit()   # 冲突痕/重放收口：快速分流不抛出，仍重放既有单
+                    return {"kind": "replayed", "ticket_id": int(receipt.get("ticket_id") or 0)}
+                upgrade_id = self.add_upgrade(target, user_id, conv_id, message, intent_value)
+                ticket_id = self.create_ticket(
+                    title, type_="emergency", priority="critical",
+                    source_request_id=target, brief=brief,
+                    notification={"idempotency_key": idem_key, "channel": channel,
+                                  "payload": payload, "request_id": target,
+                                  "upgrade_id": upgrade_id})
+                receipt = {"ticket_id": int(ticket_id), "upgrade_id": int(upgrade_id)}
+                self._con.execute("UPDATE hazard_ops SET receipt=? WHERE id=?",
+                                  (json.dumps(receipt, ensure_ascii=False), res["op_id"]))
+                self._con.commit()
+                return {"kind": "applied", "ticket_id": int(ticket_id), "receipt": receipt}
+            except BaseException:
+                try:
+                    self._con.rollback()
+                except sqlite3.Error:
+                    pass
+                raise
+            finally:
+                self._in_tx = False
 
     def find_open_hazard_duplicate(self, user_id: str, entities: Dict[str, Any],
                                    window_hours: float = 24.0) -> Optional[Dict[str, Any]]:
@@ -887,7 +1166,7 @@ class AuditStore:
                 " to_stage, actor, note, detail) VALUES (?,?,?,?,?,?,?,?)",
                 (ticket_id, time.time(), "patch", "", "", actor, note or "工单信息修改",
                  json.dumps(detail, ensure_ascii=False)))
-            self._con.commit()
+            self._commit()
             new_row = self._ticket_row_locked(ticket_id)
             return {"ok": True, "ticket": self._ticket_dict(new_row)}
 
