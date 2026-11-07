@@ -258,7 +258,8 @@ def phase_real_entry():
                json.dumps(esc.get("ticket"), ensure_ascii=False))
         record("升级用例读到通知队列状态（待发送记录已入队）",
                bool(esc.get("notifications"))
-               and esc["notifications"][0]["status"] == "pending",
+               and esc["notifications"][0]["status"] == "waiting"
+               and esc["notifications"][0]["attempts"] == 0,
                json.dumps(esc.get("notifications"), ensure_ascii=False))
 
         hot = _case(report, "hotwork-red")
