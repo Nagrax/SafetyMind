@@ -20,8 +20,14 @@
  *     于是**已入库的历史密钥扫不出来**（真实 key 就是这样漏过去的）；
  *   - 补齐此前缺失的形态：中继 32hex.20、sk-ws-、glpat-、AKIA、AIza、xox、微信 AppID；
  *   - 模式本身是 JS 正则字面量，本文件不再内嵌任何密钥形态的样例。
+ * 2026-11-07 SM-00 加固：提交前文件 allowlist（--allow <file>）。
+ *   背景：add -A 会把工作树里**所有**未提交改动卷进提交（2026-11-06 真实事故），
+ *   清单打印是事后诸葛亮。--allow 把"本次提交允许哪些文件"变成**前置硬门禁**：
+ *   变更集（staged+unstaged+untracked 逐文件）里任何清单外路径都在 git add 之前
+ *   以退出码 8 拒绝；--check 模式同样校验。不带 --allow 时行为与原来完全一致。
  */
 import { execFileSync } from 'node:child_process'
+import { readFileSync } from 'node:fs'
 import path from 'node:path'
 import {
   formatHits, formatPrivacyHits, loadPrivacyRules, loadRules, scanFiles, scanPrivacyFiles,
@@ -35,6 +41,7 @@ const getArg = (name, dflt = '') => {
 const message = getArg('-m', getArg('--message', ''))
 const noPush = args.includes('--no-push')
 const checkOnly = args.includes('--check')
+const allowFile = getArg('--allow')
 
 const git = (cmdArgs, opts = {}) =>
   execFileSync('git', cmdArgs, { encoding: 'utf8', stdio: ['ignore', 'pipe', 'pipe'], ...opts }).trim()
@@ -64,6 +71,41 @@ const bad = candidates.filter(f => !allowed(f) && FORBIDDEN.some(re => re.test(f
 if (bad.length) {
   console.error('✖ 拒绝提交敏感路径：\n  ' + bad.join('\n  '))
   process.exit(2)
+}
+
+// ── 1b. 文件 allowlist（--allow <file>）：变更超出清单就在 git add 之前失败 ──
+// 清单格式：# 注释；每行一个仓库根相对路径；目录以 / 结尾（前缀匹配）。
+// 变更集用 status --porcelain -uall（逐文件枚举 untracked，含 staged 与 rename 两端）。
+if (allowFile) {
+  let entries
+  try {
+    entries = readFileSync(allowFile, 'utf8').split(/\r?\n/)
+      .map(s => s.trim()).filter(s => s && !s.startsWith('#'))
+  } catch (e) {
+    console.error(`✖ --allow 清单不可读: ${allowFile}`)
+    process.exit(8)
+  }
+  // core.quotepath 默认把非 ASCII 路径转成八进制转义，allowlist（UTF-8 原名）会匹配不上；
+  // git() 帮助函数会 trim 整个输出，porcelain 首行 " M path" 的前导空格被吃掉后，
+  // 行内就没有"状态位+分隔空格"的形态了（踩过：'d' 被砍成 'ocs/'、整行被丢弃）。
+  // 因此这里必须用原始 execFileSync（不 trim）+ 两位状态正则逐行解析。
+  const statusOut = execFileSync('git', ['-c', 'core.quotepath=off', 'status', '--porcelain', '-uall'],
+    { encoding: 'utf8', stdio: ['ignore', 'pipe', 'pipe'] })
+  const changed = statusOut.split('\n').map(l => {
+    const m = /^(..)\s+(.+)$/.exec(l)
+    return m ? m[2].replace(/^"|"$/g, '') : null
+  }).filter(Boolean)
+  const changedFiles = [...new Set(changed.flatMap(f => f.includes(' -> ') ? f.split(' -> ') : [f]))]
+  const offenders = changedFiles.filter(f => {
+    if (f.startsWith('..') || path.isAbsolute(f)) return true
+    return !entries.some(e => e.endsWith('/') ? f.startsWith(e) : f === e)
+  })
+  if (offenders.length) {
+    console.error('✖ 变更超出允许清单（--allow），已在 git add 之前拒绝：\n  ' + offenders.join('\n  '))
+    console.error('  （把本卡要提交的文件写进清单；清单外改动请留给它的归属任务）')
+    process.exit(8)
+  }
+  console.log(`• allowlist 校验通过：${changedFiles.length} 个变更文件都在清单内（${entries.length} 条规则）`)
 }
 
 // ── 2. 密钥扫描（全部已跟踪文件 + 候选文件）──────────────────────────────
