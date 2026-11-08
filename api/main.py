@@ -3447,8 +3447,14 @@ async def ledger_templates():
 
 
 @app.post("/ledger/export", tags=["台账"])
-async def ledger_export_endpoint(body: LedgerExportRequest):
+async def ledger_export_endpoint(body: LedgerExportRequest,
+                                 _admin: None = Depends(require_admin)):
     """生成台账文件并返回落盘路径。
+
+    主体边界（闭环发现 export-subject-scope，对齐 SM-42 同范式）：台账文件生成是
+    管理端动作，部署/网络形态必须持 X-Admin-Token（require_admin，语义同
+    /ledger/acceptance-summary/{preview,export}）；本地单人形态逐字节不变（免密自动放行）。
+    产物为静态法定模板、不含库内主体数据，故无需 owner-or-admin 下载级边界。
 
     说明：
       - .xlsx 走 openpyxl（主环境已有，零新增依赖）；

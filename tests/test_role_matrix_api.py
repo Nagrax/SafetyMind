@@ -13,13 +13,15 @@
 #               通道 GET /tickets/{id}/timeline（200，用户端 progress 仍归属受限）；无令牌 401
 #   确认建议    仅本人 200（建议确认+建单+时间线+通知四表精确落库）；匿名/他人/管理员/撤权
 #               一律 403 且 DB 零变化；无令牌 401
-#   导出下载    无令牌 401；持访问令牌者 200 —— 当前产品无主体/角色边界（实测立案 RF-1：
-#               skill safety_ledger_assistant 面向安全员产出台账，属设计取舍不修；导出内容为
-#               静态法定模板，无跨主体数据，G1 数据跨界=0）
+#   导出下载    仅授权管理员 200（RF-1 已修复：2026-11-09 闭环发现 export-subject-scope，
+#               对齐 SM-42 同范式 require_admin）；匿名/本人/他人/撤权 401 且零文件落盘；
+#               无令牌 401（产物为静态法定模板，无跨主体数据，G1 数据跨界=0 不变）
 #   管理端改判  仅管理员 200（severity 改判 + patch 时间线留痕）；其余主体 401 且 DB 零变化
 #
-# 立案记录（实测发现、按设计取舍不修，详见红灯实测 JSON）：
+# 立案记录（实测发现；RF-1 原按设计取舍不修，2026-11-09 经闭环台账修复，其余详见红灯实测 JSON）：
 #   RF-1 /ledger/export 仅访问口令门、无角色边界（任何 access gate 持有者可触发服务端文件生成）
+#       —— 已修复：api/main.py 加 Depends(require_admin)；回归 tests/test_ledger_export_scope.py
+#          （红灯证据 scratch/sm-loop/handoff/findings-cleanup/api_main.py--export-subject-scope/）
 #   RF-2 导出文件名按秒时间戳，同秒并发导出互相覆盖（实测 files_created +0）
 #   RF-3 被拒越权写不留任何审计行 —— 探针断言取"DB 零变化"（比"只增对应拒绝事件"更严格）
 #
@@ -281,9 +283,11 @@ def main():
         cell("矩阵|确认建议|无访问令牌(外墙) → 401 且 DB 六表零变化", ok, detail)
 
         # ══ 动作 3：导出下载（POST /ledger/export，输出钉到临时目录）════════════
-        # 当前产品行为冻结（立案 RF-1）：任何 access gate 持有者可导出（无主体/角色边界）。
-        # G1 判定：导出内容为静态法定模板、不含任何主体数据 → 无跨界读取；落盘必须仍在
-        # 夹具目录（封闭性守卫：产品若改为写硬编码生产目录，此格立即红）。
+        # 主体边界（RF-1 已修复，闭环发现 export-subject-scope）：导出是管理端动作，
+        # 对齐 SM-42 同范式 require_admin —— 仅授权管理员 200；匿名/本人/他人/撤权
+        # 401 且零文件落盘。G1 判定不变：导出内容为静态法定模板、不含任何主体数据 →
+        # 无跨界读取；落盘必须仍在夹具目录（封闭性守卫：产品若改为写硬编码生产目录，
+        # 此格立即红）。
         b = db_snapshot()
         n0 = len(list(ledger_out.iterdir()))
         r = client.post("/ledger/export", json={"ledger": "hazard", "format": "xlsx"})
@@ -293,16 +297,25 @@ def main():
              f"code={r.status_code} files+{n1 - n0} delta={db_delta(b, db_snapshot())}")
 
         for subj, tok in (("匿名", ""), ("本人", TOKEN_A), ("他人(u-B)", TOKEN_B),
-                          ("授权管理员(u-ADM)", TOKEN_ADM), ("凭据撤销后(u-C)", TOKEN_C)):
+                          ("凭据撤销后(u-C)", TOKEN_C)):
             b = db_snapshot()
+            n0 = len(list(ledger_out.iterdir()))
             r = client.post("/ledger/export", json={"ledger": "hazard", "format": "xlsx"},
                             headers=hdr(tok))
-            body = r.json() if r.status_code == 200 else {}
-            path = str(body.get("path", ""))
-            cell(f"矩阵|导出下载|{subj} → 200 且产物在夹具目录、DB 零变化（RF-1 行为冻结）",
-                 r.status_code == 200 and body.get("ok") is True
-                 and str(ledger_out) in path and not db_delta(b, db_snapshot()),
-                 f"code={r.status_code} path={path[:120]} delta={db_delta(b, db_snapshot())}")
+            n1 = len(list(ledger_out.iterdir()))
+            cell(f"矩阵|导出下载|{subj} → 401 且零文件落盘、DB 零变化（RF-1 修复：require_admin 边界）",
+                 r.status_code == 401 and n1 == n0 and not db_delta(b, db_snapshot()),
+                 f"code={r.status_code} files+{n1 - n0} delta={db_delta(b, db_snapshot())}")
+
+        b = db_snapshot()
+        r = client.post("/ledger/export", json={"ledger": "hazard", "format": "xlsx"},
+                        headers=ahdr(TOKEN_ADM))
+        body = r.json() if r.status_code == 200 else {}
+        path = str(body.get("path", ""))
+        cell("矩阵|导出下载|授权管理员(u-ADM) → 200 且产物在夹具目录、DB 零变化",
+             r.status_code == 200 and body.get("ok") is True
+             and str(ledger_out) in path and not db_delta(b, db_snapshot()),
+             f"code={r.status_code} path={path[:120]} delta={db_delta(b, db_snapshot())}")
 
         xlsx_ok, xlsx_detail = False, ""
         try:

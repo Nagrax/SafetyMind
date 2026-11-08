@@ -15,6 +15,8 @@ enabled: true
 1. 调用 `POST /ledger/export`，参数 `{"ledger": "<类型>", "format": "xlsx", "demo": false}`。
    可选类型：`hazard`（隐患排查治理）、`inspection`（安全检查记录）、`training`（安全培训）、
    `ticket`（作业票管理）、`emergency_drill`（应急演练）。不确定类型时先调 `GET /ledger/templates` 列给用户选。
+   该端点是管理端动作：网络/部署形态需带 `X-Admin-Token`（本地单人形态免密）；
+   请求被 401 拒绝时如实说明"台账导出需管理员权限"，不要改口称已生成。
 2. 拿到 `path` 后，明确告诉用户：**文件已生成、完整路径、包含哪些列、哪些是空白可填**。
    不要把"已生成"说成"已归档"——归档仍需他自己走受控文件流程。
 3. 用户要 `.docx` 而环境缺 `python-docx` 时，接口会返回 409 并附补救建议；
