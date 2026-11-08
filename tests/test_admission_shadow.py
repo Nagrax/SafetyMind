@@ -21,6 +21,13 @@
 #   T4 续期：legacy 拒回退+留痕、有效快照回退放行、policy 换版/撤权/过期/跨主体（含 admin
 #       豁免）裁决、reject→feedback 同受校验、补授权后可回退；
 #   T5 escalation_basis 断言存在（确定性优先级 + 四出口 basis + ChatResponse 透传）。
+#   T1b 双端点影子守卫（2026-11-08 第二增量）：/chat/stream 普通路径复用 _chat_core
+#       （api/main.py 流式分支"复用 /chat 的完整实现"），observe 档影子/业务一致性与
+#       /chat 同构，done 事件携带完整 hazard 字段（两端口功能对齐）。守卫项：首跑预期
+#       PASS，RED 即两端分叉回归（任务卡 artifacts"两端点影子差异"的实证面）。
+#   T2b model_hint 摘出行为级 E2E（2026-11-08 第二增量）：桩 _orchestrator.run（免 LLM），
+#       mode=auto 下 hint-only 升级不建应急单/不入 escalate outbox、升级留痕、影子
+#       would_accept=0、隐患闸门不被抑制且 hazard 单带 bound 快照；escalated/basis 照回。
 #
 # 预期首跑 RED：T1 影子数据、T2 裁决单元与接线、T3/T4 机制项；守卫项（业务一致、CRITICAL
 # 零弱化、escalation_basis 语义）当前产品应真——防实现时弱化。
@@ -576,6 +583,204 @@ def t1_shadow_e2e(tmp_root):
                     s.close()
             except Exception:
                 pass
+    return biz_a
+
+
+# ── T1b 双端点影子守卫：/chat/stream 普通路径复用 _chat_core ──────────────────
+def _sse_events(raw: str):
+    """解析 SSE 文本 → [(event, data_dict)]；done 事件携带完整响应体（additive 契约）。"""
+    out = []
+    for block in raw.split("\n\n"):
+        ev, data = "", {}
+        for line in block.splitlines():
+            if line.startswith("event: "):
+                ev = line[7:].strip()
+            elif line.startswith("data: "):
+                try:
+                    data = json.loads(line[6:])
+                except json.JSONDecodeError:
+                    data = {}
+        if ev:
+            out.append((ev, data))
+    return out
+
+
+def _biz_snapshot(store, rid):
+    """业务六表行级快照（与 T1 的 biz() 同口径：tickets/outbox/timeline/建议/升级事件）。"""
+    tk = store.find_ticket_by_request(rid, "hazard")
+    t = store.get_ticket(tk) if tk else None
+    ob = qall(store._path, "SELECT kind, status FROM notification_outbox WHERE request_id=?", (rid,))
+    tl = qall(store._path, "SELECT action FROM ticket_timeline WHERE ticket_id=?", (tk or 0,))
+    sg = q1(store._path, "SELECT COUNT(*) AS n FROM hazard_suggestions WHERE request_id=?", (rid,))
+    up = q1(store._path, "SELECT COUNT(*) AS n FROM upgrade_events WHERE request_id=?", (rid,))
+    return {
+        "ticket": None if t is None else (
+            t["type"], t["priority"], t["stage"], t["status"], t["severity"],
+            t["responsible_dept"], t["urgency"], t["intent"],
+            json.dumps(t["entities"], sort_keys=True, ensure_ascii=False)),
+        "outbox": sorted((r["kind"], r["status"]) for r in ob),
+        "timeline": sorted({r["action"] for r in tl}),
+        "suggestions": int(sg["n"]) if sg else -1,
+        "upgrades": int(up["n"]) if up else -1,
+    }
+
+
+def t1b_shadow_stream(tmp_root, chat_off_biz):
+    from core import hazard_gate
+    from fastapi.testclient import TestClient
+    import api.main as api_main
+
+    db_c = str(Path(tmp_root) / f"t1b_off_{STAMP}.db")
+    db_d = str(Path(tmp_root) / f"t1b_obs_{STAMP}.db")
+    store_c = store_d = None
+    orig_decide = hazard_gate.decide
+    os.environ["SAFETYMIND_ADMISSION_MODE"] = "off"
+    try:
+        with TestClient(api_main.app) as client:            # lifespan：/chat 依赖
+            hazard_gate.decide = lambda *a, **k: dict(FAKE_AUTO)
+            msg = f"位号P-101储罐底部渗漏，需要处理（{STAMP}）"
+
+            # off 档流式：现行为（自动建单照旧），业务快照即流式基线
+            store_c = api_main.audit_store.AuditStore(db_c)
+            api_main._audit = store_c
+            r_c = client.post("/chat/stream", json={
+                "message": msg, "user_id": "u-shadow", "conv_id": f"c-s-off-{STAMP}"})
+            done_c = next((d for e, d in _sse_events(r_c.text) if e == "done"), {})
+            rid_c = str(done_c.get("request_id") or "")
+            record("T1b|off 档 /chat/stream 现行为（done 带完整 hazard 字段，HIGH+ 自动建单照旧）",
+                   r_c.status_code == 200 and done_c.get("hazard_action") == "auto_ticket"
+                   and int(done_c.get("hazard_ticket_id") or 0) > 0,
+                   f"code={r_c.status_code} action={done_c.get('hazard_action')} "
+                   f"tid={done_c.get('hazard_ticket_id')} rid={rid_c!r}")
+            biz_c = _biz_snapshot(store_c, rid_c)
+
+            # observe 档流式：建单/通知语义不弱化，唯一增量是影子行
+            store_d = api_main.audit_store.AuditStore(db_d)
+            api_main._audit = store_d
+            os.environ["SAFETYMIND_ADMISSION_MODE"] = "observe"
+            r_d = client.post("/chat/stream", json={
+                "message": msg, "user_id": "u-shadow", "conv_id": f"c-s-obs-{STAMP}"})
+            done_d = next((d for e, d in _sse_events(r_d.text) if e == "done"), {})
+            rid_d = str(done_d.get("request_id") or "")
+            record("T1b|observe 档 /chat/stream 建单语义不弱化（hazard 字段与 off 档一致）",
+                   done_d.get("hazard_action") == "auto_ticket"
+                   and int(done_d.get("hazard_ticket_id") or 0) > 0,
+                   f"action={done_d.get('hazard_action')} tid={done_d.get('hazard_ticket_id')}")
+            biz_d = _biz_snapshot(store_d, rid_d)
+
+            record("T1b|stream off vs observe 业务六表一致（影子零业务副作用）",
+                   biz_c == biz_d, f"off={biz_c} obs={biz_d}")
+            record("T1b|跨端点影子对照：stream observe 与 /chat off 基线业务一致",
+                   chat_off_biz == biz_d, f"chat_off={chat_off_biz} stream_obs={biz_d}")
+
+            obs_d = qall(db_d, "SELECT * FROM hazard_observations WHERE request_id=?", (rid_d,))
+            record("T1b|observe 档流式影子行存在且字段完整（would_accept/定级/大类/依据/部门/限期/主体/版本/现行动作）",
+                   len(obs_d) == 1 and obs_d[0].get("would_accept") in (0, 1)
+                   and obs_d[0].get("severity") == FAKE_AUTO["severity"]
+                   and obs_d[0].get("category") == FAKE_AUTO["category"]
+                   and (obs_d[0].get("basis") or "") == FAKE_AUTO["basis"]
+                   and obs_d[0].get("dept") == FAKE_AUTO["dept"]
+                   and float(obs_d[0].get("deadline_hours") or 0) == float(FAKE_AUTO["deadline_hours"])
+                   and obs_d[0].get("user_id") == "u-shadow"
+                   and (obs_d[0].get("policy_version") or "") != ""
+                   and obs_d[0].get("current_action") == "auto_ticket",
+                   f"rows={len(obs_d)} row={ {k: (obs_d[0] or {}).get(k) for k in ('would_accept', 'severity', 'category', 'basis', 'dept', 'deadline_hours', 'user_id', 'policy_version', 'current_action')} if obs_d else {} }")
+            n_c = q1(db_c, "SELECT COUNT(*) AS n FROM hazard_observations")
+            record("T1b|off 档流式零影子写入（现行为不产生观测行）",
+                   bool(n_c) and n_c["n"] == 0, f"n={n_c['n'] if n_c else '?'}")
+    finally:
+        hazard_gate.decide = orig_decide
+        os.environ["SAFETYMIND_ADMISSION_MODE"] = "off"
+        for s in (store_c, store_d):
+            try:
+                if s is not None:
+                    s.close()
+            except Exception:
+                pass
+
+
+# ── T2b model_hint 摘出行为级 E2E（auto 档，免 LLM：桩 _orchestrator.run）────────
+def t2b_model_hint_extraction(tmp_root):
+    from core import hazard_gate
+    from fastapi.testclient import TestClient
+    import api.main as api_main
+    from agents.agent_orchestrator import AgentType, OrchestratorResult
+
+    db_e = str(Path(tmp_root) / f"t2b_auto_{STAMP}.db")
+    orig_decide = hazard_gate.decide
+    orig_run = getattr(type(api_main._orchestrator), "run", None)
+    store_e = None
+    os.environ["SAFETYMIND_ADMISSION_MODE"] = "auto"
+    try:
+        with TestClient(api_main.app) as client:
+            hazard_gate.decide = lambda *a, **k: dict(FAKE_AUTO)
+
+            async def _stub_run(orch_req):
+                # 真 dataclass + 默认字段：escalation_basis=model_hint（仅 hint 命中场景）
+                return OrchestratorResult(
+                    request_id=f"stub-{STAMP}",
+                    response="（sm20 桩回答）已收到隐患上报，model_hint 摘出行为验证。",
+                    agent_type=AgentType.GENERAL,
+                    intent=orch_req.intent,
+                    escalated=True,
+                    escalation_basis="model_hint",
+                    latency_ms=1.0,
+                )
+
+            api_main._orchestrator.run = _stub_run          # 实例属性影子，finally 恢复
+            store_e = api_main.audit_store.AuditStore(db_e)
+            api_main._audit = store_e
+
+            msg = f"位号P-201管线法兰渗漏，需要处理（{STAMP}）"
+            r = client.post("/chat", json={"message": msg, "user_id": "u-hint",
+                                           "conv_id": f"c-hint-{STAMP}"})
+            b = r.json()
+            rid = str(b.get("request_id") or "")
+            record("T2b|auto 档 model_hint：escalated/escalation_basis 照回（分类不弱化）",
+                   r.status_code == 200 and b.get("escalated") is True
+                   and b.get("escalation_basis") == "model_hint",
+                   f"code={r.status_code} escalated={b.get('escalated')} "
+                   f"basis={b.get('escalation_basis')}")
+
+            def _count(sql, args):
+                row = q1(store_e._path, sql, args)
+                return int(row["n"]) if row else -1
+
+            n_emg = _count("SELECT COUNT(*) AS n FROM tickets"
+                           " WHERE source_request_id=? AND type='emergency'", (rid,))
+            n_esc = _count("SELECT COUNT(*) AS n FROM notification_outbox"
+                           " WHERE request_id=? AND kind='escalate'", (rid,))
+            record("T2b|auto 档 model_hint 不触发建单：零应急单、零 escalate 通知",
+                   n_emg == 0 and n_esc == 0, f"emergency={n_emg} escalate_outbox={n_esc}")
+
+            n_up = _count("SELECT COUNT(*) AS n FROM upgrade_events WHERE request_id=?", (rid,))
+            record("T2b|升级事件留痕（basis=model_hint 可观测）", n_up >= 1, f"upgrades={n_up}")
+
+            obs = qall(db_e, "SELECT * FROM hazard_observations"
+                             " WHERE request_id=? AND reason='model_hint_random'", (rid,))
+            record("T2b|影子记录 would_accept=0 reason=model_hint_random（差异列）",
+                   len(obs) == 1 and obs[0].get("would_accept") in (0, False),
+                   f"rows={len(obs)} row={ {k: (obs[0] or {}).get(k) for k in ('would_accept', 'reason')} if obs else {} }")
+
+            tk = store_e.find_ticket_by_request(rid, "hazard")
+            t = store_e.get_ticket(tk) if tk else None
+            record("T2b|隐患闸门未被抑制：hazard 单存在且 mandate_status=bound（auto 快照同事务）",
+                   t is not None and t.get("mandate_status") == "bound"
+                   and t.get("severity") == FAKE_AUTO["severity"],
+                   f"ticket={None if t is None else {k: t.get(k) for k in ('id', 'type', 'mandate_status', 'severity')}}")
+    finally:
+        hazard_gate.decide = orig_decide
+        os.environ["SAFETYMIND_ADMISSION_MODE"] = "off"
+        try:
+            if getattr(api_main, "_orchestrator", None) is not None and orig_run is not None:
+                api_main._orchestrator.run = orig_run       # 恢复原绑定方法
+        except Exception:
+            pass
+        try:
+            if store_e is not None:
+                store_e.close()
+        except Exception:
+            pass
 
 
 # ── T5 escalation_basis 断言存在（既有语义重申，零弱化守卫）──────────────────
@@ -629,7 +834,14 @@ def main():
         t2_critical_zero_weakening()
         t3_t4_snapshot_and_revalidation()
         t5_escalation_basis_guard()
-        t1_shadow_e2e(tmp_root)
+        chat_off_biz = t1_shadow_e2e(tmp_root)
+        t1b_shadow_stream(tmp_root, chat_off_biz)
+        t2b_model_hint_extraction(tmp_root)
+    except Exception:
+        # 测试体自身崩溃不得伪装全绿（2026-11-08 T2b 实测：sqlite 列名错在 finally
+        # 内 sys.exit(0) 吞掉异常、退出码 0——harness 诚实性缺陷，本行修复）。
+        RESULTS.append(False)
+        raise
     finally:
         failed = RESULTS.count(False)
         total = len(RESULTS)
