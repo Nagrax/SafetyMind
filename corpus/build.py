@@ -330,6 +330,23 @@ def _manifest_block_to_parsed(row: Dict[str, Any]) -> Dict[str, Any]:
             "kind": "text", "evidence_kind": BODY_KIND}
 
 
+def _collections_queryable(cols: Sequence[Any]) -> Optional[Exception]:
+    """写入后读回探测：query 才真正加载 HNSW 段（count() 不足以暴露段级损坏）。
+
+    背景（2026-11-08 门禁 wf-sm-41-c5 暴露）：本机 ChromaDB 1.5.9（Rust）在 Windows
+    上约 1/70 偶发写入后 HNSW 段不可读（"Error creating hnsw segment reader:
+    Nothing found on disk"）——此时 count() 仍通过、query() 才炸，因此
+    core/chroma_utils.open_local_chroma 的打开时 count 探测覆盖不到写入后的抖动。
+    返回 None=两条集合都可查；返回首个异常供调用方判定。
+    """
+    for col in cols:
+        try:
+            col.query(query_texts=["__storage_probe__"], n_results=1)
+        except Exception as ex:
+            return ex
+    return None
+
+
 def build_index(build_id: str, *, root: Optional[Any] = None,
                 source_providers: Optional[Sequence[str]] = None,
                 max_docs: int = 300, max_blocks: int = 30000, embed: bool = True,
@@ -460,6 +477,47 @@ def build_index(build_id: str, *, root: Optional[Any] = None,
         except Exception:
             pass
 
+    # ── 写入后读回自愈（最小修复，2026-11-08 门禁 wf-sm-41-c5 暴露）──────────────
+    # 段级抖动（写入后 HNSW 段不可读，count 过 query 炸）在本 build 收尾读回一次；
+    # 命中段级损坏则删除**本 build 的两条集合**并用内存中的全量数据重写一次（作用域
+    # 仅本 build，不触碰共享目录 indexes/chroma 里其他 build 的集合）；重写后仍不可
+    # 读则如实标记 storage_selfcheck="failed"，由存储自检（tests/_storage_guard.
+    # build_storage_healthy 与服务启动路径）fail-closed，绝不静默绿。非段级异常不吞、
+    # 不标记，维持既有行为（由既有自检链路如实上报）。
+    storage_selfcheck = "ok"
+    from core.chroma_utils import is_corruption   # 与打开时自愈同款判定（chroma_utils.is_corruption）
+    _probe = _collections_queryable([cards_col, body_col])
+    if _probe is not None:
+        if is_corruption(_probe):
+            try:
+                client.delete_collection(cards_col.name)
+                client.delete_collection(body_col.name)
+                cards_col = client.get_or_create_collection(
+                    name=cards_col.name, metadata={"evidence_kind": CATALOG_KIND},
+                    embedding_function=ef)
+                body_col = client.get_or_create_collection(
+                    name=body_col.name, metadata={"evidence_kind": BODY_KIND},
+                    embedding_function=ef)
+                if card_ids:
+                    cards_col.upsert(ids=card_ids, documents=card_docs, metadatas=card_meta)
+                if body_ids:
+                    body_col.upsert(ids=body_ids, documents=body_docs, metadatas=body_meta)
+                _again = _collections_queryable([cards_col, body_col])
+                if _again is None:
+                    storage_selfcheck = "recovered"
+                else:
+                    storage_selfcheck = "failed"
+                    print(f"[WARN] build {build_id} 段级抖动重写一次后仍不可读"
+                          f"（{_again}），storage_selfcheck=failed（fail-closed）", flush=True)
+            except Exception as ex:
+                storage_selfcheck = "failed"
+                print(f"[WARN] build {build_id} 段级抖动自愈失败（{type(ex).__name__}: {ex}），"
+                      f"storage_selfcheck=failed（fail-closed）", flush=True)
+        else:
+            # 非段级异常：不吞、不伪装自愈，交给既有自检链路如实上报
+            print(f"[WARN] build {build_id} 写入后读回异常（非段级）"
+                  f"{type(_probe).__name__}: {_probe}", flush=True)
+
     marker = secrets.token_hex(16)
     dim = 0
     if ef is not None:
@@ -490,6 +548,7 @@ def build_index(build_id: str, *, root: Optional[Any] = None,
         "fts_build_id": str(build_id),
         "root": base_root.as_posix(),
         "staging": staging.as_posix(),
+        "storage_selfcheck": storage_selfcheck,
         "elapsed_s": round(time.time() - t0, 3),
         "tools": _tool_versions(),
     }

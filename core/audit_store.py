@@ -241,6 +241,49 @@ CREATE UNIQUE INDEX IF NOT EXISTS ux_acceptance_export_ver
     ON acceptance_summary_exports(ticket_id, version);
 CREATE INDEX IF NOT EXISTS idx_acceptance_export_ticket
     ON acceptance_summary_exports(ticket_id);
+-- SM-41 受限后台预演：run 状态与待复核提案（自有两表，业务表零接触）。
+-- ux_rehearsal_dedup 唯一索引 = 数据库级防重（并行重复派工恰一次，冲突按 duplicate 拒绝）；
+-- 提案行过期（expired）后不删除——rollback 约定"已生成提案只读保留至 TTL 到期"仍可查。
+CREATE TABLE IF NOT EXISTS rehearsal_runs (
+    run_id TEXT PRIMARY KEY,
+    scenario_id TEXT NOT NULL,
+    subject_id TEXT NOT NULL DEFAULT '',
+    actor TEXT NOT NULL DEFAULT '',
+    status TEXT NOT NULL DEFAULT 'running',   -- running/done/cancelled/interrupted/aborted
+    policy_version TEXT NOT NULL DEFAULT '',
+    max_steps INTEGER NOT NULL DEFAULT 0,
+    max_proposals INTEGER NOT NULL DEFAULT 0,
+    deadline_ts REAL NOT NULL DEFAULT 0,
+    steps_used INTEGER NOT NULL DEFAULT 0,
+    proposals_created INTEGER NOT NULL DEFAULT 0,
+    proposals_duplicated INTEGER NOT NULL DEFAULT 0,
+    started_ts REAL NOT NULL,
+    heartbeat_ts REAL NOT NULL DEFAULT 0,
+    ended_ts REAL NOT NULL DEFAULT 0,
+    end_reason TEXT NOT NULL DEFAULT ''
+);
+CREATE TABLE IF NOT EXISTS rehearsal_proposals (
+    id TEXT PRIMARY KEY,
+    run_id TEXT NOT NULL,
+    scenario_id TEXT NOT NULL,
+    kind TEXT NOT NULL,                       -- overdue_rectification_notice / sop_reference_replacement
+    dedup_key TEXT NOT NULL,
+    subject_id TEXT NOT NULL DEFAULT '',
+    source_ref TEXT NOT NULL DEFAULT '',
+    payload TEXT NOT NULL DEFAULT '{}',       -- 脱敏摘要 JSON（不携带敏感原文）
+    payload_sha256 TEXT NOT NULL DEFAULT '',
+    status TEXT NOT NULL DEFAULT 'pending',   -- pending/approved/rejected/expired
+    policy_version TEXT NOT NULL DEFAULT '',
+    created_ts REAL NOT NULL,
+    expires_ts REAL NOT NULL,
+    decided_ts REAL NOT NULL DEFAULT 0,
+    decided_by TEXT NOT NULL DEFAULT '',
+    decision_reason TEXT NOT NULL DEFAULT ''
+);
+CREATE UNIQUE INDEX IF NOT EXISTS ux_rehearsal_dedup
+    ON rehearsal_proposals(scenario_id, kind, dedup_key);
+CREATE INDEX IF NOT EXISTS idx_rehearsal_prop_status
+    ON rehearsal_proposals(status);
 """
 
 # ── 五阶段回路定义（新库建表即带列；旧库由 _migrate 非破坏补列）────────────────
@@ -1704,6 +1747,208 @@ class AuditStore:
             rows = self._con.execute(
                 "SELECT * FROM watchdog_state ORDER BY fact_code, key").fetchall()
         return [dict(r) for r in rows]
+
+    # ── SM-41：受限预演 run/提案持久化（调用方 core/rehearsal.py）───────────────
+    # 与 watchdog_observe 同款纪律：所有写收敛进单 BEGIN IMMEDIATE，迁移/查重判定
+    # 在锁内读库；并发=1 与 dedup 恰一次由此保证（重启/多实例并行都成立）。
+    # 返回结构化结果而不抛领域异常（异常类型归引擎层，存储层零反向依赖）。
+
+    def rehearsal_run_start(self, row: Dict[str, Any]) -> Dict[str, Any]:
+        """登记预演 run；锁内判并发（同 scenario 已有 running → ok=False + conflict_run_id）。"""
+        with self._lock:
+            self._con.execute("BEGIN IMMEDIATE")
+            self._in_tx = True
+            try:
+                dup = self._con.execute(
+                    "SELECT run_id FROM rehearsal_runs WHERE scenario_id=? AND status='running'",
+                    (str(row.get("scenario_id") or ""),)).fetchone()
+                if dup is not None:
+                    self._con.rollback()
+                    return {"ok": False, "conflict_run_id": str(dup["run_id"])}
+                self._con.execute(
+                    "INSERT INTO rehearsal_runs (run_id, scenario_id, subject_id, actor, status,"
+                    " policy_version, max_steps, max_proposals, deadline_ts, started_ts, heartbeat_ts)"
+                    " VALUES (?,?,?,?,?,?,?,?,?,?,?)",
+                    (str(row.get("run_id") or ""), str(row.get("scenario_id") or ""),
+                     str(row.get("subject_id") or ""), str(row.get("actor") or ""),
+                     "running", str(row.get("policy_version") or ""),
+                     int(row.get("max_steps") or 0), int(row.get("max_proposals") or 0),
+                     float(row.get("deadline_ts") or 0.0), float(row.get("started_ts") or 0.0),
+                     float(row.get("heartbeat_ts") or row.get("started_ts") or 0.0)))
+                self._con.commit()
+                return {"ok": True, "conflict_run_id": None}
+            except BaseException:
+                try:
+                    self._con.rollback()
+                except sqlite3.Error:
+                    pass
+                raise
+            finally:
+                self._in_tx = False
+
+    def rehearsal_run_heartbeat(self, run_id: str, ts: float) -> None:
+        with self._lock:
+            self._con.execute(
+                "UPDATE rehearsal_runs SET heartbeat_ts=? WHERE run_id=?", (float(ts), run_id))
+            self._con.commit()
+
+    def rehearsal_run_finish(self, run_id: str, *, status: str, end_reason: str,
+                             ended_ts: float, steps_used: int, proposals_created: int,
+                             proposals_duplicated: int) -> None:
+        """终态写入（含计数器一次性落库；中断 run 的计数以已落库提案行为准）。"""
+        with self._lock:
+            self._con.execute(
+                "UPDATE rehearsal_runs SET status=?, end_reason=?, ended_ts=?,"
+                " steps_used=?, proposals_created=?, proposals_duplicated=?"
+                " WHERE run_id=?",
+                (str(status), str(end_reason), float(ended_ts), int(steps_used),
+                 int(proposals_created), int(proposals_duplicated), str(run_id)))
+            self._con.commit()
+
+    def rehearsal_run_get(self, run_id: str) -> Optional[Dict[str, Any]]:
+        with self._lock:
+            row = self._con.execute(
+                "SELECT * FROM rehearsal_runs WHERE run_id=?", (str(run_id),)).fetchone()
+        return dict(row) if row is not None else None
+
+    def rehearsal_runs(self, scenario_id: Optional[str] = None) -> List[Dict[str, Any]]:
+        with self._lock:
+            if scenario_id is None:
+                rows = self._con.execute(
+                    "SELECT * FROM rehearsal_runs ORDER BY started_ts").fetchall()
+            else:
+                rows = self._con.execute(
+                    "SELECT * FROM rehearsal_runs WHERE scenario_id=? ORDER BY started_ts",
+                    (str(scenario_id),)).fetchall()
+        return [dict(r) for r in rows]
+
+    def rehearsal_propose(self, row: Dict[str, Any]) -> tuple:
+        """提案落库（锁内查重）：('created', id) | ('duplicate', 既有 id)。
+
+        dedup 唯一索引兜底：即使锁内查重被绕过（多进程竞态窗口），INSERT 也只成功一次。
+        """
+        with self._lock:
+            self._con.execute("BEGIN IMMEDIATE")
+            self._in_tx = True
+            try:
+                dup = self._con.execute(
+                    "SELECT id FROM rehearsal_proposals"
+                    " WHERE scenario_id=? AND kind=? AND dedup_key=?",
+                    (str(row.get("scenario_id") or ""), str(row.get("kind") or ""),
+                     str(row.get("dedup_key") or ""))).fetchone()
+                if dup is not None:
+                    self._con.rollback()
+                    return ("duplicate", str(dup["id"]))
+                self._con.execute(
+                    "INSERT INTO rehearsal_proposals (id, run_id, scenario_id, kind, dedup_key,"
+                    " subject_id, source_ref, payload, payload_sha256, status, policy_version,"
+                    " created_ts, expires_ts)"
+                    " VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?)",
+                    (str(row.get("id") or ""), str(row.get("run_id") or ""),
+                     str(row.get("scenario_id") or ""), str(row.get("kind") or ""),
+                     str(row.get("dedup_key") or ""), str(row.get("subject_id") or ""),
+                     str(row.get("source_ref") or ""), str(row.get("payload") or "{}"),
+                     str(row.get("payload_sha256") or ""), "pending",
+                     str(row.get("policy_version") or ""),
+                     float(row.get("created_ts") or 0.0), float(row.get("expires_ts") or 0.0)))
+                self._con.commit()
+                return ("created", str(row.get("id") or ""))
+            except BaseException:
+                try:
+                    self._con.rollback()
+                except sqlite3.Error:
+                    pass
+                raise
+            finally:
+                self._in_tx = False
+
+    def rehearsal_proposals(self, scenario_id: Optional[str] = None,
+                            status: Optional[str] = None) -> List[Dict[str, Any]]:
+        with self._lock:
+            q = "SELECT * FROM rehearsal_proposals"
+            conds, args = [], []
+            if scenario_id is not None:
+                conds.append("scenario_id=?")
+                args.append(str(scenario_id))
+            if status is not None:
+                conds.append("status=?")
+                args.append(str(status))
+            if conds:
+                q += " WHERE " + " AND ".join(conds)
+            q += " ORDER BY created_ts, id"
+            rows = self._con.execute(q, args).fetchall()
+        return [dict(r) for r in rows]
+
+    def rehearsal_proposal_decide(self, proposal_id: str, *, status: str,
+                                  decided_by: str, reason: str,
+                                  decided_ts: float) -> Optional[Dict[str, Any]]:
+        """锁内状态翻转（仅 pending → approved/rejected）：非 pending 返回 None（已决/不存在）。"""
+        with self._lock:
+            self._con.execute("BEGIN IMMEDIATE")
+            self._in_tx = True
+            try:
+                row = self._con.execute(
+                    "SELECT status FROM rehearsal_proposals WHERE id=?",
+                    (str(proposal_id),)).fetchone()
+                if row is None or str(row["status"]) != "pending":
+                    self._con.rollback()
+                    return None
+                self._con.execute(
+                    "UPDATE rehearsal_proposals SET status=?, decided_by=?,"
+                    " decision_reason=?, decided_ts=? WHERE id=?",
+                    (str(status), str(decided_by), str(reason), float(decided_ts),
+                     str(proposal_id)))
+                self._con.commit()
+                return {"id": str(proposal_id), "status": str(status),
+                        "decided_by": str(decided_by), "decision_reason": str(reason),
+                        "decided_ts": float(decided_ts)}
+            except BaseException:
+                try:
+                    self._con.rollback()
+                except sqlite3.Error:
+                    pass
+                raise
+            finally:
+                self._in_tx = False
+
+    def rehearsal_reap(self, now: float, lease_s: float) -> Dict[str, int]:
+        """过期回收（锁内批处理）：pending 且 expires_ts<now → expired（行保留只读可查）；
+        running 且心跳超 lease_s → interrupted（崩溃可解释，绝不静默复写）。"""
+        with self._lock:
+            self._con.execute("BEGIN IMMEDIATE")
+            self._in_tx = True
+            try:
+                cur = self._con.execute(
+                    "UPDATE rehearsal_proposals SET status='expired',"
+                    " decision_reason='TTL 过期回收'"
+                    " WHERE status='pending' AND expires_ts < ?", (float(now),))
+                expired = int(cur.rowcount)
+                cur2 = self._con.execute(
+                    "UPDATE rehearsal_runs SET status='interrupted',"
+                    " end_reason='interrupted:heartbeat-lease-expired（进程崩溃/失联，状态保留待人工核对）',"
+                    " ended_ts=? WHERE status='running' AND heartbeat_ts + ? < ?",
+                    (float(now), float(lease_s), float(now)))
+                interrupted = int(cur2.rowcount)
+                self._con.commit()
+                return {"expired_proposals": expired, "interrupted_runs": interrupted}
+            except BaseException:
+                try:
+                    self._con.rollback()
+                except sqlite3.Error:
+                    pass
+                raise
+            finally:
+                self._in_tx = False
+
+    def rehearsal_proposal_mutate_payload_for_test(self, proposal_id: str,
+                                                   payload: str) -> None:
+        """只供回归测试使用：绕过引擎直接改库内 payload，验证审批 sha256 fail-closed。
+        生产代码不得调用（名字带 _for_test，测试内显式引用）。"""
+        with self._lock:
+            self._con.execute(
+                "UPDATE rehearsal_proposals SET payload=? WHERE id=?",
+                (str(payload), str(proposal_id)))
+            self._con.commit()
 
     # 允许经 PATCH /tickets/{id} 改判的字段（研讨阶段人工定级/改派/改期限）
     _PATCHABLE_TICKET_FIELDS = {

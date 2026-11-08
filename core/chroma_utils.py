@@ -24,6 +24,11 @@ def _is_corruption(ex: Exception) -> bool:
     return "hnsw" in msg or "segment" in msg
 
 
+# 公开别名：corpus/build.py 写入后读回自愈复用同款判定（2026-11-08 门禁
+# wf-sm-41-c5 暴露的写入后段级抖动修复），语义与本模块打开时自愈保持一致。
+is_corruption = _is_corruption
+
+
 def _new_client(path: str) -> chromadb.api.ClientAPI:
     return chromadb.PersistentClient(
         path=path,
