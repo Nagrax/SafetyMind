@@ -1,4 +1,8 @@
-# SafetyMind
+<p align="center">
+  <img src="logo.png" alt="SafetyMind" width="128" height="128">
+</p>
+
+<h1 align="center">SafetyMind</h1>
 
 **多 Agent 路由 · 安全知识库 · 可解释、可观测、可评测的应急处置链路**
 
