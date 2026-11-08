@@ -60,6 +60,7 @@ _skill_evolution = None
 _skill_ledger  = None   # SM-30：SOP 修订注册表与发布指针（core/skill_loader.py）
 _conv_store   = None
 _audit        = None
+_watchdog     = None   # SM-40：只读巡检（core/watchdog.py；业务表只读+自有两表）
 
 def _intent_model_name(gen_model: str) -> str:
     """意图模型选择（薄封装，实现在 core/llm_params.intent_model_name）。
@@ -540,6 +541,43 @@ async def lifespan(app: FastAPI):
     if os.getenv("SAFETYMIND_BGE", "") == "1":
         asyncio.create_task(_orchestrator.recognize_intent("系统预热"))
 
+    # SM-40 只读巡检 watchdog（任务卡 SM-40）：复用既有读取入口汇总等待/逾期/卡单/
+    # 审批/版本漂移为稳定事实码；状态迁移收敛进 AuditStore.watchdog_observe 单事务
+    # （重启/双调度者恰一次新告警、状态未变静默、恢复恰一次 recovered 事件）。
+    # 巡检对业务表只读（只写自有 watchdog_state/events 两表），失败只告警绝不影响主服务；
+    # SAFETYMIND_WATCHDOG_ENABLED=0 关闭（任务卡回滚条款），间隔/卡单阈值可配。
+    watchdog_task = None
+    global _watchdog
+    if _audit is not None and os.getenv("SAFETYMIND_WATCHDOG_ENABLED", "1") == "1":
+        from core.watchdog import Watchdog
+        _watchdog = Watchdog(
+            audit=_audit,
+            skill_evolution=_skill_evolution,
+            skill_ledger=_skill_ledger,
+            skill_manager=_skill_manager,
+        )
+        async def _watchdog_loop():
+            interval = float(os.getenv("SAFETYMIND_WATCHDOG_INTERVAL_S", "60"))
+            while True:
+                try:
+                    rep = await asyncio.to_thread(_watchdog.scan)
+                    alerts = [e for e in rep.get("events") or [] if e.get("kind") == "alert"]
+                    recovered = [e for e in rep.get("events") or []
+                                 if e.get("kind") == "recovered"]
+                    if alerts:
+                        logger.warning(f"只读巡检新告警 {len(alerts)} 条: "
+                                       f"{[e['event_id'] + ' ' + e['fact_code'] + '/' + e['key'] for e in alerts]}")
+                    if recovered:
+                        logger.info(f"只读巡检恢复 {len(recovered)} 条: "
+                                    f"{[e['event_id'] + ' ' + e['fact_code'] + '/' + e['key'] for e in recovered]}")
+                    if rep.get("unknown"):
+                        logger.warning(f"只读巡检存在不可读事实（报未知，不误报）: "
+                                       f"{[(u.get('fact_code'), str(u.get('error'))[:120]) for u in rep['unknown']]}")
+                except Exception as ex:
+                    logger.warning(f"只读巡检失败（不影响服务）: {ex}")
+                await asyncio.sleep(interval)
+        watchdog_task = asyncio.create_task(_watchdog_loop())
+
     logger.info("SafetyMind 已就绪")
     yield
 
@@ -547,6 +585,9 @@ async def lifespan(app: FastAPI):
         hazard_overdue_task.cancel()
     if outbox_task is not None:
         outbox_task.cancel()
+    if watchdog_task is not None:
+        watchdog_task.cancel()
+    _watchdog = None
     await _monitor.stop()
     if _memory is not None:
         await _memory.close()
@@ -810,6 +851,30 @@ def require_admin(x_admin_token: str = Header(default="", alias="X-Admin-Token")
     请求头 X-Admin-Token 访问；未配置 = 锁定（防裸奔上线）。
     本地单人形态自动放行——管理功能保护的是"多人在网络上访问"的场景。"""
     if not _admin_auth_required():
+        return
+    expected = os.getenv("ADMIN_TOKEN", "").strip()
+    if not expected:
+        raise HTTPException(
+            503, "服务以网络模式运行但未设置管理密码：请在 .env 配置 ADMIN_TOKEN（首次可在设置页一键生成）")
+    if x_admin_token != expected:
+        raise HTTPException(401, "管理密码无效")
+
+
+def require_watchdog(x_admin_token: str = Header(default="", alias="X-Admin-Token"),
+                     x_watchdog_token: str = Header(default="", alias="X-Watchdog-Token")):
+    """巡检报告端点鉴权（SM-40，权限 ≤ require_admin）：
+
+    部署形态下两条路二选一：
+      - X-Watchdog-Token == SAFETYMIND_WATCHDOG_TOKEN：**专用只读巡检主体**——
+        该主体只在本端点放行；所有管理写端点仍走 require_admin（只认 ADMIN_TOKEN），
+        巡检 token 对其一律 401（tests/test_watchdog.py F5-F8 钉死：改工单/改字段/
+        重放通知/发布 SOP 全拒且业务表零漂移）；
+      - X-Admin-Token == ADMIN_TOKEN：管理员本就可巡检。
+    两个令牌都未配置 = 锁定（与 require_admin 同口径防裸奔）；本地单人形态自动放行。"""
+    if not _admin_auth_required():
+        return
+    wd_expected = os.getenv("SAFETYMIND_WATCHDOG_TOKEN", "").strip()
+    if wd_expected and x_watchdog_token == wd_expected:
         return
     expected = os.getenv("ADMIN_TOKEN", "").strip()
     if not expected:
@@ -1326,6 +1391,19 @@ async def tickets_overdue(_admin: None = Depends(require_admin)):
     if _audit is None:
         raise HTTPException(503, "审计存储未启用")
     return {"tickets": _audit.list_overdue_tickets()}
+
+
+# ── SM-40 只读巡检报告（稳定事实码 + 事件 ID + 责任范围 + 处理建议）──────────
+@app.get("/watchdog", tags=["巡检"])
+async def watchdog_report(_wd: None = Depends(require_watchdog)):
+    """只读巡检报告（SM-40）：等待/逾期/卡单/审批/版本漂移的确定性事实与
+    恢复建议。只读最近一次后台扫描视图（不触发采集）；自然语言问诊后接时
+    只解释本端点已鉴权字段。巡检主体（X-Watchdog-Token）只有这一个读取面，
+    无法改工单、发布 SOP 或调用生产写工具（require_admin 与其 token 互斥）。"""
+    if _watchdog is None:
+        raise HTTPException(
+            503, "只读巡检未启用（SAFETYMIND_WATCHDOG_ENABLED=0 或审计存储未启用）")
+    return _watchdog.report()
 
 
 # ── SM-22 影子评审报告（管理端点，只读聚合）──────────────────────────────────

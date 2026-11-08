@@ -59,6 +59,40 @@ def record(name, ok, detail=""):
     print(f"[{'PASS' if ok else 'FAIL'}] {name}" + (f" — {detail}" if detail and not ok else ""))
 
 
+# ── 存储抖动的"一次重建重试"（范式=tests/_storage_guard.py 模块文档）──────────
+# 门禁实录（wf-sm-40-c3，2026-11-08）：phase_bge_scale_unchanged 在 add_documents 与
+# search 均成功后，紧随的白盒裸 query 抛 "Error creating hnsw segment reader: Nothing
+# found on disk"。该错误是本机 ChromaDB 1.5.9/Windows 环境级抖动（_storage_guard.py
+# 文档：全新唯一目录/单进程单客户端约 1/70；mcp/knowledge_base.py _runtime_degrade 已把
+# 它归为 corrupt 且 search 契约内自愈）——产品无缺陷，被测断言也没有问题；问题是白盒
+# 裸 query 刻意绕过产品降级契约以锁定原始距离口径，抖动恰好打在断言缝上。
+# 处置：仅当异常匹配**已知 flake 签名**时，把整个相位在全新目录重跑一次（各相位自建
+# 全新临时目录，重跑即全新存储）；断言逐字节不变、一条不少，attempt-1 未完成的部分
+# 记录作废并由 attempt-2 原样重判。真实回归（签名外异常）不重试，照常一次失败。
+_KNOWN_CHROMA_FLAKE_MARKERS = ("nothing found on disk", "hnsw segment reader",
+                               "error creating hnsw")
+
+
+def _known_chroma_flake(ex: BaseException) -> bool:
+    msg = str(ex).lower()
+    return any(m in msg for m in _KNOWN_CHROMA_FLAKE_MARKERS)
+
+
+def phase_with_storage_retry(label: str, fn):
+    """跑一个自建全新存储的相位；命中已知 chroma 抖动签名 → 换全新目录整相位重跑一次。"""
+    mark = len(RESULTS)
+    try:
+        return fn()
+    except BaseException as ex:
+        if not _known_chroma_flake(ex):
+            raise
+        print(f"[WARN] {label}: 命中已知 chroma 存储抖动（{type(ex).__name__}: "
+              f"{str(ex)[:160]}）→ 换全新目录重跑该相位一次（断言原样重判，不跳过）",
+              flush=True)
+        del RESULTS[mark:]          # attempt-1 部分记录作废：由 attempt-2 原样重判
+        return fn()
+
+
 TAIL_CLAUSE = "二级动火票有效期不超过72小时UNIQ7788，作业结束后作业人须立即关闭动火票。"
 FILLER = "特殊作业前必须完成风险辨识与安全交底。现场作业人员应确认作业票证齐全有效。监护人员须全程在岗并保持通讯畅通。"
 MSG = "动火作业票有效期不超过72小时UNIQ7788怎么规定的"
@@ -284,9 +318,9 @@ def phase_threshold_consumer_frozen():
 
 def main():
     phase_score_mode_gate()
-    phase_kb_score_semantics()
+    phase_with_storage_retry("KB ngram 得分口径", phase_kb_score_semantics)
     phase_default_threshold_to_citations()
-    phase_bge_scale_unchanged()
+    phase_with_storage_retry("BGE 旧口径", phase_bge_scale_unchanged)
     phase_threshold_consumer_frozen()
 
     failed = RESULTS.count(False)

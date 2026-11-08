@@ -198,6 +198,28 @@ CREATE TABLE IF NOT EXISTS notification_health (
     breached_ts REAL,
     PRIMARY KEY(kind, channel)
 );
+-- SM-40 只读巡检 watchdog：事实状态与事件（巡检组件的**自有簿记**，只允许巡检路径写入；
+-- 业务表零接触——巡检对业务表只读，见 core/watchdog.py 模块文档与 tests/test_watchdog.py）。
+-- watchdog_state：(fact_code, key) 当前态——迁移判定收敛进 watchdog_observe 的单个
+-- BEGIN IMMEDIATE（与领取/逾期同款写锁先行），重启与多调度者并行由此恰一次去重。
+CREATE TABLE IF NOT EXISTS watchdog_state (
+    fact_code TEXT NOT NULL,
+    key TEXT NOT NULL,
+    state TEXT NOT NULL DEFAULT '',           -- 'alert' | ''（正常）
+    since_ts REAL NOT NULL DEFAULT 0,         -- 当前态起始时间
+    detail TEXT NOT NULL DEFAULT '',
+    event_id TEXT NOT NULL DEFAULT '',        -- 置为此态的事件 ID（alert 事件可追溯）
+    PRIMARY KEY(fact_code, key)
+);
+CREATE TABLE IF NOT EXISTS watchdog_events (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    fact_code TEXT NOT NULL,
+    key TEXT NOT NULL,
+    kind TEXT NOT NULL,                       -- 'alert' | 'recovered'
+    source_ts REAL NOT NULL,                  -- 事实来源时间（采集时刻）
+    event_ts REAL NOT NULL,                   -- 事件落库时刻
+    detail TEXT NOT NULL DEFAULT ''
+);
 """
 
 # ── 五阶段回路定义（新库建表即带列；旧库由 _migrate 非破坏补列）────────────────
@@ -1564,6 +1586,103 @@ class AuditStore:
                 if appended:
                     newly.append(t)
         return newly
+
+    # ── SM-40 只读巡检：卡单只读查询 + 巡检状态机（自有两表，业务表零接触）──────
+    def list_stuck_tickets(self, stale_s: float, now: Optional[float] = None) -> List[Dict[str, Any]]:
+        """卡单只读扫描（SM-40）：open 工单且最后一条时间线事件距今超过 stale_s；
+        无时间线行的单用 created_ts 兜底（建单即卡）。纯 SELECT，零写入。
+        stale_s 为负数时全部 open 单视为卡单（测试确定性缝）。"""
+        now = time.time() if now is None else now
+        cutoff = now - float(stale_s)
+        with self._lock:
+            rows = self._con.execute(
+                "SELECT t.* FROM tickets t WHERE t.status!='closed' AND COALESCE("
+                " (SELECT MAX(tl.ts) FROM ticket_timeline tl WHERE tl.ticket_id=t.id),"
+                " t.created_ts) < ? ORDER BY t.id ASC", (cutoff,)).fetchall()
+        return [self._ticket_dict(r) for r in rows]
+
+    def watchdog_observe(self, events: List[Dict[str, Any]],
+                         now: Optional[float] = None) -> List[Dict[str, Any]]:
+        """巡检状态机（SM-40 去重唯一依据，调用方 core/watchdog.py）：
+
+        events = [{"fact_code","key","bad":bool,"detail":str,"source_ts":float}]。
+        整批收敛进**单个 BEGIN IMMEDIATE**（迁移判定在锁内读 watchdog_state）：
+          - bad 且先前非 alert → 恰一条 alert 事件；
+          - 状态未变 → 零新事件（静默）；
+          - 非 bad 且先前 alert → 恰一条 recovered 事件；
+          - 非 bad 且先前非 alert → 零新事件。
+        重启（状态从库读）与两个调度者并行（写锁串行化，后到者在锁内读到已迁移状态）
+        由此都恰一次去重。事件 ID = "WD-EV-<watchdog_events 自增 id>"（稳定可追溯）。
+        返回本次新建事件列表（含 event_id）；存储不可用时抛出由调用方按 fail-closed 处理
+        （不写任何行，绝不因读不到而误报恢复）。"""
+        now = time.time() if now is None else now
+        created: List[Dict[str, Any]] = []
+        with self._lock:
+            self._con.execute("BEGIN IMMEDIATE")
+            self._in_tx = True
+            try:
+                for ev in events:
+                    code = str(ev.get("fact_code") or "")
+                    key = str(ev.get("key") or "")
+                    if not code:
+                        continue
+                    bad = bool(ev.get("bad"))
+                    cur_state = "alert" if bad else ""
+                    row = self._con.execute(
+                        "SELECT state FROM watchdog_state WHERE fact_code=? AND key=?",
+                        (code, key)).fetchone()
+                    prev = str(row["state"]) if row is not None else ""
+                    if prev == cur_state:
+                        continue                          # 状态未变：静默（并行第二次到达也在此沉默）
+                    kind = "alert" if bad else "recovered"
+                    detail = str(ev.get("detail") or "")
+                    self._con.execute(
+                        "INSERT INTO watchdog_events"
+                        " (fact_code, key, kind, source_ts, event_ts, detail)"
+                        " VALUES (?,?,?,?,?,?)",
+                        (code, key, kind, float(ev.get("source_ts") or now), now, detail))
+                    eid = int(self._con.execute("SELECT last_insert_rowid()").fetchone()[0])
+                    self._con.execute(
+                        "INSERT INTO watchdog_state (fact_code, key, state, since_ts, detail, event_id)"
+                        " VALUES (?,?,?,?,?,?) ON CONFLICT(fact_code, key) DO UPDATE SET"
+                        " state=excluded.state, since_ts=excluded.since_ts,"
+                        " detail=excluded.detail, event_id=excluded.event_id",
+                        (code, key, cur_state, now if bad else 0, detail,
+                         f"WD-EV-{eid}" if bad else ""))
+                    created.append({"event_id": f"WD-EV-{eid}", "fact_code": code,
+                                    "key": key, "kind": kind,
+                                    "source_ts": float(ev.get("source_ts") or now),
+                                    "event_ts": now, "detail": detail})
+                self._con.commit()
+            except BaseException:
+                try:
+                    self._con.rollback()
+                except sqlite3.Error:
+                    pass
+                raise
+            finally:
+                self._in_tx = False
+        return created
+
+    def watchdog_events_recent(self, limit: int = 50) -> List[Dict[str, Any]]:
+        """巡检事件近况（GET /watchdog 数据源）：新事件在前，含稳定事件 ID。"""
+        with self._lock:
+            rows = self._con.execute(
+                "SELECT * FROM watchdog_events ORDER BY id DESC LIMIT ?",
+                (int(limit),)).fetchall()
+        out = []
+        for r in rows:
+            d = dict(r)
+            d["event_id"] = f"WD-EV-{d.pop('id')}"
+            out.append(d)
+        return out
+
+    def watchdog_state_all(self) -> List[Dict[str, Any]]:
+        """巡检当前状态全集（管理端/测试用）。"""
+        with self._lock:
+            rows = self._con.execute(
+                "SELECT * FROM watchdog_state ORDER BY fact_code, key").fetchall()
+        return [dict(r) for r in rows]
 
     # 允许经 PATCH /tickets/{id} 改判的字段（研讨阶段人工定级/改派/改期限）
     _PATCHABLE_TICKET_FIELDS = {
