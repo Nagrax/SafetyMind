@@ -121,6 +121,54 @@ def main():
         kb4._recovered_at = 0.0
         record("服务器模式跳过本地自愈", _KB.recover_runtime(kb4, "test") is False)
 
+        # ── 5b. 自愈重播本实例文档（2026-11-08 门禁修复）─────────────────
+        # 门禁实录（runs/wf-sm-31-c2.json、runs/diag-sm31-1.json）：Windows HNSW
+        # 偶发段不可读（core/chroma_utils 开篇实录的本机已知 flake）触发运行态自愈，
+        # 原实现归档重建只重导默认知识——本进程刚播种的证据被静默丢弃，默认文档
+        # 顶替命中（"检索成功"但内容换了，证据保真被破坏）。契约：自愈后本实例
+        # 添加过的文档仍可检索（注册表按 title 重播，add_documents 幂等）。
+        kb5, _ = make_real_kb(tmp)
+        seeded = kb5.add_documents([{
+            "title": "动火作业管理规定（自愈重播回归种子）",
+            "content": "二级动火票有效期不超过72小时SEEDREGEN99，"
+                       "作业结束后作业人须立即关闭动火票并复位现场警戒。",
+            "source": "内部制度", "version": "2026-11",
+        }])
+        _probe = kb5.search("SEEDREGEN99 动火票有效期", top_k=3)
+
+        def _has_seed(hits):
+            return any("SEEDREGEN99" in str(h.get("snippet", ""))
+                       or "SEEDREGEN99" in str(h.get("content", "")) for h in hits)
+
+        record("5b 前置：种子文档已入库且可检索",
+               seeded > 0 and _has_seed(_probe),
+               f"seeded={seeded} hits={[(h.get('title'), str(h.get('snippet', ''))[:40]) for h in _probe]}")
+        _registry = getattr(kb5, "_instance_docs", None)
+        record("产品具备自愈重播注册表（_instance_docs）", _registry is not None,
+               "缺 _instance_docs——自愈重播修复缺失")
+        reg_before = len(_registry) if _registry is not None else 0
+        inject_corrupt_then_ok(kb5)
+        out5 = kb5.search("SEEDREGEN99 动火票有效期", top_k=3)
+        record("自愈重播：corrupt 重建后本实例文档仍可检索（不再静默丢证据）",
+               _has_seed(out5),
+               f"hits={[(h.get('title'), str(h.get('snippet', ''))[:40]) for h in out5]}")
+        _registry2 = getattr(kb5, "_instance_docs", None)
+        record("重播后种子文档仍在注册表（按 title 保留最新版）",
+               _registry2 is not None
+               and "动火作业管理规定（自愈重播回归种子）" in _registry2
+               and len(_registry2) >= reg_before,
+               f"before={reg_before} after={(len(_registry2) if _registry2 is not None else 'N/A')}")
+        if _registry2 is not None:
+            _n = len(_registry2)
+            kb5.add_documents([{
+                "title": "动火作业管理规定（自愈重播回归种子）",
+                "content": "二级动火票有效期不超过72小时SEEDREGEN99，"
+                           "作业结束后作业人须立即关闭动火票并复位现场警戒。",
+                "source": "内部制度", "version": "2026-11",
+            }])
+            record("注册表按 title 幂等（同 title 重导不增长）",
+                   len(_registry2) == _n, f"before={_n} after={len(_registry2)}")
+
         # ── 6. 源码守护：开关名与冷却期常量存在 ──────────────────────────
         src = (Path(__file__).resolve().parents[1] / "mcp" / "knowledge_base.py").read_text(encoding="utf-8")
         record("自愈开关 SAFETYMIND_KB_RUNTIME_RECOVERY 存在",

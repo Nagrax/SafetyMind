@@ -358,7 +358,14 @@ def t11_contract_fields():
                 #（请求级 SOP 版本与注入片段摘要，默认空列表；无注入路径为 []，
                 # 回放按 unknown 标注；语义与行为不变性由 tests/test_skill_publication.py
                 # 专门回归承担）。理由记录：scratch/sm-loop/handoff/SM-30/run-wf/decision.md。
-                "skill_versions"]
+                "skill_versions",
+                # 契约同步（2026-11-08）：SM-31 末尾 additive 新增
+                # `evidence_pointer_uses`（每个专家实际展开的证据指针
+                # [{agent_type, pointer_ids, expansions}]，默认空列表=无展开数据，
+                # 诚实缺席不编造；语义与行为不变性由
+                # tests/test_context_window_pointers.py t6/t7 专门回归承担）。
+                # 理由记录：scratch/sm-loop/handoff/SM-31/run-wf/decision.md §3.2。
+                "evidence_pointer_uses"]
     record("OrchestratorResult 契约字段原样保留", names == expected, f"got={names}")
 
 

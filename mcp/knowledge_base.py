@@ -171,6 +171,16 @@ class KnowledgeBase:
             embedding_function, getattr(self._collection, "metadata", None))
         self._recovery_lock = threading.Lock()
         self._recovered_at = 0.0
+        # 本实例已添加文档注册表（2026-11-08 门禁修复）：recover_runtime 归档重建的
+        # 原权衡"可用性 > 完整性"会把**本进程刚添加的文档**一并丢掉——门禁实录
+        # （runs/wf-sm-31-c2.json、runs/diag-sm31-1.json）：测试/调用方刚播种完证据，
+        # Windows HNSW 偶发段不可读（core/chroma_utils 开篇实录的本机已知 flake）触发
+        # 运行态自愈，重建后只剩默认 7 篇，查询"成功"返回默认文档顶替命中——静默的
+        # 证据丢失（违反证据保真契约）。按 title 记录本实例最新版本，自愈后原样重播
+        # （add_documents 本就是 upsert-by-title 幂等）；上限封顶防内存失控。
+        self._instance_docs: "Dict[str, Dict[str, str]]" = {}
+        self._instance_docs_order: List[str] = []
+        self._INSTANCE_DOC_CAP = 2048
         # 父块集合：整篇文档，命中子块后取回完整上下文（仅为批量 get 的载体，不参与检索）
         self._parents = self._client.get_or_create_collection(
             name=self.PARENT_COLLECTION_NAME + suffix,
@@ -254,6 +264,22 @@ class KnowledgeBase:
             # ChromaDB 会自动生成 Embedding
             self._collection.add(ids=ids, documents=docs, metadatas=metas)
             logger.info(f"知识库导入 {len(ids)} 个子块 / {len(documents)} 篇父文档")
+            # 登记进本实例注册表（最新版本按 title 覆盖；供运行态自愈后重播，
+            # 见 __init__ 的 _instance_docs 注释）。登记失败不影响导入。
+            try:
+                for _d in documents:
+                    _t = str(_d.get("title", ""))
+                    if not _t:
+                        continue
+                    if _t not in self._instance_docs and \
+                            len(self._instance_docs_order) >= self._INSTANCE_DOC_CAP:
+                        _old = self._instance_docs_order.pop(0)
+                        self._instance_docs.pop(_old, None)
+                    if _t not in self._instance_docs:
+                        self._instance_docs_order.append(_t)
+                    self._instance_docs[_t] = dict(_d)
+            except Exception as _rex:
+                logger.warning(f"文档注册表登记失败（不影响导入）: {_rex}")
             # 库内容变了 → 回复缓存必须全量失效，否则会拿旧答案回答新库
             # （版本号进缓存 key，bump 即天然失效；见 core/response_cache.py）
             try:
@@ -631,8 +657,10 @@ class KnowledgeBase:
           1. 归档损坏目录（Windows 句柄未释放时 rename 被拒 → 退到时间戳新目录）
           2. 重新打开 client + 子块/父块集合（沿用同一嵌入函数与集合后缀）
           3. 重导默认知识（_load_default_docs）
-        此前人工添加的文档会丢失——这是权衡：**可用性 > 数据完整性**，
-        且日志里会明确提示重新上传。
+          4. 重播本实例注册表中的文档（2026-11-08 门禁修复：原实现会丢掉运行中
+             添加的文档——"刚播种就被 flake 触发自愈"场景下等于静默丢证据，
+             默认文档顶替命中；按 title 重播幂等，见 _instance_docs 注释）
+        跨进程添加的文档（注册表之外）仍会丢失——日志明确提示重新上传。
 
         防护：线程锁防并发重建；冷却期（120s）防"重建又损坏"死循环。
         服务器模式（chroma host:port）不归本方法管——那是独立进程的事。
@@ -647,12 +675,23 @@ class KnowledgeBase:
                                now - getattr(self, "_recovered_at", 0.0))
                 return False
             try:
+                restore = [dict(v) for v in self._instance_docs.values()]
                 self._archive_and_reopen()
                 self._load_default_docs()
                 self._recovered_at = now
+                if restore:
+                    try:
+                        self.add_documents(restore)
+                        logger.info("知识库运行态自愈：已重播本实例此前添加的 %d 篇文档",
+                                    len(restore))
+                    except Exception as re_ex:
+                        logger.error(
+                            "知识库运行态自愈：本实例文档重播失败（%d 篇需重新上传）: %s",
+                            len(restore), re_ex)
                 logger.error(
-                    "知识库运行态自愈完成（原因: %s）。默认知识已重导；"
-                    "此前人工添加的文档已随坏库归档，需要重新上传。", reason)
+                    "知识库运行态自愈完成（原因: %s）。默认知识已重导；本实例运行中"
+                    "添加的文档已按注册表重播（%d 篇），跨进程添加的文档如缺失需重新上传。",
+                    reason, len(restore))
                 return True
             except Exception as ex:
                 logger.error(f"知识库运行态自愈失败: {type(ex).__name__}: {ex}")

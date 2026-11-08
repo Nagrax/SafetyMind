@@ -171,6 +171,9 @@ class OrchestratorResult:
     # [{revision_id, fragments:[{skill_name, revision_id, content_sha256, chars, truncated}]}]。
     # 紧急模板/缓存命中/确定性直出等无注入路径为空列表（回放按 unknown 标注）。
     skill_versions: List[Dict[str, Any]] = field(default_factory=list)
+    # SM-31：每个专家实际展开的证据指针（[{agent_type, pointer_ids, expansions}]）。
+    # 未展开的专家如实出现为空列表；无展开数据时整个字段为 []（诚实缺席，不编造）。
+    evidence_pointer_uses: List[Dict[str, Any]] = field(default_factory=list)
 
 
 @dataclass
@@ -205,6 +208,31 @@ def skill_versions_of(req: "Request", responses: List["AgentResponse"]) -> List[
     if not fragments:
         return []
     return [{"revision_id": str(snap.get("revision_id") or ""), "fragments": fragments}]
+
+
+def evidence_pointer_uses_of(responses: List["AgentResponse"]) -> List[Dict[str, Any]]:
+    """SM-31：按专家归集实际展开的证据指针（tool_trace 中 evidence_expand 且 ok）。
+
+    语义（任务卡验收 3）：保存每个专家实际使用的片段 ID；数据缺失时给出诚实结果——
+    未展开的专家如实出现为空 pointer_ids，不编造"使用了"；响应对象缺失（异常路径）
+    时不进入结果，由空列表表达"无数据"。
+    """
+    uses: List[Dict[str, Any]] = []
+    for r in responses or []:
+        if not isinstance(r, AgentResponse):
+            continue
+        ids: List[str] = []
+        for rec in (r.tool_trace or []):
+            name = getattr(rec, "name", None)
+            if name != "evidence_expand":
+                continue
+            if not getattr(rec, "ok", False):
+                continue   # 展开失败/被拒的不算"实际使用"
+            params = getattr(rec, "params", None) or {}
+            ids.append(str(params.get("pointer_id") or ""))  # 模型未带 id 也如实记录空串
+        uses.append({"agent_type": r.agent_type.value,
+                     "pointer_ids": ids, "expansions": len(ids)})
+    return uses
 
 
 def escalation_basis(urgency: "UrgencyLevel", intent: "IntentCategory",
@@ -436,8 +464,26 @@ class EmployeeAgent:
 
     def _memory_block(self, req: Request) -> str:
         """读取记忆：优先结构化 MemoryContext（员工代表用户读过记忆再说话）；
-        渲染失败降级回文本 context，绝不阻塞对话。"""
+        渲染失败降级回文本 context，绝不阻塞对话。
+
+        SM-31：SAFETYMIND_CONTEXT_WINDOW=1 且有结构化记忆时改走窗口渲染——
+        保留摘要/画像/偏好卡/最近关键轮与否决证据，其余注册为受权证据指针
+        （memory/evidence_pointers.py）。任何异常回退旧渲染；开关缺省 off 时
+        行为与改造前逐字节一致（tests/test_context_window_pointers.py t0）。"""
         if req.memory_context is not None:
+            if os.getenv("SAFETYMIND_CONTEXT_WINDOW", "0") == "1":
+                try:
+                    from memory.evidence_pointers import (REGISTRY, current_scope,
+                                                          window_memory_prompt)
+                    scope = current_scope()
+                    text = window_memory_prompt(
+                        req.memory_context, store=REGISTRY,
+                        subject_id=scope.get("subject_id") or req.user_id,
+                        session_id=scope.get("session_id") or req.conv_id)
+                    return text or (req.context or "")
+                except Exception as ex:
+                    logger.warning(
+                        f"请求 {req.request_id} 上下文窗口渲染失败，退回全量记忆: {ex}")
             try:
                 return req.memory_context.to_prompt_text() or ""
             except Exception as ex:
@@ -709,6 +755,7 @@ class EmployeeAgent:
             routing_confidence=decision.confidence,
             tool_trace=list(response.tool_trace),
             skill_versions=skill_versions_of(req, [response]),
+            evidence_pointer_uses=evidence_pointer_uses_of([response]),
         )
 
     async def run_parallel(self, req: Request, decision: RoutingDecision) -> OrchestratorResult:
@@ -763,6 +810,8 @@ class EmployeeAgent:
             tool_trace=tool_trace,
             skill_versions=skill_versions_of(req, [r for r in responses
                                                    if isinstance(r, AgentResponse)]),
+            evidence_pointer_uses=evidence_pointer_uses_of(
+                [r for r in responses if isinstance(r, AgentResponse)]),
         )
 
     # ── 路由逻辑 ──────────────────────────────────────────────────────────────

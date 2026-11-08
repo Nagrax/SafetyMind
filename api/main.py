@@ -384,6 +384,52 @@ async def lifespan(app: FastAPI):
             "knowledge_search,msds_lookup,resource_search,ledger_checklist,"
             "corpus_search,asset_open").split(",")
             if n.strip()]
+
+        # ── SM-31：受权证据指针展开工具（SAFETYMIND_CONTEXT_WINDOW=1 才注册/放行）──
+        # 模型只传 pointer_id；主体/会话由服务端 contextvar 绑定（_chat_core 入口），
+        # 越权/篡改/过期/读取失败由 EvidencePointerStore.resolve fail-closed 把守；
+        # 展开经本执行器走白名单+双预算（任务卡"展开沿用工具轮次预算"）。
+        if os.getenv("SAFETYMIND_CONTEXT_WINDOW", "0") == "1":
+            try:
+                from memory.evidence_pointers import REGISTRY as _ev_registry
+
+                def _ev_registry_current_scope():
+                    from memory import evidence_pointers as _ep
+                    return _ep.current_scope()
+
+                async def _evidence_expand_handler(params: Dict[str, Any],
+                                                   context: Any) -> Dict[str, Any]:
+                    pid = str((params or {}).get("pointer_id") or "")
+                    scope = _ev_registry_current_scope()
+                    r = _ev_registry.resolve(
+                        pid, subject_id=scope.get("subject_id"),
+                        session_id=scope.get("session_id"))
+                    if not r.get("ok"):
+                        # 六态如实（not_found/subject_mismatch/session_mismatch/
+                        # expired/tampered/store_error），绝不返回编造内容
+                        return {"found": False, "reason": r.get("reason"),
+                                "pointer_id": pid, "content": ""}
+                    return {"found": True, "kind": r.get("kind"),
+                            "chars": r.get("chars"), "content": r.get("content")}
+
+                _tool_manager.register(Tool(
+                    name="evidence_expand",
+                    description=("按指针展开受权证据（上下文窗口策略下的有界引用正文）。"
+                                 "只接受 pointer_id；主体/会话由服务端绑定，"
+                                 "越权、过期、篡改或未知指针会如实返回拒绝原因。"),
+                    handler=_evidence_expand_handler,
+                    schema={"type": "object",
+                            "properties": {"pointer_id": {"type": "string",
+                                            "description": "[有界引用] 中的 ctx- 指针 ID"}},
+                            "required": ["pointer_id"]},
+                    cache_ttl=0.0,   # 指针内容会过期且主体受限——绝不跨请求缓存
+                ))
+                if "evidence_expand" not in _allow:
+                    _allow.append("evidence_expand")
+                logger.info("SM-31 上下文窗口策略已启用：evidence_expand 工具已注册并加入白名单")
+            except Exception as ex:
+                logger.warning(f"evidence_expand 注册失败（窗口策略退化为仅指针化不可展开）: {ex}")
+
         _tool_executor = ToolExecutor(
             client=make_llm_client(api_key=cfg["api_key"], base_url=cfg.get("base_url", ""), model=cfg["model"], **llm_client_kwargs()),
             model=cfg["model"],
@@ -1726,6 +1772,28 @@ async def chat(req: ChatRequest,
 
 
 async def _chat_core(req, conv_id: str, OrcReq, MsgRole, t_start: float):
+    """SM-31：窗口策略开启时先绑定请求级证据 scope（主体/会话为服务端事实，
+    evidence_expand 展开时按此 fail-closed 校验），再进入原有核心链路。
+    /chat 与 /chat/stream 共用本入口；开关缺省 off 时零额外行为。"""
+    _ev_token = None
+    if os.getenv("SAFETYMIND_CONTEXT_WINDOW", "0") == "1":
+        try:
+            from memory.evidence_pointers import bind_request_scope
+            _ev_token = bind_request_scope(str(req.user_id or ""), str(conv_id or ""))
+        except Exception as ex:
+            logger.warning(f"证据 scope 绑定失败（按未绑定处理，展开将拒绝）: {ex}")
+    try:
+        return await _chat_core_impl(req, conv_id, OrcReq, MsgRole, t_start)
+    finally:
+        if _ev_token is not None:
+            try:
+                from memory.evidence_pointers import reset_scope
+                reset_scope(_ev_token)
+            except Exception:
+                pass
+
+
+async def _chat_core_impl(req, conv_id: str, OrcReq, MsgRole, t_start: float):
     # 1. 读取记忆上下文
     mem_ctx = await _memory.get_context(req.user_id, conv_id, query=req.message)
 
@@ -1968,6 +2036,16 @@ async def _chat_core(req, conv_id: str, OrcReq, MsgRole, t_start: float):
                 list(_sv[0].get("fragments") or []))
     except Exception as ex:
         logger.warning(f"Skill 版本回放记录失败（不影响响应）: {ex}")
+
+    # SM-31：每个专家实际展开的证据指针落盘（验收 3：保存每个专家实际使用的片段 ID）。
+    # uses 为空也落盘——"没有展开"与"没有记录"分开表达；落盘失败仅告警不阻断。
+    if os.getenv("SAFETYMIND_CONTEXT_WINDOW", "0") == "1":
+        try:
+            from memory.evidence_pointers import REGISTRY as _ev_registry
+            _ev_registry.record_pointer_uses(
+                result.request_id, list(getattr(result, "evidence_pointer_uses", None) or []))
+        except Exception as ex:
+            logger.warning(f"证据指针使用记录落盘失败（不影响响应）: {ex}")
 
     # SM-20 准入三档（逐请求读，纯函数零副作用；存储未启用时也先取值供闸门条件引用）：
     # off=现行为逐字节不变；observe=现行写入照旧+影子；auto=建单条件只认确定性依据
