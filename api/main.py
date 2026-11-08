@@ -1282,6 +1282,25 @@ async def tickets_overdue(_admin: None = Depends(require_admin)):
     return {"tickets": _audit.list_overdue_tickets()}
 
 
+# ── SM-22 影子评审报告（管理端点，只读聚合）──────────────────────────────────
+@app.get("/admission/shadow-report", tags=["审计"])
+async def admission_shadow_report(_admin: None = Depends(require_admin)):
+    """影子评审指标（SM-22 决策单 §3.2）：双轨分歧 / 确认率 / 确认时长 / 去重覆盖 /
+    转人工覆盖 / 待复核清单，全部分母显式、样本（request_id）可核对。
+
+    管理边界与 /tickets 同款（require_admin，吸取 export-subject-scope 教训）。
+    纯只读聚合（core/shadow_report.shadow_metrics），零写库零 LLM；
+    observe 未启用期间真实数据为空集——如实返回零计数，不造样本（deny 期间口径）。"""
+    if _audit is None:
+        raise HTTPException(503, "审计存储未启用")
+    from core.shadow_report import shadow_metrics
+    try:
+        return shadow_metrics(_audit)
+    except Exception as ex:  # 聚合失败只告警，不抛 500 给管理界面
+        logger.warning(f"影子评审报告聚合失败: {ex}")
+        return {"error": f"{type(ex).__name__}: {ex}", "pending_suggestions": []}
+
+
 # ── .env 可视化配置（管理端点；白名单 + 掩码 + 原子写）───────────────────────
 @app.post("/config/admin/bootstrap", tags=["审计"])
 async def admin_config_bootstrap():
@@ -2098,6 +2117,32 @@ async def _chat_core(req, conv_id: str, OrcReq, MsgRole, t_start: float):
                                        dept=decision.get("dept", ""),
                                        deadline_hours=decision.get("deadline_hours"),
                                        current_action="none")
+                    elif admission.observe_hazard_active():
+                        # SM-22 §3.1（行动指南 §2"局部 observe"）：hazard 范围收口——
+                        # 推断自动动作进入待复核（建议卡），零自动建单、零通知；
+                        # 影子行对照列如实记收口后实际动作（current_action="suggested"），
+                        # would_accept 照新规则真值（双轨对照口径不变）。
+                        _audit.save_hazard_suggestion(
+                            result.request_id, req.user_id, conv_id,
+                            {"decision": decision, "brief": brief_hz})
+                        hazard_action = "suggested"
+                        hazard_suggestion = {
+                            "summary": decision.get("summary", ""),
+                            "severity": decision.get("severity", "general"),
+                            "dept": decision.get("dept", ""),
+                            "deadline_hours": decision.get("deadline_hours", 0),
+                            "basis": decision.get("basis", ""),
+                        }
+                        _record_shadow(result.request_id, user_id=req.user_id, conv_id=conv_id,
+                                       would_accept=_adm_r["would_accept"],
+                                       decision=_adm_r["decision"],
+                                       reason=_adm_r["reason"], action_proposed="auto_ticket",
+                                       severity=decision.get("severity", ""),
+                                       category=decision.get("category", ""),
+                                       basis=decision.get("basis", ""),
+                                       dept=decision.get("dept", ""),
+                                       deadline_hours=decision.get("deadline_hours"),
+                                       current_action="suggested")
                     else:
                         hazard_ticket_id, merged_hz = _create_hazard_ticket(
                             _audit, decision, brief_hz, result.request_id,

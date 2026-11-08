@@ -1227,6 +1227,29 @@ class AuditStore:
             self._commit()
             return cur.rowcount > 0
 
+    def list_hazard_suggestions(self, status: Optional[str] = None,
+                                limit: int = 1000) -> List[Dict[str, Any]]:
+        """建议卡列表（SM-22 只读聚合面：确认率/确认时长/待复核清单的数据源）。
+        status 过滤可选；按创建时间倒序；payload 原样返回（解析交给调用方）。"""
+        with self._lock:
+            if status:
+                rows = self._con.execute(
+                    "SELECT * FROM hazard_suggestions WHERE status=?"
+                    " ORDER BY created_ts DESC LIMIT ?", (status, limit)).fetchall()
+            else:
+                rows = self._con.execute(
+                    "SELECT * FROM hazard_suggestions ORDER BY created_ts DESC LIMIT ?",
+                    (limit,)).fetchall()
+        out = []
+        for r in rows:
+            d = dict(r)
+            try:
+                d["payload"] = json.loads(d["payload"]) if d.get("payload") else {}
+            except (ValueError, TypeError):
+                d["payload"] = {}
+            out.append(d)
+        return out
+
     # ── SM-10：带显式幂等键的写入事务（预留→去重→工单→标记→入队 单 BEGIN IMMEDIATE）──
     def _reserve_op_locked(self, action: str, subject: str, idem_key: str,
                            target: str, request_hash: str) -> Dict[str, Any]:

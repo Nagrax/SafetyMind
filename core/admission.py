@@ -100,6 +100,26 @@ def auto_subjects() -> frozenset:
     return frozenset(s.strip() for s in raw.split(",") if s.strip())
 
 
+def observe_scopes() -> frozenset:
+    """observe 档启用范围（SAFETYMIND_ADMISSION_OBSERVE_SCOPE，逗号分隔；SM-22）。
+
+    空（默认）= SM-20 影子档语义逐字节不变（现行一切业务写入照旧，hazard_observations
+    只增裁决数据）。scope 含 "hazard" 时（且 mode=observe）进入行动指南 §2"局部 observe"：
+    普通隐患推断自动动作进入待复核（建议卡），零自动建单、零通知。缺省关闭是默认安全：
+    收口改变建单副作用，必须显式配置；与 auto_subjects 同哲学。"""
+    raw = (os.getenv("SAFETYMIND_ADMISSION_OBSERVE_SCOPE", "") or "").strip()
+    if not raw:
+        return frozenset()
+    return frozenset(s.strip().lower() for s in raw.split(",") if s.strip())
+
+
+def observe_hazard_active() -> bool:
+    """hazard 范围 observe 收口是否生效（SM-22 决策单 §3.1）：
+    mode=observe 且 SAFETYMIND_ADMISSION_OBSERVE_SCOPE 含 "hazard"。
+    off 档 / 未设 scope 的 observe 档恒 False（SM-20 影子档语义不受影响）。"""
+    return admission_mode() == "observe" and "hazard" in observe_scopes()
+
+
 def deterministic_basis(basis: str) -> bool:
     """建单条件谓词（§6）：basis ∈ {urgency, intent, safety_net} 为确定性依据。
     escalation_basis() 语义一个字不改（tests/test_escalation_basis.py 锁定）；
