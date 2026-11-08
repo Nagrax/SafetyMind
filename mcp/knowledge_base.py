@@ -340,11 +340,20 @@ class KnowledgeBase:
             else:
                 return []
         if not results["documents"] or not results["documents"][0]:
-            # 兼容旧数据：子块没有 type 元数据时不过滤重查
-            results = self._collection.query(query_texts=[query], n_results=top_k * 4)
             if restricted:
-                results = self._client_scope_filter(results, scopes)
-            if not results["documents"] or not results["documents"][0]:
+                # 受限范围不走下方无过滤兜底（wf-sm-20-c1 门禁实录 2026-11-08）：
+                #   1) _scoped_child_query 的受限分支在过滤查询为空时已做过"无过滤重查 +
+                #      客户端范围过滤"（同一集合、同一 n、同一 _client_scope_filter），
+                #      此处重放是同一查询原样再来一次，结果不可能更多；
+                #   2) 若服务端 where 过滤抛错走了 fail-closed（_scoped_child_query 内
+                #      明示"过滤无法生效一律空结果"），无过滤重查会绕过该安全裁决；
+                #   3) ChromaDB 偶发段不可读（core/chroma_utils 开篇实录的本机已知 flake）
+                #      在此裸抛 InternalError（hnsw segment reader: Nothing found on
+                #      disk），穿透本方法的降级契约直达 HTTP 500。判空即如实返回空。
+                return []
+            # 兼容旧数据：子块没有 type 元数据时不过滤重查（对齐主路径降级契约）
+            results = self._legacy_compat_query(query, top_k)
+            if results is None or not results["documents"] or not results["documents"][0]:
                 return []
             hits = zip(
                 results["documents"][0],
@@ -435,6 +444,40 @@ class KnowledgeBase:
             item.update(self._identity_fields(entry["snippet"], meta))
             items.append(item)
         return items
+
+    def _legacy_compat_query(self, query: str, top_k: int) -> Optional[Dict[str, Any]]:
+        """旧数据兼容重查（子块缺 type 元数据时越过 where 过滤的全量查询）。
+
+        wf-sm-20-c1 门禁实录（2026-11-08）：该查询此前裸抛——ChromaDB 偶发段不可读时
+        InternalError（hnsw segment reader: Nothing found on disk）穿透 search() 的
+        降级契约直达 HTTP 500。现与主路径同一契约：异常 → _runtime_degrade 如实标注；
+        corrupt 且 SAFETYMIND_KB_RUNTIME_RECOVERY=1（默认）→ recover_runtime 至多一次
+        后重查一次；仍失败返回 None（调用方按空结果处理），绝不外抛、绝不伪造结果。
+        """
+        try:
+            return self._collection.query(query_texts=[query], n_results=top_k * 4)
+        except Exception as ex:
+            degrade_note = self._runtime_degrade(ex)
+            logger.warning(f"知识库旧数据兼容重查运行态异常，已降级为空结果: {ex}")
+            self._last_degraded = degrade_note
+            if (degrade_note == "corrupt"
+                    and os.getenv("SAFETYMIND_KB_RUNTIME_RECOVERY", "1") == "1"):
+                recovered = False
+                try:
+                    recovered = self.recover_runtime(str(ex)[:200])
+                except Exception as rec_ex:
+                    # 自愈自身失败也绝不外抛——降级搜索不能因为自愈 bug 变成 500
+                    logger.error(f"运行态自愈执行异常（按未自愈处理）: {rec_ex}")
+                if recovered:
+                    try:
+                        results = self._collection.query(query_texts=[query], n_results=top_k * 4)
+                        self._last_degraded = None   # 自愈成功，恢复健康标记
+                        return results
+                    except Exception as ex2:
+                        logger.warning(f"自愈后重查仍失败，返回空结果: {ex2}")
+                        return None
+                return None
+            return None
 
     async def search_async(self, query: str, top_k: int = 5,
                            scopes: Optional[List[str]] = None) -> List[Dict[str, Any]]:
