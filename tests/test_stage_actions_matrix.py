@@ -108,6 +108,40 @@ def db_delta(before, after):
     return sorted(t for t in TABLES if before[t] != after[t])
 
 
+def audit_rows_between(before_snapshot):
+    """快照之后新落库的 audit_log 行（按快照前后总数差取最新若干行）。"""
+    n0 = len(json.loads(before_snapshot["audit_log"]))
+    con = sqlite3.connect(f"file:{TMP / 'audit.db'}?mode=ro", uri=True)
+    con.row_factory = sqlite3.Row
+    try:
+        total = con.execute("SELECT COUNT(*) AS n FROM audit_log").fetchone()["n"]
+        new_n = max(total - n0, 0)
+        if not new_n:
+            return []
+        rows = [dict(r) for r in con.execute(
+            "SELECT * FROM audit_log ORDER BY id DESC LIMIT ?", (new_n,))]
+    finally:
+        con.close()
+    return list(reversed(rows))
+
+
+def check_transition_rejection(before, want_actor, want_target):
+    """越权流转断言（2026-11-09 拒绝审计落地后口径，RF-3 已修复）：五业务表零漂移 +
+    audit_log 恰一条 ticket_transition.rejected 行（actor=服务端解析主体、target=工单 id）
+    ——拒绝也是授权事件（设计 scratch/sm-loop/handoff/SM-20/run-wf/mandate-contract.md §4）。
+    旧口径"DB 零变化"是拒绝不留痕时代的最严格形态；审计落地后"五业务表零漂移+恰一条
+    授权事件行"是新的最严格形态。返回 (ok, detail) 由调用方落格断言。"""
+    delta = db_delta(before, db_snapshot())
+    rows = audit_rows_between(before)
+    ok = set(delta) == {"audit_log"} and len(rows) == 1 \
+        and rows[0].get("action") == "ticket_transition.rejected" \
+        and rows[0].get("user_id") == want_actor \
+        and rows[0].get("target") == str(want_target) \
+        and rows[0].get("reason") == "verifier_role_required"
+    detail = f"delta={delta} row={rows[:1]}"
+    return ok, detail
+
+
 def sug_payload(summary, area):
     return {
         "decision": {"action": "suggest", "severity": "major", "summary": summary,
@@ -291,9 +325,10 @@ def main():
         r = client.post(f"/tickets/{tid}/transition",
                         json={"to_stage": "accept", "actor": "u-REP", "note": "越权探针"},
                         headers=ahdr(TOKEN_REP))
-        cell("transition 矩阵|本人(reporter+管理令牌) → accept 403 且 DB 零变化",
-             r.status_code == 403 and not db_delta(b, db_snapshot()),
-             f"code={r.status_code} body={r.text[:120]}")
+        c4_ok, c4_detail = check_transition_rejection(b, "u-REP", tid)
+        cell("transition 矩阵|本人(reporter+管理令牌) → accept 403 且五业务表零漂移+恰一条拒绝行",
+             r.status_code == 403 and c4_ok,
+             f"code={r.status_code} body={r.text[:120]} {c4_detail}")
 
         # C5 管理令牌 + 他人(reporter u-B) 主体 → accept 403
         r = client.post(f"/tickets/{tid}/transition",
@@ -337,9 +372,10 @@ def main():
         r = client.post(f"/tickets/{tid}/transition",
                         json={"to_stage": "accept", "actor": "u-VER", "note": "撤权后探针"},
                         headers=ahdr(TOKEN_VER))
-        cell("transition 矩阵|撤权(verifier 移出目录) → accept 403 且 DB 零变化",
-             r.status_code == 403 and not db_delta(b, db_snapshot()),
-             f"code={r.status_code} body={r.text[:120]}")
+        c8_ok, c8_detail = check_transition_rejection(b, "anonymous", tid)
+        cell("transition 矩阵|撤权(verifier 移出目录) → accept 403 且五业务表零漂移+恰一条拒绝行",
+             r.status_code == 403 and c8_ok,
+             f"code={r.status_code} body={r.text[:120]} {c8_detail}")
         os.environ["SAFETYMIND_USERS"] = json.dumps(USERS_FULL, ensure_ascii=False)
 
         # C9 中间阶段推进：reporter 主体 + 管理令牌 → 200（现状契约：中间阶段只认管理令牌）
@@ -414,9 +450,15 @@ def main():
         b = db_snapshot()
         r = client.post("/hazard/confirm?dev=1",
                         json={"request_id": RID_SUG, "user_id": "u-REP"}, headers=hdr())
-        cell("dev=1|POST /hazard/confirm?dev=1 匿名(仅访问令牌) → 403 且 DB 零变化",
-             r.status_code == 403 and not db_delta(b, db_snapshot()),
-             f"code={r.status_code} body={r.text[:120]}")
+        d1_rows = audit_rows_between(b)
+        cell("dev=1|POST /hazard/confirm?dev=1 匿名(仅访问令牌) → 403 且五业务表零漂移+恰一条拒绝行",
+             r.status_code == 403
+             and set(db_delta(b, db_snapshot())) == {"audit_log"}
+             and len(d1_rows) == 1
+             and d1_rows[0].get("action") == "hazard_confirm.rejected"
+             and d1_rows[0].get("user_id") == "anonymous"
+             and d1_rows[0].get("target") == RID_SUG,
+             f"code={r.status_code} body={r.text[:120]} rows={d1_rows[:1]}")
 
         r = client.get(f"/tickets/progress/{RID_SUG}?dev=1", headers=hdr())
         cell("dev=1|GET /tickets/progress?dev=1 匿名(仅访问令牌) → 200 且 found=false",

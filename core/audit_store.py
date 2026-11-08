@@ -74,7 +74,11 @@ CREATE TABLE IF NOT EXISTS audit_log (
     user_id TEXT, conv_id TEXT,
     message_preview TEXT, intent TEXT, urgency TEXT,
     escalated INTEGER DEFAULT 0, latency_ms REAL, degraded INTEGER DEFAULT 0,
-    knowledge_used INTEGER DEFAULT 0
+    knowledge_used INTEGER DEFAULT 0,
+    -- 被拒越权写审计（台账 api/main.py::no-audit-on-rejection，设计 SM-20
+    -- mandate-contract §4：拒绝也是授权事件）：拒绝行 action/target/reason 有值，
+    -- 聊天请求行保持空串（读取语义不变，旧库随迁移幂等加列零回填）。
+    action TEXT DEFAULT '', target TEXT DEFAULT '', reason TEXT DEFAULT ''
 );
 CREATE TABLE IF NOT EXISTS upgrade_events (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -411,6 +415,20 @@ class AuditStore:
         except sqlite3.Error as ex:  # pragma: no cover - 迁移失败不拖垮审计存储
             self._con.rollback()
             logger.warning(f"通知 outbox 迁移失败（沿用旧结构读取）: {ex}")
+        # 被拒越权写审计（2026-11-09，台账 api/main.py::no-audit-on-rejection；设计
+        # scratch/sm-loop/handoff/SM-20/run-wf/mandate-contract.md §4）：audit_log 非破坏
+        # 加列 action/target/reason——拒绝也是授权事件，主体已解析但越权的写拒绝落一行。
+        # 幂等零回填：旧聊天行三列保持空串=非拒绝事件标记，读取语义逐字节不变。
+        try:
+            cols = {r[1] for r in self._con.execute("PRAGMA table_info(audit_log)")}
+            for col, ddl in (("action", "TEXT DEFAULT ''"),
+                             ("target", "TEXT DEFAULT ''"),
+                             ("reason", "TEXT DEFAULT ''")):
+                if col not in cols:
+                    self._con.execute(f"ALTER TABLE audit_log ADD COLUMN {col} {ddl}")
+        except sqlite3.Error as ex:  # pragma: no cover - 迁移失败不拖垮审计存储
+            self._con.rollback()
+            logger.warning(f"audit_log 拒绝审计列迁移失败（沿用旧结构读取）: {ex}")
 
     def _norm_stage(self, stage: str, status: str) -> str:
         """阶段归一：stage 列缺失（理论上 _migrate 后不再出现）时按旧两态推导。"""
@@ -450,6 +468,25 @@ class AuditStore:
                 (time.time(), request_id, user_id, conv_id, _preview(message),
                  intent, urgency, int(escalated), latency_ms,
                  int(degraded), int(knowledge_used)))
+            self._commit()
+
+    def record_auth_rejection(self, action: str, actor: str, target: str,
+                              reason: str, request_id: str = "") -> None:
+        """被拒越权写审计（2026-11-09，台账 api/main.py::no-audit-on-rejection；设计
+        scratch/sm-loop/handoff/SM-20/run-wf/mandate-contract.md §4"一般越权写的拒绝审计"
+        ——拒绝也是授权事件）：主体已解析但越权的写操作被拒时落一行授权事件，审计员可从
+        库内追溯拒绝始末（此前六表快照前后零变化，拒绝不留任何痕）。
+
+        只记授权元数据：actor=服务端解析主体（未解析如实记 anonymous）、action=拒绝动作、
+        target=被操作对象标识（仅调用方自报的编号/工单 id）、reason=机器可读原因码；
+        **绝不落他人数据内容**（建议/工单正文不入行）。聊天审计列（message_preview/intent/
+        urgency/escalated/latency）保持默认值，旧行读取语义逐字节不变。
+        抛出由调用方定夺（api 层钩子捕获告警，不改写拒绝语义）。"""
+        with self._lock:
+            self._con.execute(
+                "INSERT INTO audit_log (ts, request_id, user_id, action, target, reason)"
+                " VALUES (?,?,?,?,?,?)",
+                (time.time(), request_id, actor, action, target, reason))
             self._commit()
 
     def list_audit(self, limit: int = 100, escalated_only: bool = False) -> List[Dict[str, Any]]:

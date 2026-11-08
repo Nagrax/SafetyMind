@@ -704,6 +704,26 @@ def _subject_id_of(req) -> str:
     return req.user_id if _isolation_enforced() else ""
 
 
+def _record_auth_rejection(action: str, *, actor: str, target: str, reason: str,
+                           request_id: str = "") -> None:
+    """被拒越权写审计钩子（2026-11-09，台账 api/main.py::no-audit-on-rejection；设计
+    scratch/sm-loop/handoff/SM-20/run-wf/mandate-contract.md §4"一般越权写的拒绝审计"
+    ——拒绝也是授权事件）：主体已解析但被拒的写操作在 audit_log 落一行
+    （actor/action/target/reason/request_id），与快照闸门的 timeline 留痕同构。
+
+    只记授权元数据（主体/动作/对象标识/原因码），不落任何他人数据内容；
+    审计写失败只告警、绝不改写拒绝语义（仍按原状态码拒绝，不 500）。
+    仅越权（主体级授权）拒绝调用：401 外墙/管理口令错误属认证失败无主体可记，
+    过期/冲突/重放已有各自独立留痕（expired 痕/conflict 痕/404 一次性契约），不在此列。"""
+    if _audit is None:
+        return
+    try:
+        _audit.record_auth_rejection(action=action, actor=actor, target=target,
+                                     reason=reason, request_id=request_id)
+    except Exception as ex:   # 审计故障不拖垮拒绝路径（R7 fail-safe 回归钉死）
+        logger.warning(f"拒绝审计落库失败（拒绝语义不受影响）: {ex}")
+
+
 @contextmanager
 def _scoped_knowledge(subject: subject_auth.Subject):
     """多用户形态下按主体资料范围约束**本次请求的全部知识库检索**。
@@ -993,6 +1013,8 @@ async def ticket_close(ticket_id: int, body: Optional[TicketCloseInput] = None,
             raise HTTPException(400, "缺整改证据不能经正常或旧兼容入口闭单：请提供验收批注或整改证据")
         subject = _subject_for(x_user_token, "")
         if not subject.has_role("verifier", "admin"):
+            _record_auth_rejection("ticket_close.rejected", actor=subject.subject_id,
+                                   target=str(ticket_id), reason="verifier_role_required")
             raise HTTPException(403, "无权验收：需要验收者或管理员角色")
     return {"closed": _audit.close_ticket(ticket_id)}
 
@@ -1043,6 +1065,8 @@ async def ticket_transition(ticket_id: int, body: TicketTransitionInput,
     if _isolation_enforced() and body.to_stage in ("accept", "reject"):
         subject = _subject_for(x_user_token, body.actor)
         if not subject.has_role("verifier", "admin"):
+            _record_auth_rejection("ticket_transition.rejected", actor=subject.subject_id,
+                                   target=str(ticket_id), reason="verifier_role_required")
             raise HTTPException(403, "无权验收：需要验收者或管理员角色")
         if body.to_stage == "accept" and not (body.note or "").strip():
             raise HTTPException(400, "验收必须填写验收批注（验收批注不得为空）")
@@ -1290,6 +1314,9 @@ async def hazard_confirm(body: HazardConfirmRequest,
     if _isolation_enforced():
         subject = _subject_for(x_user_token, body.user_id)
         if str(sug.get("user_id") or "") != subject.subject_id:
+            _record_auth_rejection("hazard_confirm.rejected", actor=subject.subject_id,
+                                   target=str(body.request_id), reason="cross_subject",
+                                   request_id=str(body.request_id))
             raise HTTPException(403, "无权处理该上报事项")
         user_id = subject.subject_id
     else:
@@ -1339,6 +1366,9 @@ def _hazard_confirm_idempotent(body: HazardConfirmRequest, idem_key: str,
             "current": (result.get("detail") or {}).get("current"),
         })
     if kind == "forbidden":
+        _record_auth_rejection("hazard_confirm.rejected", actor=subject_id,
+                               target=str(body.request_id), reason="cross_subject",
+                               request_id=str(body.request_id))
         raise HTTPException(403, "无权处理该上报事项")
     if kind == "expired":
         # 过期走既有 SM-01 契约：独立事务落 expired 痕 + 409（与幂等冲突错误码区分）

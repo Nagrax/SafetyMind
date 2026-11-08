@@ -6,24 +6,29 @@
 # 覆盖（全部走 FastAPI TestClient 真实 HTTP 端点，不起真实服务、零 LLM、零网络）：
 #   5 主体：匿名(仅访问令牌) / 本人(u-A) / 他人(u-B) / 授权管理员(u-ADM) / 凭据撤销后(u-C)
 #   4 动作：读工单 / 确认建议 / 导出下载 / 管理端改判 → 5×4 = 20 格 + 外墙探针(无访问令牌×4) = 24 格
-#   写探针：每个主体的越权写逐个发真实请求，断言 401/403/409 且 DB 六表快照前后零变化
+#   写探针：每个主体的越权写逐个发真实请求；主体级越权 403 断言五业务表零漂移 + audit_log
+#           恰一条拒绝行（2026-11-09 拒绝审计落地），认证类 401 断言六表零变化
 #
 # G1 逐格预期（行动指南 G1：跨界读取或写入 0 次）：
 #   读工单      本人 found=true；匿名/他人/撤权 found=false（不泄露存在性）；管理员走授权读
 #               通道 GET /tickets/{id}/timeline（200，用户端 progress 仍归属受限）；无令牌 401
 #   确认建议    仅本人 200（建议确认+建单+时间线+通知四表精确落库）；匿名/他人/管理员/撤权
-#               一律 403 且 DB 零变化；无令牌 401
+#               一律 403 且五业务表零漂移+恰一条拒绝审计行（拒绝也是授权事件）；无令牌 401
 #   导出下载    仅授权管理员 200（RF-1 已修复：2026-11-09 闭环发现 export-subject-scope，
 #               对齐 SM-42 同范式 require_admin）；匿名/本人/他人/撤权 401 且零文件落盘；
 #               无令牌 401（产物为静态法定模板，无跨主体数据，G1 数据跨界=0 不变）
 #   管理端改判  仅管理员 200（severity 改判 + patch 时间线留痕）；其余主体 401 且 DB 零变化
 #
-# 立案记录（实测发现；RF-1 原按设计取舍不修，2026-11-09 经闭环台账修复，其余详见红灯实测 JSON）：
+# 立案记录（实测发现；RF-1/RF-3 原按设计取舍不修，2026-11-09 经闭环台账修复，其余详见红灯实测 JSON）：
 #   RF-1 /ledger/export 仅访问口令门、无角色边界（任何 access gate 持有者可触发服务端文件生成）
 #       —— 已修复：api/main.py 加 Depends(require_admin)；回归 tests/test_ledger_export_scope.py
 #          （红灯证据 scratch/sm-loop/handoff/findings-cleanup/api_main.py--export-subject-scope/）
 #   RF-2 导出文件名按秒时间戳，同秒并发导出互相覆盖（实测 files_created +0）
-#   RF-3 被拒越权写不留任何审计行 —— 探针断言取"DB 零变化"（比"只增对应拒绝事件"更严格）
+#   RF-3 被拒越权写不留任何审计行 —— 已修复：api/main.py 主体级越权 403 落 audit_log 拒绝行
+#          （设计 SM-20 mandate-contract §4"拒绝也是授权事件"）；回归
+#          tests/test_auth_rejection_audit.py（红灯证据 scratch/sm-loop/handoff/
+#          findings-cleanup/api_main.py--no-audit-on-rejection/）；本矩阵 4 格确认建议越权
+#          探针同步改为新口径（五业务表零漂移+恰一条拒绝行+actor=服务端主体）
 #
 # 铁律：存储全部走一次性临时目录（审计库 / 台账输出钉到 tmp），不触碰生产数据目录与仓库
 # data/；环境不可用退出码 2，绝不伪装成业务失败。
@@ -106,17 +111,51 @@ def sug_payload(summary, area):
     }
 
 
-def probe_rejected_write(send):
-    """写探针：真实发一次越权写请求，返回 (是否被拒且 DB 零变化, 明细)。
+def audit_rows_between(before_snapshot):
+    """快照之后新落库的 audit_log 行（按快照前后总数差取最新若干行）。"""
+    n0 = len(json.loads(before_snapshot["audit_log"]))
+    con = sqlite3.connect(f"file:{TMP / 'audit.db'}?mode=ro", uri=True)
+    con.row_factory = sqlite3.Row
+    try:
+        total = con.execute("SELECT COUNT(*) AS n FROM audit_log").fetchone()["n"]
+        new_n = max(total - n0, 0)
+        if not new_n:
+            return []
+        rows = [dict(r) for r in con.execute(
+            "SELECT * FROM audit_log ORDER BY id DESC LIMIT ?", (new_n,))]
+    finally:
+        con.close()
+    return list(reversed(rows))
 
-    断言：状态码 ∈ {401,403,409} 且 DB 六表快照前后零变化（当前产品拒绝路径不写任何
-    审计行，"零变化"是"审计行只增对应拒绝事件"的最严格形态——拒绝不留审计痕已立案 RF-3）。
+
+def probe_rejected_write(send, expect_audit_action=None, expect_audit_actor=None):
+    """写探针：真实发一次越权写请求，返回 (是否被拒且 DB 漂移符合口径, 明细)。
+
+    断言口径（2026-11-09 更新，RF-3 已修复——闭环发现 api/main.py::no-audit-on-rejection，
+    设计 scratch/sm-loop/handoff/SM-20/run-wf/mandate-contract.md §4"拒绝也是授权事件"）：
+      - expect_audit_action=None：认证类拒绝（401 外墙/管理口令）无服务端主体可记，
+        DB 六表零变化（原口径保留，防拒绝审计行扩散到非授权拒绝路径）；
+      - expect_audit_action="<action>"：主体级越权 403 → 五业务表零漂移 +
+        audit_log 恰增一条 action 匹配的拒绝行（可再钉 actor=服务端解析主体）。
+    此前口径"六表零变化"是拒绝不留痕时代的最严格形态；拒绝审计落地后，
+    "五业务表零漂移 + 恰一条授权事件行"是新的最严格形态（多一行少一行都算漂移）。
     只计算不断言，落断言由调用方的矩阵格完成（一格一条断言，不重复记）。"""
     before = db_snapshot()
     resp = send()
     delta = db_delta(before, db_snapshot())
-    ok = resp.status_code in REJECT_CODES and not delta
+    ok = resp.status_code in REJECT_CODES
     detail = f"code={resp.status_code} db_delta={delta} body={resp.text[:120]}"
+    if ok and expect_audit_action is None:
+        ok = not delta
+    elif ok:
+        rows = audit_rows_between(before)
+        ok = set(delta) == {"audit_log"} and len(rows) == 1 \
+            and rows[0].get("action") == expect_audit_action
+        if ok and expect_audit_actor is not None:
+            ok = rows[0].get("user_id") == expect_audit_actor
+            detail += f" actor={rows[0].get('user_id')!r}"
+        if rows:
+            detail += f" reject_row={json.dumps(rows[-1], ensure_ascii=False, default=str)[:160]}"
     return ok, detail
 
 
@@ -257,14 +296,20 @@ def main():
              f"code={r.status_code}")
 
         # ══ 动作 2：确认建议（POST /hazard/confirm；越权格先行，本人格最后）══════
-        # 越权写探针：每个主体真实发一次越权确认，断言 403 且 DB 六表零变化。
-        for subj, tok in (("匿名", ""), ("他人(u-B)", TOKEN_B),
-                          ("授权管理员(u-ADM)", TOKEN_ADM), ("凭据撤销后(u-C)", TOKEN_C)):
+        # 越权写探针：每个主体真实发一次越权确认，断言 403 且五业务表零漂移 +
+        # audit_log 恰一条拒绝行（actor=服务端解析主体；2026-11-09 拒绝审计落地，
+        # RF-3 修复后口径，旧"六表零变化"见 probe_rejected_write 文档）。
+        for subj, tok, want_actor in (("匿名", "", "anonymous"), ("他人(u-B)", TOKEN_B, "u-B"),
+                                      ("授权管理员(u-ADM)", TOKEN_ADM, "u-ADM"),
+                                      ("凭据撤销后(u-C)", TOKEN_C, "anonymous")):
             ok, detail = probe_rejected_write(
                 lambda tok=tok: client.post("/hazard/confirm",
                                             json={"request_id": RID_2, "user_id": "u-A"},
-                                            headers=hdr(tok)))
-            cell(f"矩阵|确认建议|{subj} → 403 且 DB 六表零变化（写探针：真实越权写请求）",
+                                            headers=hdr(tok)),
+                expect_audit_action="hazard_confirm.rejected",
+                expect_audit_actor=want_actor)
+            cell(f"矩阵|确认建议|{subj} → 403 且五业务表零漂移+恰一条拒绝行"
+                 f"（actor={want_actor}）",
                  ok, detail + " （越权确认 u-A 的 pending 建议）")
 
         b = db_snapshot()

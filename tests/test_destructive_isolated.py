@@ -23,9 +23,10 @@
 #   S2 过期版本确认返回冲突且冲突行可回放：确认已过 24h 的建议 → 409 + 建议行落
 #      expired 痕（不是永远滞留 pending）；重新上报同收据后可正常确认建单；
 #   S3 跨主体确认被拒：他人令牌确认本人建议 → 403，伪造 body.user_id 也不能越权，
-#      六表零漂移；
-#   S4 撤权后操作被拒：主体目录移除令牌后确认 → 403（令牌即匿名），六表零漂移，
-#      建议保持 pending 可被后续合法流程处理；
+#      五业务表零漂移 + audit_log 恰一条拒绝行（2026-11-09 拒绝审计落地，RF-3 修复；
+#      设计 SM-20 mandate-contract §4"拒绝也是授权事件"）；
+#   S4 撤权后操作被拒：主体目录移除令牌后确认 → 403（令牌即匿名），五业务表零漂移
+#      + 恰一条拒绝行（actor=anonymous），建议保持 pending 可被后续合法流程处理；
 #   S5 重复建单去重：同用户 24h 内同实体第二次确认 → merged=true 合并既有单，
 #      不新建工单（tickets 表零新增），时间线留 repeat_report 事件。
 #
@@ -105,6 +106,39 @@ def db_snapshot():
 
 def db_delta(before, after):
     return sorted(t for t in TABLES if before[t] != after[t])
+
+
+def audit_rows_between(before_snapshot):
+    """快照之后新落库的 audit_log 行（按快照前后总数差取最新若干行）。"""
+    n0 = len(json.loads(before_snapshot["audit_log"]))
+    con = sqlite3.connect(f"file:{AUDIT_DB}?mode=ro", uri=True)
+    con.row_factory = sqlite3.Row
+    try:
+        total = con.execute("SELECT COUNT(*) AS n FROM audit_log").fetchone()["n"]
+        new_n = max(total - n0, 0)
+        if not new_n:
+            return []
+        rows = [dict(r) for r in con.execute(
+            "SELECT * FROM audit_log ORDER BY id DESC LIMIT ?", (new_n,))]
+    finally:
+        con.close()
+    return list(reversed(rows))
+
+
+def check_rejection_drift(tag, before, want_actor, want_target):
+    """越权拒绝断言（2026-11-09 拒绝审计落地后口径，RF-3 已修复）：
+    五张业务表零漂移 + audit_log 恰一条 hazard_confirm.rejected 行
+    （actor=服务端解析主体、target=自报上报编号）——拒绝也是授权事件
+    （设计 scratch/sm-loop/handoff/SM-20/run-wf/mandate-contract.md §4）。
+    旧口径"六表零漂移"是拒绝不留痕时代的最严格形态；审计落地后
+    "五业务表零漂移+恰一条授权事件行"是新的最严格形态。"""
+    delta = db_delta(before, db_snapshot())
+    rows = audit_rows_between(before)
+    ok = set(delta) == {"audit_log"} and len(rows) == 1 \
+        and rows[0].get("action") == "hazard_confirm.rejected" \
+        and rows[0].get("user_id") == want_actor \
+        and rows[0].get("target") == want_target
+    record(tag, ok, f"delta={delta} rows={rows[:1]}")
 
 
 def sug_payload(summary, area):
@@ -254,13 +288,15 @@ def main():
         rid3 = f"SM01-DESTR-S3-{STAMP}"
         audit.save_hazard_suggestion(rid3, "u-A", f"conv-{rid3}",
                                      sug_payload("丙区安全出口指示灯熄灭", "丙区"))
-        for label, uid in (("他人自己的 user_id", "u-B"), ("伪造归属 user_id=u-A", "u-A")):
+        for label, uid, want_actor in (("他人自己的 user_id", "u-B", "u-B"),
+                                       ("伪造归属 user_id=u-A", "u-A", "u-B")):
             b = db_snapshot()
             r = confirm(rid3, TOKEN_B, uid)
-            delta = db_delta(b, db_snapshot())
-            record(f"S3|跨主体确认（{label}）→ 403 且六表零漂移",
-                   r.status_code == 403 and not delta,
-                   f"code={r.status_code} delta={delta} body={r.text[:120]}")
+            record(f"S3|跨主体确认（{label}）→ 403",
+                   r.status_code == 403,
+                   f"code={r.status_code} body={r.text[:120]}")
+            check_rejection_drift(f"S3|跨主体确认（{label}）→ 五业务表零漂移+恰一条拒绝行"
+                                  f"（actor={want_actor}）", b, want_actor, rid3)
         record("S3|被拒后建议保持 pending（归属人仍可正常确认）",
                audit.get_hazard_suggestion(rid3) is not None,
                "get_hazard_suggestion=None（建议被意外消费）")
@@ -278,19 +314,21 @@ def main():
             [u for u in USERS_FULL if u["token"] != TOKEN_C], ensure_ascii=False)
         b = db_snapshot()
         r = confirm(rid4, TOKEN_C, "u-C")
-        delta = db_delta(b, db_snapshot())
-        record("S4|撤权后确认 → 403（令牌失效即匿名）且六表零漂移",
-               r.status_code == 403 and not delta,
-               f"code={r.status_code} delta={delta} body={r.text[:120]}")
+        record("S4|撤权后确认 → 403（令牌失效即匿名）",
+               r.status_code == 403,
+               f"code={r.status_code} body={r.text[:120]}")
+        check_rejection_drift("S4|撤权后确认 → 五业务表零漂移+恰一条拒绝行（actor=anonymous）",
+                              b, "anonymous", rid4)
         record("S4|撤权后建议保持 pending（可由合法流程接手，不因撤权丢数据）",
                audit.get_hazard_suggestion(rid4) is not None,
                "get_hazard_suggestion=None（建议被意外消费）")
         b = db_snapshot()
         r = confirm(rid4, TOKEN_C, "")
-        delta = db_delta(b, db_snapshot())
-        record("S4|撤权后不带 user_id 重试 → 仍 403 且六表零漂移（body 不能补回身份）",
-               r.status_code == 403 and not delta,
-               f"code={r.status_code} delta={delta}")
+        record("S4|撤权后不带 user_id 重试 → 仍 403（body 不能补回身份）",
+               r.status_code == 403,
+               f"code={r.status_code} body={r.text[:120]}")
+        check_rejection_drift("S4|撤权重试 → 五业务表零漂移+恰一条拒绝行（actor=anonymous）",
+                              b, "anonymous", rid4)
 
         # ══ S5 重复建单去重 ═══════════════════════════════════════════════════
         rid5a = f"SM01-DESTR-S5A-{STAMP}"
