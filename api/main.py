@@ -889,10 +889,14 @@ async def ticket_close(ticket_id: int, body: Optional[TicketCloseInput] = None,
 # ── 工单五阶段回路（brief→discuss→execute→feedback→accept/reject，借鉴 OCTO Loop）──
 class TicketTransitionInput(BaseModel):
     """阶段流转：to_stage ∈ brief|discuss|execute|feedback|accept|reject；
-    actor/note 作为操作者批注随时间线落库。"""
+    actor/note 作为操作者批注随时间线落库。
+    expected_from_stage（SM-21 乐观并发，可选）：提交方所依据的页面阶段——非空且与
+    服务端当前阶段不一致 → 409（kind=stage_conflict，附实际阶段），零写动作；
+    旧客户端不传 = 行为逐字节不变。合法动作以服务端 allowed_stages 派生为准。"""
     to_stage: str
     actor: str = "admin"
     note: str = ""
+    expected_from_stage: str = ""
 
 
 @app.post("/tickets/{ticket_id}/transition", tags=["审计"])
@@ -908,6 +912,23 @@ async def ticket_transition(ticket_id: int, body: TicketTransitionInput,
     （处理者不能越权验收）；accept 另要求非空验收批注，空批注 400。本地形态不生效。"""
     if _audit is None:
         raise HTTPException(503, "审计存储未启用")
+    # SM-21 过期页面提交（乐观并发）：提交方声明其所依据的阶段，与服务端当前阶段不一致
+    # → 409 冲突（kind=stage_conflict），**零写动作**（视图过期不是写，不落 timeline；
+    # store 层 stage_conflict 审计行语义保留给真实并发竞态兜底）。客户端按 409 附带的
+    # 实际阶段（或 GET timeline）刷新视图后重发即可恢复，(from,to) 不产生重复变更。
+    _expected = (body.expected_from_stage or "").strip()
+    if _expected:
+        _current = _audit.get_ticket(ticket_id)
+        if _current is not None and _current.get("stage") != _expected:
+            raise HTTPException(409, detail={
+                "kind": "stage_conflict",
+                "expected": _expected,
+                "from_stage": _current.get("stage", ""),
+                "current_stage": _current.get("stage", ""),
+                "error": f"工单阶段已变化（当前 "
+                         f"{_current.get('stage_label') or _current.get('stage')}），"
+                         f"请刷新后重试",
+            })
     if _isolation_enforced() and body.to_stage in ("accept", "reject"):
         subject = _subject_for(x_user_token, body.actor)
         if not subject.has_role("verifier", "admin"):

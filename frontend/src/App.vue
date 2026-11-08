@@ -269,6 +269,10 @@
           <span>访问令牌<small>管理员发给你的口令；本机自用留空即可</small></span>
           <input v-model="accessToken" placeholder="无令牌则留空" @change="persist" />
         </label>
+        <label class="cfg-row">
+          <span>用户口令<small>多用户部署时你的身份口令；本机自用留空</small></span>
+          <input v-model="userToken" placeholder="无则留空" @change="persist" />
+        </label>
         <div v-if="!adminCfg.length && !adminInputOpen" class="cfg-first">
           <button @click="adminInputOpen = true">我已有管理密码，点击输入</button>
           <button @click="bootstrapAdmin">首次使用：一键生成管理密码</button>
@@ -529,6 +533,9 @@ async function saveAdminConfig() {
 }
 const adminToken = ref(localStorage.getItem('safetymind.adminToken') || '')
 const accessToken = ref(localStorage.getItem('safetymind.accessToken') || '')
+// 多用户形态的主体口令（X-User-Token）：服务端据此解析本人身份（工单进度/确认建议）。
+// 本机自用留空 = 行为零变化；权限一律服务端判定，?dev=1 与本字段都不产生授权。
+const userToken = ref(localStorage.getItem('safetymind.userToken') || '')
 const conversations = ref([])
 const config = ref({ escalationPhone: '' })
 
@@ -910,7 +917,9 @@ async function confirmHazard(item) {
     showToast(data.merged ? `已合并到现有工单 #${data.ticket_id}` : `隐患工单 #${data.ticket_id} 已建立`)
   } catch (error) {
     const msg = String(error.message || '')
-    showToast(msg.includes('404') ? '上报建议已过期（24 小时内有效）' : `上报失败：${msg}`)
+    // 过期确认后端回 409（SM-01 契约：独立事务落 expired 痕），404 分支文案同样含"已过期"
+    // ——按文案判定，不再按状态码（2026-11-08：后端过期确认改回 409 后 404 键已失配）
+    showToast(msg.includes('已过期') ? '上报建议已过期（24 小时内有效）' : `上报失败：${msg}`)
   } finally {
     item.hazardBusy = false
   }

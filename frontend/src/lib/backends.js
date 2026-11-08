@@ -165,7 +165,8 @@ export async function streamChat(type, settings, message, { onStage } = {}) {
       method: 'POST',
       headers: {
         'Content-Type': 'application/json',
-        'X-Access-Token': localStorage.getItem('safetymind.accessToken') || ''
+        'X-Access-Token': localStorage.getItem('safetymind.accessToken') || '',
+        'X-User-Token': localStorage.getItem('safetymind.userToken') || ''
       },
       body: JSON.stringify(payload)
     })
@@ -355,7 +356,13 @@ function normalizeChatResponse(type, raw) {
 
 async function requestJson(baseUrl, path, options = {}) {
   const url = `${normalizeBaseUrl(baseUrl)}${path}`
-  options.headers = { ...(options.headers || {}), 'X-Access-Token': localStorage.getItem('safetymind.accessToken') || '' }
+  // X-User-Token（SM-21）：多用户形态的主体口令——服务端据此解析本人（工单进度/确认建议
+  // 才能命中归属主体）；本机自用为空串=匿名语义不变。权限一律服务端判定。
+  options.headers = {
+    ...(options.headers || {}),
+    'X-Access-Token': localStorage.getItem('safetymind.accessToken') || '',
+    'X-User-Token': localStorage.getItem('safetymind.userToken') || ''
+  }
   const response = await fetch(url, options)
   const text = await response.text()
   let data = null

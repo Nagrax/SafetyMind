@@ -217,6 +217,17 @@ _STAGE_TRANSITIONS: Dict[str, set] = {
 }
 
 
+def allowed_transitions(stage: str) -> tuple:
+    """当前阶段的合法下一步（SM-21 R1：唯一派生点=_STAGE_TRANSITIONS，按 TICKET_STAGES 序）。
+
+    客户端/管理端渲染"下一步动作"一律读本派生（服务端为权限与状态的唯一判断点），
+    未知阶段回空元组（不发明动作）。"""
+    allowed = _STAGE_TRANSITIONS.get(str(stage or ""))
+    if not allowed:
+        return ()
+    return tuple(s for s in TICKET_STAGES if s in allowed)
+
+
 def _preview(text: str, limit: int = 80) -> str:
     """消息摘要（不存原文）：压缩空白并截断。"""
     return " ".join(str(text or "").split())[:limit]
@@ -324,6 +335,9 @@ class AuditStore:
         d = dict(row)
         d["stage"] = self._norm_stage(d.get("stage", ""), d.get("status", ""))
         d["stage_label"] = STAGE_LABELS.get(d["stage"], d["stage"])
+        # SM-21 阶段动作派生（只读，additive）：当前阶段合法下一步由白名单唯一派生，
+        # 管理端/客户端渲染动作一律消费本字段，不得自带白名单。
+        d["allowed_stages"] = list(allowed_transitions(d["stage"]))
         # SM-20 授权快照状态派生（只读，不改写数据）："bound"=有快照 / "legacy"=空（旧单标记，
         # 管理端据此辨识补授权对象）。禁止伪造历史依据：legacy 永远靠补授权时间线救，不改本行。
         d["mandate_status"] = "bound" if (d.get("mandate_json") or "").strip() else "legacy"
