@@ -18,6 +18,7 @@ import re
 import shutil
 import sys
 import tempfile
+import threading
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
@@ -117,12 +118,200 @@ def main():
     # 清理
     shutil.rmtree(str(tmp), ignore_errors=True)
 
+    # ── 7. 同秒并发导出回归（export-same-second-overwrite）──────────────
+    conc_xlsx_tests()
+    conc_docx_tests()
+
     # ── SM-42 整改验收摘要试点（2026-11-08）─────────────────────────────────
     sm42_main()
 
     failed = RESULTS.count(False)
     print(f"\n{len(RESULTS) - failed}/{len(RESULTS)} PASSED")
     sys.exit(1 if failed else 0)
+
+
+# ═══════════════════════════════════════════════════════════════════════════
+# 同秒并发导出回归（闭环发现 export-same-second-overwrite，2026-11-09）
+#
+# 发现：export_xlsx/export_docx 文件名只带秒级时间戳（%Y%m%d-%H%M%S），同一秒内的
+#       连发/并发导出拿到同一路径，后写者静默覆写前写者（写探针实测 5 连发
+#       files_created 仅 +1），且直接 save() 无原子发布。
+# 修后契约（对齐 SM-42 版本化归档"产物一旦存在绝不覆写"范式）：
+#   C1 同一秒内 N 次导出（顺序连发 + 多线程并发）→ N 个互不相同且完好可读回的文件；
+#   C2 已存在文件（哪怕恰好占用本次时间戳名）绝不被覆写，导出走冲突序号路径；
+#   C3 渲染失败零残留（不留认领占位/临时半成品）。
+# 时间在模块命名空间内冻结到同一秒：让旧实现确定性复现"同秒同路径"，
+# 不赌真实秒边界（否则红灯变偶发，等于没测）。
+# ═══════════════════════════════════════════════════════════════════════════
+
+CONC_OUT = Path("D:/claudecode/scratch/sm-loop/test_ledger_conc_out")
+
+
+class _FrozenSecondTime:
+    """替换 core.ledger_export 命名空间里的 time 模块（仅测试内），冻结同一秒。"""
+
+    FROZEN_STAMP = "20261109-120000"
+
+    @staticmethod
+    def strftime(fmt, *args, **kwargs):
+        return _FrozenSecondTime.FROZEN_STAMP
+
+
+def _conc_subdir(name: str) -> Path:
+    d = CONC_OUT / name
+    if d.exists():
+        shutil.rmtree(str(d), ignore_errors=True)
+    d.mkdir(parents=True, exist_ok=True)
+    return d
+
+
+def _conc_assert_c1(label: str, do_export, readback) -> None:
+    """C1：同一秒内顺序 5 连发 + 多线程并发 8 导出 → 各自 N 个互不相同且完好的文件。"""
+    paths = [do_export() for _ in range(5)]
+    uniq = {str(p) for p in paths}
+    record(f"[{label}] C1: 同秒 5 连发产出 5 个互不相同的文件", len(uniq) == 5,
+           f"uniq={len(uniq)} names={[Path(str(p)).name for p in paths]}")
+    sizes = {str(p): (Path(p).stat().st_size if Path(p).exists() else 0) for p in paths}
+    record(f"[{label}] C1: 5 个产物全部落盘且非空", all(s > 1000 for s in sizes.values()),
+           f"sizes={sizes}")
+    bad = []
+    for p in paths:
+        try:
+            readback(p)
+        except Exception as e:
+            bad.append(f"{Path(p).name}: {type(e).__name__}: {e}")
+    record(f"[{label}] C1: 5 个产物全部完好可读回（无覆写/撕裂损坏）", not bad, f"bad={bad}")
+
+    results, errors = [], []
+
+    def _worker():
+        try:
+            results.append(do_export())
+        except Exception as e:
+            errors.append(f"{type(e).__name__}: {e}")
+
+    threads = [threading.Thread(target=_worker) for _ in range(8)]
+    for t in threads:
+        t.start()
+    for t in threads:
+        t.join()
+    uniq_t = {str(p) for p in results}
+    ok_thr = (not errors and len(uniq_t) == 8
+              and all(Path(p).exists() and Path(p).stat().st_size > 1000 for p in results))
+    record(f"[{label}] C1: 多线程并发 8 导出零异常且产出 8 个互不相同的非空文件", ok_thr,
+           f"errors={errors} uniq={len(uniq_t)} names={[Path(p).name for p in results]}")
+    bad = []
+    for p in results:
+        try:
+            readback(p)
+        except Exception as e:
+            bad.append(f"{Path(p).name}: {type(e).__name__}: {e}")
+    record(f"[{label}] C1: 并发 8 产物全部完好可读回", not bad, f"bad={bad}")
+
+
+def _conc_assert_c2(label: str, suffix: str, do_export) -> None:
+    """C2：已存在文件（恰好占用本次将生成的时间戳名）绝不被覆写。"""
+    d2 = _conc_subdir(f"{label}_c2")
+    canary = d2 / f"隐患排查治理台账_{_FrozenSecondTime.FROZEN_STAMP}{suffix}"
+    canary.write_bytes(b"canary-not-a-real-export")
+    p = do_export(d2)
+    record(f"[{label}] C2: 同名已存在文件不被覆写（导出走冲突序号路径）",
+           Path(p) != canary and canary.read_bytes() == b"canary-not-a-real-export",
+           f"export={Path(p).name} canary_bytes={len(canary.read_bytes())}")
+
+
+def _conc_assert_c3(label: str, boom_save) -> None:
+    """C3：渲染失败返回结构化失败且零残留（不留认领占位/临时半成品）。"""
+    from core import ledger_export as lx
+    d3 = _conc_subdir(f"{label}_c3")
+    with boom_save():
+        r = lx.export("hazard", label, d3, True)
+    residue = sorted(q.name for q in d3.iterdir())
+    record(f"[{label}] C3: 渲染失败返回结构化失败",
+           r.get("ok") is False and "注入的保存故障" in str(r.get("error")), f"r={r}")
+    record(f"[{label}] C3: 渲染失败零残留（无认领占位/临时文件）", not residue,
+           f"residue={residue}")
+
+
+def conc_xlsx_tests():
+    from core import ledger_export as lx
+    import openpyxl
+
+    d1 = _conc_subdir("xlsx_c1")
+    do_export = lambda out=None: lx.export_xlsx("hazard", out or d1, with_demo=True)
+
+    def _readback(p):
+        wb = openpyxl.load_workbook(str(p))
+        assert len(wb.sheetnames) >= 1, f"sheets={wb.sheetnames}"
+
+    import contextlib
+
+    @contextlib.contextmanager
+    def _boom_save():
+        orig = openpyxl.Workbook.save
+
+        def _boom(self, filename):
+            raise RuntimeError("注入的保存故障")
+        openpyxl.Workbook.save = _boom
+        try:
+            yield
+        finally:
+            openpyxl.Workbook.save = orig
+
+    orig_time = lx.time
+    lx.time = _FrozenSecondTime
+    try:
+        _conc_assert_c1("xlsx", do_export, _readback)
+        _conc_assert_c2("xlsx", ".xlsx", do_export)
+        _conc_assert_c3("xlsx", _boom_save)
+    finally:
+        lx.time = orig_time
+        shutil.rmtree(str(CONC_OUT), ignore_errors=True)
+
+
+def conc_docx_tests():
+    """docx 分支：能力存在跑完整契约；主 venv 无 python-docx 时该环境下
+    契约 = 结构化失败且零落盘（与上方第 4 节同口径），不虚报并发结果。"""
+    from core import ledger_export as lx
+    caps = lx.capability_report()
+    d1 = _conc_subdir("docx_c1")
+    do_export = lambda out=None: lx.export_docx("hazard", out or d1, with_demo=True)
+
+    orig_time = lx.time
+    lx.time = _FrozenSecondTime
+    try:
+        if caps.get("docx"):
+            import docx
+            import contextlib
+
+            def _readback(p):
+                docx.Document(str(p))
+
+            # docx.Document 是工厂函数，save 挂在实例类型上（docx.document.Document）
+            _doc_cls = type(docx.Document())
+
+            @contextlib.contextmanager
+            def _boom_save():
+                orig = _doc_cls.save
+
+                def _boom(self, filename):
+                    raise RuntimeError("注入的保存故障")
+                _doc_cls.save = _boom
+                try:
+                    yield
+                finally:
+                    _doc_cls.save = orig
+
+            _conc_assert_c1("docx", do_export, _readback)
+            _conc_assert_c2("docx", ".docx", do_export)
+            _conc_assert_c3("docx", _boom_save)
+        else:
+            r = lx.export("hazard", "docx", d1, True)
+            record("docx: 无能力环境导出为结构化失败且零落盘（不进入并发链路）",
+                   r.get("ok") is False and not any(d1.iterdir()), f"r={r}")
+    finally:
+        lx.time = orig_time
+        shutil.rmtree(str(CONC_OUT), ignore_errors=True)
 
 
 # ═══════════════════════════════════════════════════════════════════════════

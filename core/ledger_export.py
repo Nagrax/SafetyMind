@@ -17,6 +17,9 @@
 ## 产物落盘（铁律 7：一切只进 D 盘）
 
 默认输出到 D:/SafetyMindData/台账输出/，文件名带时间戳与台账类型，便于版本区分。
+同秒并发/重名自动加冲突序号（_2/_3…）——产物一旦存在绝不覆写；内容经同目录
+临时文件 os.replace 原子发布，读者看不到半成品（闭环发现 export-same-second-overwrite，
+对齐 SM-42 版本化归档范式，2026-11-09 修复）。
 
 ## 用法
 
@@ -34,6 +37,7 @@ import hashlib
 import json
 import os
 import sys
+import tempfile
 import time
 from pathlib import Path
 from typing import Any, Dict, List, Optional
@@ -159,6 +163,51 @@ def _safe_name(s: str) -> str:
     return "".join(c for c in s if c not in '\\/:*?"<>|').strip()
 
 
+def _claim_output_path(out_dir: Path, stem: str, suffix: str) -> Path:
+    """独占认领一个不与现有文件冲突的输出路径（闭环发现 export-same-second-overwrite）。
+
+    旧行为：文件名只带秒级时间戳（%Y%m%d-%H%M%S），同一秒内的连发/并发导出拿到
+    同一路径，后写者静默覆写前写者（写探针实测 5 连发 files_created 仅 +1）。
+    新行为（对齐 SM-42 版本化归档"产物一旦存在绝不覆写"的范式）：
+      1. 秒级时间戳撞名时自动加冲突序号（_2/_3/…），任何已存在文件都不会被覆写；
+      2. 用 O_CREAT|O_EXCL 独占创建认领（exists() 检查在并发下有 TOCTOU 竞态，
+         独占创建是内核级原子的），认领成功即占住文件名，内容随后经
+         _atomic_publish 原子发布到该路径；
+      3. 进程在认领后、发布前崩溃会留下 0 字节占位孤儿——它同样绝不覆写
+         （无法与有效产物区分），后续导出只会拿新序号路径。
+    """
+    base = f"{stem}_{time.strftime('%Y%m%d-%H%M%S')}"
+    candidate = out_dir / f"{base}{suffix}"
+    n = 1
+    while True:
+        try:
+            fd = os.open(str(candidate), os.O_CREAT | os.O_EXCL | os.O_WRONLY)
+            os.close(fd)
+            return candidate
+        except FileExistsError:
+            n += 1
+            candidate = out_dir / f"{base}_{n}{suffix}"
+
+
+def _atomic_publish(render, final_path: Path) -> None:
+    """渲染到同目录临时文件后 os.replace 原子发布：读者要么看不到文件、
+    要么看到完整文件，绝无半成品。渲染/替换失败时清理临时文件并向上抛
+    （调用方负责清认领占位，整体零残留）。"""
+    fd, tmp_name = tempfile.mkstemp(dir=str(final_path.parent),
+                                    prefix=".tmp-export-", suffix=".tmp")
+    os.close(fd)
+    tmp_path = Path(tmp_name)
+    try:
+        render(tmp_path)
+        os.replace(str(tmp_path), str(final_path))
+    except BaseException:
+        try:
+            tmp_path.unlink(missing_ok=True)
+        except OSError:
+            pass
+        raise
+
+
 def export_xlsx(ledger: str, out_dir: Path, with_demo: bool = False) -> Path:
     """生成 .xlsx 台账。openpyxl 在主环境已有，零新增依赖。"""
     import openpyxl
@@ -232,8 +281,16 @@ def export_xlsx(ledger: str, out_dir: Path, with_demo: bool = False) -> Path:
     ws2.column_dimensions["B"].width = 100
 
     out_dir.mkdir(parents=True, exist_ok=True)
-    path = out_dir / f"{_safe_name(tpl['name'])}_{time.strftime('%Y%m%d-%H%M%S')}.xlsx"
-    wb.save(str(path))
+    path = _claim_output_path(out_dir, _safe_name(tpl["name"]), ".xlsx")
+    try:
+        _atomic_publish(lambda p: wb.save(str(p)), path)
+    except BaseException:
+        # 认领了但没发布成功 = 失败窗口占位，清理后整体零残留
+        try:
+            path.unlink(missing_ok=True)
+        except OSError:
+            pass
+        raise
     return path
 
 
@@ -280,8 +337,16 @@ def export_docx(ledger: str, out_dir: Path, with_demo: bool = False) -> Path:
     note.runs[0].font.size = Pt(8)
 
     out_dir.mkdir(parents=True, exist_ok=True)
-    path = out_dir / f"{_safe_name(tpl['name'])}_{time.strftime('%Y%m%d-%H%M%S')}.docx"
-    doc.save(str(path))
+    path = _claim_output_path(out_dir, _safe_name(tpl["name"]), ".docx")
+    try:
+        _atomic_publish(lambda p: doc.save(str(p)), path)
+    except BaseException:
+        # 认领了但没发布成功 = 失败窗口占位，清理后整体零残留
+        try:
+            path.unlink(missing_ok=True)
+        except OSError:
+            pass
+        raise
     return path
 
 
