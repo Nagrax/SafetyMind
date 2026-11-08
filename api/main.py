@@ -18,7 +18,7 @@ if _ROOT not in sys.path:
 
 import uvicorn
 from dotenv import load_dotenv
-from fastapi.responses import StreamingResponse
+from fastapi.responses import StreamingResponse, FileResponse
 from fastapi import FastAPI, HTTPException, Request, Response, UploadFile, File, Header, Depends
 from fastapi.responses import JSONResponse
 from fastapi.middleware.cors import CORSMiddleware
@@ -3460,6 +3460,101 @@ async def ledger_export_endpoint(body: LedgerExportRequest):
         # 能力缺失（如缺 python-docx）用 409 表达"可预期的环境限制"，而非 500
         raise HTTPException(409, result.get("error", "导出失败"))
     return result
+
+
+# ── SM-42 整改验收摘要试点：预览 → 授权导出 → 授权下载 ────────────────────────
+# 两步授权（决策规则 R2，scratch/sm-loop/handoff/SM-42/run-wf/decision.md）：
+# 预览（admin）返回业务字段预览 + data_hash；导出（admin）必须回传该哈希，服务端生成前
+# 重读 DB 重算比对——不一致即"审批已过期"（预览后工单已变化）409，零写动作。
+# 授权状态即内容哈希本身，无表可篡改。预览/导出是管理端动作（require_admin）；
+# 下载走主体边界（R7）：管理员角色或工单归属主体（对齐 S-05 归属口径），匿名/他人拒绝。
+from core import ledger_export as _ledger_export  # noqa: E402  （SM-42 摘要导出）
+
+
+class AcceptanceSummaryPreviewRequest(BaseModel):
+    """整改验收摘要预览请求（两步授权第一步）：仅已验收工单。"""
+    ticket_id: int
+    template_id: str = _ledger_export.ACCEPTANCE_SUMMARY_TEMPLATE_ID
+
+
+class AcceptanceSummaryExportRequest(AcceptanceSummaryPreviewRequest):
+    """授权导出请求：approval 必须携带 preview 返回的 data_hash（内容审批）。"""
+    approval: str = ""
+
+
+def _sm42_out_dir() -> Optional[pathlib.Path]:
+    """摘要产物目录：默认 D:/SafetyMindData/台账输出（铁律 7）；
+    SAFETYMIND_LEDGER_OUT_DIR 可钉到隔离目录（测试/演练）。刻意不从请求体收路径——
+    服务端文件写路径不接受请求方输入。"""
+    env = (os.getenv("SAFETYMIND_LEDGER_OUT_DIR", "") or "").strip()
+    return pathlib.Path(env) if env else None
+
+
+@app.post("/ledger/acceptance-summary/preview", tags=["台账"])
+async def acceptance_summary_preview(body: AcceptanceSummaryPreviewRequest,
+                                     _admin: None = Depends(require_admin)):
+    """已验收工单的验收摘要预览：字段 + data_hash（审批凭据），零落盘。"""
+    if _audit is None:
+        raise HTTPException(503, "审计存储未启用")
+    result = await asyncio.to_thread(
+        _ledger_export.preview_acceptance_summary, _audit, body.ticket_id, body.template_id)
+    if not result.get("ok"):
+        code = result.get("code")
+        if code in ("not_found",):
+            raise HTTPException(404, result.get("error", "工单不存在"))
+        if code in ("not_accepted", "template_mismatch"):
+            raise HTTPException(409, result.get("error", "预览失败"))
+        raise HTTPException(500, result.get("error", "预览失败"))
+    return result
+
+
+@app.post("/ledger/acceptance-summary/export", tags=["台账"])
+async def acceptance_summary_export(body: AcceptanceSummaryExportRequest,
+                                    _admin: None = Depends(require_admin),
+                                    x_user_token: str = Header(default="", alias="X-User-Token")):
+    """授权导出：校验审批新鲜度后渲染 xlsx + 数据快照 JSON，manifest 归档（版本唯一）。
+
+    失败口径：404 工单不存在 / 409 未验收·审批过期·模板不匹配·版本冲突 /
+    500 渲染失败（结构化 detail，manifest 零行零残留）。"""
+    if _audit is None:
+        raise HTTPException(503, "审计存储未启用")
+    subject = _subject_for(x_user_token, "")
+    approved_by = subject.subject_id if _isolation_enforced() else "admin"
+    result = await asyncio.to_thread(
+        _ledger_export.export_acceptance_summary, _audit, body.ticket_id,
+        body.approval, body.template_id, _sm42_out_dir(), approved_by)
+    if not result.get("ok"):
+        code = result.get("code")
+        if code in ("not_found",):
+            raise HTTPException(404, result.get("error", "工单不存在"))
+        if code in ("not_accepted", "expired_approval", "template_mismatch",
+                    "version_conflict"):
+            raise HTTPException(409, result.get("error", "导出被拒"))
+        raise HTTPException(500, result.get("error", "导出失败"))
+    return result
+
+
+@app.get("/ledger/acceptance-summary/{export_id}/download", tags=["台账"])
+async def acceptance_summary_download(export_id: int,
+                                      x_user_token: str = Header(default="", alias="X-User-Token")):
+    """已批准产物的授权下载（R7）：多用户形态下仅管理员角色或工单归属主体；
+    本地单人形态沿用既有可信边界。产物内容以 manifest 记录的 sha256 为完整性基准。"""
+    if _audit is None:
+        raise HTTPException(503, "审计存储未启用")
+    rec = await asyncio.to_thread(_audit.get_acceptance_export, int(export_id))
+    if rec is None:
+        raise HTTPException(404, f"验收摘要产物不存在: {export_id}")
+    subject = _subject_for(x_user_token, "")
+    if _isolation_enforced():
+        t = await asyncio.to_thread(_audit.get_ticket, rec["ticket_id"])
+        owner = str((t or {}).get("user_id", "") or "")
+        if not (subject.has_role("admin") or (owner and subject.subject_id == owner)):
+            raise HTTPException(403, "无权下载该验收摘要：仅工单归属主体或管理员")
+    path = pathlib.Path(rec["file_path"])
+    if not path.exists():
+        raise HTTPException(404, "产物文件缺失（服务端产物被清理，请重新导出）")
+    return FileResponse(str(path), filename=path.name,
+                        media_type="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet")
 
 
 

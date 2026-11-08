@@ -41,6 +41,22 @@ DEFAULT_TOTAL_BUDGET_BYTES = 8 * GIB    # 原件总预算 §6
 DEFAULT_DISK_FREE_GUARD_BYTES = 15 * GIB  # D 盘始终保留 ≥15GiB §6
 CHUNK = 1 << 16
 
+
+def _default_disk_free_guard_bytes() -> int:
+    """磁盘守卫默认值（§6）。生产默认 15GiB 不变；SAFETYMIND_DISK_FREE_GUARD_BYTES
+    可显式覆盖——供隔离运行/门禁沙箱按自身容量策略设置（样例 KB 级、宿主盘空闲随使用
+    漂移，15GiB 生产保留额在沙箱语境不是合理判据）。非法/负值一律忽略回 15GiB 默认：
+    容量旋钮坏掉时必须保守，绝不静默放宽。"""
+    raw = (os.getenv("SAFETYMIND_DISK_FREE_GUARD_BYTES", "") or "").strip()
+    if raw:
+        try:
+            v = int(raw)
+            if v >= 0:
+                return v
+        except ValueError:
+            pass
+    return DEFAULT_DISK_FREE_GUARD_BYTES
+
 # ── 凭据脱敏 ─────────────────────────────────────────────────────────────────
 _SENSITIVE_KEYS = (r"cookie|token|passcode|passwd|password|pwd|secret|signature|sign|"
                    r"access[_-]?key|api[_-]?key|code")
@@ -284,7 +300,7 @@ class Downloader:
                  staging_dir: Optional[Union[str, Path]] = None,
                  max_bytes: int = DEFAULT_MAX_BYTES,
                  total_budget_bytes: int = DEFAULT_TOTAL_BUDGET_BYTES,
-                 disk_free_guard_bytes: int = DEFAULT_DISK_FREE_GUARD_BYTES,
+                 disk_free_guard_bytes: Optional[int] = None,
                  manifest: Optional[CorpusManifest] = None,
                  root: Optional[Union[str, Path]] = None,
                  provider: str = "toolbox_catalog",
@@ -299,7 +315,9 @@ class Downloader:
         self.timeout = float(timeout)
         self.max_bytes = int(max_bytes)
         self.total_budget_bytes = int(total_budget_bytes)
-        self.disk_free_guard_bytes = int(disk_free_guard_bytes)
+        self.disk_free_guard_bytes = (
+            int(disk_free_guard_bytes) if disk_free_guard_bytes is not None
+            else _default_disk_free_guard_bytes())
         self.staging = Path(staging_dir) if staging_dir else paths.staging_dir("downloads", self._root)
         self.registry = registry or ShareRegistry(self.manifest)
         # 计数（供测试与报告核对：并发/字节）

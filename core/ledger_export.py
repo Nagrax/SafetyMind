@@ -30,6 +30,7 @@
     <venv python> core/ledger_export.py --ledger inspection --format docx --demo
 """
 import argparse
+import hashlib
 import json
 import os
 import sys
@@ -302,6 +303,300 @@ def export(ledger: str, fmt: str = "xlsx", out_dir: Optional[Path] = None,
                 "size": p.stat().st_size, "name": LEDGER_TEMPLATES[ledger]["name"]}
     except Exception as e:
         return {"ok": False, "error": f"{type(e).__name__}: {e}", "ledger": ledger, "format": fmt}
+
+
+# ═══ SM-42 整改验收摘要试点（2026-11-08）══════════════════════════════════════
+# 试点口径（任务卡 SM-42 + 行动指南 CarlcareDOC 反哺点）：
+#   - 只对 stage=accept（验收通过）的隐患工单出摘要；
+#   - 生成从授权（mandate 快照）、改判（patch）、反馈（feedback）到验收（accept）的
+#     版本化摘要；业务字段只从 AuditStore 读（状态/责任方/证据/版本/确认者）；
+#   - 两步授权：preview 返回字段预览 + data_hash（业务字段 canonical JSON 的 sha256，
+#     不含版本号/时间戳）；export 必须回传该哈希，生成前重读 DB 重算比对——
+#     不一致 = 审批过期（预览后工单已变化），授权状态无表可篡改；
+#   - 正式生成记录模板/数据快照及产物 hash：快照 JSON + xlsx 落盘，manifest 行
+#     （acceptance_summary_exports）与时间线 acceptance_export 事件同 commit；
+#   - 版本化归档：文件名带版本号，已归档产物绝不覆写（归档后继续改工单不会篡改旧产物）；
+#   - 结构化产物先走现有格式（xlsx + JSON 快照）；DOCX 受控模板按任务卡 deferred，
+#     待 DOCX 业务条件确认后再加（模板不匹配校验已为其预留）。
+# 决策规则全文：scratch/sm-loop/handoff/SM-42/run-wf/decision.md（R1–R10）。
+
+ACCEPTANCE_SUMMARY_TEMPLATE_ID = "acceptance_summary@v1"
+ACCEPTANCE_SUMMARY_LEGAL_BASIS = (
+    "《安全生产法》第四十一条：生产经营单位应当建立健全并落实生产安全事故隐患排查治理制度")
+
+# 字段与布局金样（单一定义；tests/test_ledger_export.py 的金样用例持有独立字面量副本——
+# 改这里必须同步金样并明白自己在改渲染合同）。
+ACCEPTANCE_SUMMARY_FIELD_LABELS = (
+    "隐患描述", "隐患等级", "状态", "整改责任人", "责任部门",
+    "验收确认者", "验收时间", "验收批注", "授权主体", "授权规则",
+    "改判轮次", "反馈轮次", "摘要版本", "数据快照哈希",
+)
+ACCEPTANCE_SUMMARY_EVIDENCE_HEADER = ("序号", "时间", "事件", "阶段流转", "操作者", "批注")
+
+
+def _acceptance_canonical(obj: Any) -> str:
+    """规范化序列化（与 core.audit_store.canonical_json 同规范：键排序+紧凑分隔符）。
+    本模块刻意不反向依赖 audit_store（CLI 直跑/解析 venv 场景保持零模块依赖）。"""
+    return json.dumps(obj, sort_keys=True, ensure_ascii=False, separators=(",", ":"))
+
+
+def _fmt_ts(ts: Any) -> str:
+    try:
+        f = float(ts)
+        return time.strftime("%Y-%m-%d %H:%M:%S", time.localtime(f)) if f > 0 else ""
+    except (TypeError, ValueError):
+        return ""
+
+
+def build_acceptance_summary_fields(store, ticket_id: int) -> Optional[Dict[str, Any]]:
+    """从 AuditStore 读出摘要业务字段（R1：状态/责任方/证据/版本/确认者的数据源）。
+    工单不存在返回 None；store 缺时间线按空链处理。纯读，无副作用。"""
+    t = store.get_ticket(int(ticket_id))
+    if t is None:
+        return None
+    tl = store.get_ticket_timeline(int(ticket_id)) or []
+    try:
+        mandate = json.loads(t.get("mandate_json") or "{}")
+        if not isinstance(mandate, dict):
+            mandate = {}
+    except (ValueError, TypeError):
+        mandate = {}
+    accepts = [e for e in tl if e.get("action") == "stage_change"
+               and e.get("to_stage") == "accept"]
+    last_accept = accepts[-1] if accepts else {}
+    patches = [e for e in tl if e.get("action") == "patch"]
+    feedbacks = [e for e in tl if e.get("action") == "stage_change"
+                 and e.get("to_stage") == "feedback"]
+    # 证据链只承载"授权→改判→反馈→验收"业务链（任务卡口径）。acceptance_export 是
+    # 导出动作自身的时间线痕（归档在 manifest + 时间线，可追溯），不进摘要业务字段——
+    # 否则第二次导出会因"含第一次导出事件"而语义漂移，违背"重复导出语义一致"。
+    evidence_src = [e for e in tl if e.get("action") != "acceptance_export"]
+    return {
+        "ticket_id": t.get("id"),
+        "title": t.get("title", ""),
+        "hazard_digest": t.get("message_digest", ""),
+        "severity": t.get("severity", ""),
+        "status": {"stage": t.get("stage", ""), "stage_label": t.get("stage_label", ""),
+                   "status": t.get("status", "")},
+        "responsible": {"assignee": t.get("assignee", ""),
+                        "responsible_dept": t.get("responsible_dept", "")},
+        "confirmer": {"actor": str(last_accept.get("actor") or ""),
+                      "accepted_ts": last_accept.get("ts"),
+                      "note": str(last_accept.get("note") or "")},
+        "authorization": {"mandate_status": t.get("mandate_status", "legacy"),
+                          "policy_version": t.get("policy_version", ""),
+                          "mandate": mandate},
+        "revisions": [{"ts": e.get("ts"), "actor": e.get("actor", ""),
+                       "note": e.get("note", ""), "detail": e.get("detail", {})}
+                      for e in patches],
+        "feedback_rounds": len(feedbacks),
+        "evidence": [{"ts": e.get("ts"), "action": e.get("action", ""),
+                      "from_stage": e.get("from_stage", ""),
+                      "to_stage": e.get("to_stage", ""),
+                      "actor": e.get("actor", ""), "note": e.get("note", "")}
+                     for e in evidence_src],
+    }
+
+
+def summary_data_hash(fields: Dict[str, Any]) -> str:
+    """业务字段内容哈希（R2 内容审批的凭据）：canonical JSON + sha256。
+    只覆盖业务字段——版本号/导出时刻等产物元数据不进哈希，重复导出同状态必同哈希。"""
+    return hashlib.sha256(
+        _acceptance_canonical(fields).encode("utf-8")).hexdigest()
+
+
+def preview_acceptance_summary(store, ticket_id: int,
+                               template_id: str = ACCEPTANCE_SUMMARY_TEMPLATE_ID) -> Dict[str, Any]:
+    """两步授权第一步：返回字段预览 + data_hash。不写任何文件、不落任何行。"""
+    if template_id != ACCEPTANCE_SUMMARY_TEMPLATE_ID:
+        return {"ok": False, "code": "template_mismatch",
+                "error": f"模板不匹配：请求 {template_id}，可用 "
+                         f"{ACCEPTANCE_SUMMARY_TEMPLATE_ID}"}
+    fields = build_acceptance_summary_fields(store, ticket_id)
+    if fields is None:
+        return {"ok": False, "code": "not_found", "error": f"工单不存在: {ticket_id}"}
+    if fields["status"]["stage"] != "accept":
+        return {"ok": False, "code": "not_accepted",
+                "error": f"未验收工单不能导出整改验收摘要"
+                         f"（当前阶段：{fields['status']['stage_label'] or fields['status']['stage']}）"
+                         f"，请验收通过后再试"}
+    return {"ok": True, "ticket_id": int(ticket_id), "template_id": template_id,
+            "data_hash": summary_data_hash(fields), "fields": fields}
+
+
+def _acceptance_field_rows(fields: Dict[str, Any], meta: Dict[str, Any]):
+    """字段区行序（与 ACCEPTANCE_SUMMARY_FIELD_LABELS 一一对应）。"""
+    mandate = fields["authorization"]["mandate"] or {}
+    sev = str(fields.get("severity") or "")
+    sev_label = {"major": "重大隐患", "general": "一般隐患"}.get(sev, sev or "未定级")
+    st = fields["status"]
+    cf = fields["confirmer"]
+    return [
+        ("隐患描述", fields.get("hazard_digest") or fields.get("title") or "—"),
+        ("隐患等级", sev_label),
+        ("状态", f"{st.get('stage_label') or st.get('stage') or '—'}"
+                 f"（{st.get('status') or '—'}）"),
+        ("整改责任人", fields["responsible"].get("assignee") or "—"),
+        ("责任部门", fields["responsible"].get("responsible_dept") or "—"),
+        ("验收确认者", cf.get("actor") or "—"),
+        ("验收时间", _fmt_ts(cf.get("accepted_ts")) or "—"),
+        ("验收批注", cf.get("note") or "—"),
+        ("授权主体", str(mandate.get("subject_id") or "") or "—"),
+        ("授权规则", str(mandate.get("rule_id") or "") or "—"),
+        ("改判轮次", str(len(fields.get("revisions") or []))),
+        ("反馈轮次", str(fields.get("feedback_rounds", 0))),
+        ("摘要版本", f"v{meta['version']}"),
+        ("数据快照哈希", meta["data_hash"]),
+    ]
+
+
+def render_acceptance_summary_xlsx(fields: Dict[str, Any], meta: Dict[str, Any],
+                                   path: Path) -> None:
+    """渲染验收摘要 .xlsx（SM-42 渲染 seam：测试可注入故障做渲染失败用例）。
+    布局由本模块金样常量唯一定义；本函数不读 DB、不做授权判断。"""
+    import openpyxl
+    from openpyxl.styles import Alignment, Border, Font, PatternFill, Side
+
+    lay_sheet = "验收摘要"
+    wb = openpyxl.Workbook()
+    ws = wb.active
+    ws.title = lay_sheet
+    thin = Side(style="thin", color="999999")
+    border = Border(left=thin, right=thin, top=thin, bottom=thin)
+    head_fill = PatternFill("solid", fgColor="DCE6F1")
+    ncol = len(ACCEPTANCE_SUMMARY_EVIDENCE_HEADER)
+
+    # A1 标题
+    ws.merge_cells(start_row=1, start_column=1, end_row=1, end_column=ncol)
+    c = ws.cell(row=1, column=1, value=f"整改验收摘要（工单 #{fields['ticket_id']}）")
+    c.font = Font(bold=True, size=14)
+    c.alignment = Alignment(horizontal="center", vertical="center")
+    ws.row_dimensions[1].height = 26
+    # A2 元信息（版本/模板/哈希只进元数据，不进 data_hash）
+    ws.merge_cells(start_row=2, start_column=1, end_row=2, end_column=ncol)
+    c = ws.cell(row=2, column=1,
+                value=f"模板：{meta['template_id']} · 版本：v{meta['version']}"
+                      f" · 摘要哈希：{meta['data_hash']}")
+    c.font = Font(size=9, italic=True, color="666666")
+    # A3 依据行
+    ws.merge_cells(start_row=3, start_column=1, end_row=3, end_column=ncol)
+    ws.cell(row=3, column=1,
+            value=f"法律依据：{ACCEPTANCE_SUMMARY_LEGAL_BASIS}"
+                  f" · 授权快照：{fields['authorization']['mandate_status']}"
+                  f" · 策略版本：{fields['authorization'].get('policy_version') or '-'}")
+    # 第 4 行表头
+    for j, title in enumerate(("项目", "内容"), start=1):
+        cell = ws.cell(row=4, column=j, value=title)
+        cell.font = Font(bold=True)
+        cell.fill = head_fill
+        cell.border = border
+        cell.alignment = Alignment(horizontal="center", vertical="center")
+    ws.column_dimensions["A"].width = 18
+    ws.column_dimensions["B"].width = 66
+    # 字段区（固定行序）
+    for i, (label, value) in enumerate(_acceptance_field_rows(fields, meta)):
+        r = 5 + i
+        a = ws.cell(row=r, column=1, value=label)
+        b = ws.cell(row=r, column=2, value=value)
+        a.font = Font(bold=True)
+        for cell in (a, b):
+            cell.border = border
+        b.alignment = Alignment(vertical="top", wrap_text=True)
+    # 证据区（字段区后空 1 行）
+    ev_head = 5 + len(ACCEPTANCE_SUMMARY_FIELD_LABELS) + 1
+    for j, title in enumerate(ACCEPTANCE_SUMMARY_EVIDENCE_HEADER, start=1):
+        cell = ws.cell(row=ev_head, column=j, value=title)
+        cell.font = Font(bold=True)
+        cell.fill = head_fill
+        cell.border = border
+        cell.alignment = Alignment(horizontal="center", vertical="center")
+    for i, e in enumerate(fields["evidence"]):
+        r = ev_head + 1 + i
+        flow = f"{e['from_stage'] or '—'}→{e['to_stage'] or '—'}" \
+            if (e["from_stage"] or e["to_stage"]) else "—"
+        for j, v in enumerate([i + 1, _fmt_ts(e["ts"]), e["action"], flow,
+                               e["actor"], e["note"]], start=1):
+            cell = ws.cell(row=r, column=j, value=v)
+            cell.border = border
+            cell.alignment = Alignment(vertical="top", wrap_text=True)
+    for col, w in (("C", 16), ("D", 16), ("E", 10), ("F", 30)):
+        ws.column_dimensions[col].width = w
+    Path(path).parent.mkdir(parents=True, exist_ok=True)
+    wb.save(str(path))
+
+
+def export_acceptance_summary(store, ticket_id: int, approval: str,
+                              template_id: str = ACCEPTANCE_SUMMARY_TEMPLATE_ID,
+                              out_dir: Optional[Path] = None,
+                              approved_by: str = "") -> Dict[str, Any]:
+    """两步授权第二步：校验（模板/未验收/审批新鲜度）→ 渲染 → 快照 → manifest 归档。
+    顺序保证失败零残留：先渲染（失败无文件），再快照，最后 manifest（冲突清理两文件）。
+    产物文件名带版本号；manifest 已有该版本 = 已归档产物，绝不覆写（R4）。"""
+    out = Path(out_dir) if out_dir else DEFAULT_OUT
+    if template_id != ACCEPTANCE_SUMMARY_TEMPLATE_ID:
+        return {"ok": False, "code": "template_mismatch",
+                "error": f"模板不匹配：请求 {template_id}，审批对应"
+                         f" {ACCEPTANCE_SUMMARY_TEMPLATE_ID}"}
+    fields = build_acceptance_summary_fields(store, int(ticket_id))
+    if fields is None:
+        return {"ok": False, "code": "not_found", "error": f"工单不存在: {ticket_id}"}
+    if fields["status"]["stage"] != "accept":
+        return {"ok": False, "code": "not_accepted",
+                "error": f"未验收工单不能导出整改验收摘要"
+                         f"（当前阶段：{fields['status']['stage_label'] or fields['status']['stage']}）"
+                         f"，请验收通过后再试"}
+    data_hash = summary_data_hash(fields)
+    if not str(approval or "").strip() or str(approval).strip() != data_hash:
+        return {"ok": False, "code": "expired_approval",
+                "error": "审批已过期（预览后工单已变化或审批为空），请重新预览后再导出"}
+    version = store.next_acceptance_version(int(ticket_id))
+    base = f"验收摘要_工单{int(ticket_id)}_v{version}"
+    xlsx_path = out / f"{base}.xlsx"
+    snapshot_path = out / f"{base}.json"
+    # 归档保护（R4）：该版本已有 manifest 行 = 已归档产物，绝不覆写；
+    # 无行的同名文件 = 崩溃窗口孤儿（未批准产物），可安全重写。
+    if xlsx_path.exists() or snapshot_path.exists():
+        already = store.list_acceptance_exports(int(ticket_id))
+        if any(int(r.get("version") or 0) == version for r in already):
+            return {"ok": False, "code": "version_conflict",
+                    "error": f"摘要 v{version} 已归档且产物在册，拒绝覆写"}
+    meta = {"template_id": template_id, "version": version, "data_hash": data_hash}
+    try:
+        render_acceptance_summary_xlsx(fields, meta, xlsx_path)
+    except Exception as e:
+        # 渲染失败：清理可能的半成品文件，manifest 零行（R9）
+        try:
+            xlsx_path.unlink(missing_ok=True)
+        except OSError:
+            pass
+        return {"ok": False, "code": "render_failed",
+                "error": f"验收摘要渲染失败: {type(e).__name__}: {e}"}
+    snapshot = {"schema_version": 1, "template_id": template_id,
+                "ticket_id": int(ticket_id), "version": version,
+                "data_hash": data_hash, "fields": fields}
+    snapshot_path.write_text(
+        json.dumps(snapshot, ensure_ascii=False, indent=2, sort_keys=True),
+        encoding="utf-8")
+    file_hash = hashlib.sha256(xlsx_path.read_bytes()).hexdigest()
+    snapshot_hash = hashlib.sha256(snapshot_path.read_bytes()).hexdigest()
+    rec = store.record_acceptance_export(
+        ticket_id=int(ticket_id), version=version, template_id=template_id,
+        data_hash=data_hash, file_path=str(xlsx_path), file_hash=file_hash,
+        snapshot_path=str(snapshot_path), snapshot_hash=snapshot_hash,
+        approved_by=str(approved_by or ""))
+    if not rec.get("ok"):
+        # 并发归档撞唯一索引：清理本轮产物，零残留
+        for p in (xlsx_path, snapshot_path):
+            try:
+                p.unlink(missing_ok=True)
+            except OSError:
+                pass
+        return {"ok": False, "code": str(rec.get("code") or "version_conflict"),
+                "error": str(rec.get("error") or "归档冲突")}
+    return {"ok": True, "export_id": rec["export_id"], "ticket_id": int(ticket_id),
+            "version": version, "template_id": template_id, "data_hash": data_hash,
+            "file_hash": file_hash, "snapshot_hash": snapshot_hash,
+            "file_path": str(xlsx_path), "snapshot_path": str(snapshot_path)}
 
 
 def main():

@@ -220,6 +220,27 @@ CREATE TABLE IF NOT EXISTS watchdog_events (
     event_ts REAL NOT NULL,                   -- 事件落库时刻
     detail TEXT NOT NULL DEFAULT ''
 );
+-- SM-42 整改验收摘要导出 manifest：每张已验收工单的版本化产物台账（(ticket_id, version) 唯一）。
+-- 产物文件/数据快照只落盘一次，行内 sha256 是"归档后未被篡改"的核对依据；
+-- 归档与 ticket_timeline 的 acceptance_export 事件同 commit 落库（授权→改判→反馈→验收→
+-- 导出全链留痕）。旧库随建表脚本自动创建（非破坏迁移，无回填）。
+CREATE TABLE IF NOT EXISTS acceptance_summary_exports (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    ticket_id INTEGER NOT NULL,
+    version INTEGER NOT NULL,
+    template_id TEXT NOT NULL DEFAULT '',
+    data_hash TEXT NOT NULL DEFAULT '',
+    file_path TEXT NOT NULL DEFAULT '',
+    file_hash TEXT NOT NULL DEFAULT '',
+    snapshot_path TEXT NOT NULL DEFAULT '',
+    snapshot_hash TEXT NOT NULL DEFAULT '',
+    approved_by TEXT DEFAULT '',
+    created_ts REAL NOT NULL
+);
+CREATE UNIQUE INDEX IF NOT EXISTS ux_acceptance_export_ver
+    ON acceptance_summary_exports(ticket_id, version);
+CREATE INDEX IF NOT EXISTS idx_acceptance_export_ticket
+    ON acceptance_summary_exports(ticket_id);
 """
 
 # ── 五阶段回路定义（新库建表即带列；旧库由 _migrate 非破坏补列）────────────────
@@ -1734,6 +1755,76 @@ class AuditStore:
             self._commit()
             new_row = self._ticket_row_locked(ticket_id)
             return {"ok": True, "ticket": self._ticket_dict(new_row)}
+
+    # ── SM-42 整改验收摘要导出 manifest（版本化产物台账）──────────────────
+    def next_acceptance_version(self, ticket_id: int) -> int:
+        """该工单下一版摘要的版本号 = 已归档版本数 + 1（唯一索引兜底并发）。"""
+        with self._lock:
+            row = self._con.execute(
+                "SELECT COUNT(*) FROM acceptance_summary_exports WHERE ticket_id=?",
+                (ticket_id,)).fetchone()
+        return int(row[0] or 0) + 1
+
+    def record_acceptance_export(self, *, ticket_id: int, version: int,
+                                 template_id: str, data_hash: str,
+                                 file_path: str, file_hash: str,
+                                 snapshot_path: str, snapshot_hash: str,
+                                 approved_by: str = "",
+                                 actor: str = "admin") -> Dict[str, Any]:
+        """归档一版验收摘要：manifest 行 + ticket_timeline acceptance_export 事件在
+        **同一次持锁、同一次 commit** 内落库（导出也是授权链上的一环，时间线可追溯）。
+        (ticket_id, version) 唯一索引兜底并发：撞索引 = 版本已被并发归档 → 结构化
+        version_conflict，调用方负责清理已写产物（零残留）；工单不存在 → not_found。"""
+        with self._lock:
+            row = self._ticket_row_locked(ticket_id)
+            if row is None:
+                return {"ok": False, "code": "not_found",
+                        "error": f"工单不存在: {ticket_id}"}
+            try:
+                cur = self._con.execute(
+                    "INSERT INTO acceptance_summary_exports (ticket_id, version,"
+                    " template_id, data_hash, file_path, file_hash, snapshot_path,"
+                    " snapshot_hash, approved_by, created_ts) VALUES (?,?,?,?,?,?,?,?,?,?)",
+                    (ticket_id, int(version), str(template_id), str(data_hash),
+                     str(file_path), str(file_hash), str(snapshot_path),
+                     str(snapshot_hash), str(approved_by or ""), time.time()))
+                export_id = int(cur.lastrowid or 0)
+                self._con.execute(
+                    "INSERT INTO ticket_timeline (ticket_id, ts, action, from_stage,"
+                    " to_stage, actor, note, detail) VALUES (?,?,?,?,?,?,?,?)",
+                    (ticket_id, time.time(), "acceptance_export",
+                     self._norm_stage(row["stage"], row["status"]), "",
+                     actor or "admin",
+                     f"整改验收摘要 v{int(version)} 已归档",
+                     json.dumps({"export_id": export_id, "version": int(version),
+                                 "template_id": str(template_id),
+                                 "data_hash": str(data_hash),
+                                 "file_hash": str(file_hash),
+                                 "approved_by": str(approved_by or "")},
+                                ensure_ascii=False)))
+                self._commit()
+            except sqlite3.IntegrityError:
+                self._con.rollback()
+                return {"ok": False, "code": "version_conflict",
+                        "error": f"工单 {ticket_id} 的摘要版本 v{int(version)} "
+                                 f"已被归档（并发冲突），请重新预览后导出"}
+        return {"ok": True, "export_id": export_id}
+
+    def get_acceptance_export(self, export_id: int) -> Optional[Dict[str, Any]]:
+        """按产物 id 取 manifest 行（下载授权与完整性核对的数据源）。"""
+        with self._lock:
+            row = self._con.execute(
+                "SELECT * FROM acceptance_summary_exports WHERE id=?",
+                (int(export_id),)).fetchone()
+        return dict(row) if row else None
+
+    def list_acceptance_exports(self, ticket_id: int) -> List[Dict[str, Any]]:
+        """某工单全部已归档摘要版本（版本升序）。"""
+        with self._lock:
+            rows = self._con.execute(
+                "SELECT * FROM acceptance_summary_exports WHERE ticket_id=?"
+                " ORDER BY version ASC", (ticket_id,)).fetchall()
+        return [dict(r) for r in rows]
 
     # ── 报表（安环部周报的数据源）─────────────────────────────────────────
     def stats(self) -> Dict[str, Any]:
