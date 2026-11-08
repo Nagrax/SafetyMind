@@ -31,6 +31,7 @@ load_dotenv()
 # 在普通对话闸门之前完成分流；未命中的紧急消息仍走原链路由 orchestrator 模板兜底。
 from core import emergency  # noqa: E402  （需在 _ROOT 入 sys.path 之后导入）
 from core import audit_store  # noqa: E402  （SM-10：idem_hash/canonical_json 唯一出处）
+from core import admission  # noqa: E402  （SM-20：准入三档/影子裁决/授权快照唯一出处）
 from core import auth as subject_auth  # noqa: E402  （S-05：服务端主体与数据隔离）
 
 logging.basicConfig(
@@ -56,6 +57,7 @@ _monitor      = None
 _evaluator    = None
 _skill_manager = None
 _skill_evolution = None
+_skill_ledger  = None   # SM-30：SOP 修订注册表与发布指针（core/skill_loader.py）
 _conv_store   = None
 _audit        = None
 
@@ -132,6 +134,23 @@ async def lifespan(app: FastAPI):
     from core.skill_evolution import SkillEvolution
     _skill_evolution = SkillEvolution(skills_root=skills_dir)
     logger.info(f"Skill 自进化已启用: 反馈={_skill_evolution.feedback_path}")
+
+    # SM-30：SOP 修订登记（登记当前生效内容为起始版本）+ 发布指针重启复现。
+    # 启动即把指针指向的批准修订覆盖进生效视图（跨进程读到批准版本）；
+    # 治理层初始化失败只告警，不拖垮服务（与 Skill 目录加载同款降级原则）。
+    global _skill_ledger
+    try:
+        from core.skill_loader import SkillPublicationLedger
+        _skill_ledger = SkillPublicationLedger(
+            skills_root=skills_dir,
+            data_dir=os.getenv("SAFETYMIND_PUB_DIR") or str(pathlib.Path(_ROOT) / "data"))
+        _skill_ledger.register_baseline()
+        _applied = _skill_ledger.apply_published(_skill_manager)
+        logger.info(f"Skill 发布指针已同步: pointer={_skill_ledger.pointer()['revision_id'] or '(未发布)'} "
+                    f"applied={_applied.get('revision_id') or '(无)'}")
+    except Exception as ex:
+        _skill_ledger = None
+        logger.error(f"Skill 发布治理初始化失败（发布端点不可用，加载与对话不受影响）: {ex}")
 
     # Agent 编排器
     _orchestrator = AgentOrchestrator(
@@ -825,8 +844,17 @@ async def ticket_create(body: TicketInput, _admin: None = Depends(require_admin)
     if _audit is None:
         raise HTTPException(503, "审计存储未启用")
     due = (time.time() + body.due_hours * 3600) if body.due_hours else None
+    # SM-20 §2 真值表（auto 档）：管理端手动建单带快照（source_type=admin_manual，
+    # strength=explicit，rule_id=manual.admin）；off/observe 不写（默认行为不变）。
+    _mandate = None
+    if admission.admission_mode() == "auto":
+        _mandate = admission.mandate_snapshot(
+            source_type="admin_manual", strength="explicit",
+            subject_id="", scopes=[], rule_id="manual.admin",
+            basis="confirm", proposal_id=f"admin-{uuid.uuid4().hex[:12]}",
+            evidence_ids=["manual.admin"])
     tid = _audit.create_ticket(body.title, type_=body.type, priority=body.priority,
-                               assignee=body.assignee, due_ts=due)
+                               assignee=body.assignee, due_ts=due, mandate=_mandate)
     return {"ticket_id": tid}
 
 
@@ -872,6 +900,9 @@ async def ticket_transition(ticket_id: int, body: TicketTransitionInput,
                             _admin: None = Depends(require_admin),
                             x_user_token: str = Header(default="", alias="X-User-Token")):
     """五阶段流转：合法流转返回新状态，非法跳转/未知阶段 400，工单不存在 404。
+    SM-20 §5：两个终态回退（accept/reject→feedback）前做授权快照续期校验，
+    不成立 400（kind=mandate_legacy/mandate_stale，timeline 已留 mandate_reauth_required），
+    补授权后重试可通过（POST /tickets/{id}/reauth）。
 
     多用户形态（S-05）角色边界：accept/reject 需要主体含 verifier 或 admin，否则 403
     （处理者不能越权验收）；accept 另要求非空验收批注，空批注 400。本地形态不生效。"""
@@ -883,13 +914,45 @@ async def ticket_transition(ticket_id: int, body: TicketTransitionInput,
             raise HTTPException(403, "无权验收：需要验收者或管理员角色")
         if body.to_stage == "accept" and not (body.note or "").strip():
             raise HTTPException(400, "验收必须填写验收批注（验收批注不得为空）")
-    result = _audit.transition_ticket(ticket_id, body.to_stage,
-                                      actor=body.actor, note=body.note)
+    # SM-20 续期校验的操作主体：隔离形态=服务端解析主体（非客户端自报），
+    # 本地形态=经 require_admin 闸门的管理操作（operator_is_admin=True 豁免跨主体拦截）。
+    if _isolation_enforced():
+        _op = _subject_for(x_user_token, body.actor)
+        result = _audit.transition_ticket(
+            ticket_id, body.to_stage, actor=body.actor, note=body.note,
+            operator_subject=_op.subject_id, operator_is_admin=_op.has_role("admin"))
+    else:
+        result = _audit.transition_ticket(
+            ticket_id, body.to_stage, actor=body.actor, note=body.note,
+            operator_subject=body.actor, operator_is_admin=True)
     if not result["ok"]:
         if result.get("kind") == "not_found":
             raise HTTPException(404, result["error"])
         raise HTTPException(400, result["error"])
     return result
+
+
+class TicketReauthInput(BaseModel):
+    """补授权（SM-20 §5.3）：只追加 mandate_reauth 时间线事件，不改写授权快照。"""
+    actor: str = "admin"
+    note: str = ""
+    policy_version: str = ""
+
+
+@app.post("/tickets/{ticket_id}/reauth", tags=["审计"])
+async def ticket_reauth(ticket_id: int, body: TicketReauthInput,
+                        _admin: None = Depends(require_admin)):
+    """旧单/失效快照的人工补授权：追加 mandate_reauth 时间线事件（admin/policy 版本/
+    时间/批注），不改 mandate_json、不改历史时间线（禁止伪造历史依据）。补授权后
+    同一次终态回退重试可通过；补授权事件受快照有效期约束，过期需重新补授权。
+    工单不存在 404。"""
+    if _audit is None:
+        raise HTTPException(503, "审计存储未启用")
+    ok = _audit.record_mandate_reauth(ticket_id, actor=body.actor, note=body.note,
+                                      policy_version=body.policy_version)
+    if not ok:
+        raise HTTPException(404, f"工单不存在: {ticket_id}")
+    return {"ok": True, "policy_version": body.policy_version or admission.policy_version()}
 
 
 @app.get("/tickets/{ticket_id}/timeline", tags=["审计"])
@@ -945,9 +1008,12 @@ def _hazard_ticket_params(decision: Dict[str, Any], brief: Dict[str, Any]) -> Di
 
 
 def _create_hazard_ticket(audit, decision: Dict[str, Any], brief: Dict[str, Any],
-                          request_id: str, user_id: str, actor: str) -> tuple:
+                          request_id: str, user_id: str, actor: str,
+                          mandate: Optional[Dict[str, Any]] = None) -> tuple:
     """按闸门裁决建隐患工单（无键路径）。去重先行：同用户 24h 内同实体（设备/区域/化学品）
-    未关闭隐患单不重复建，合并 repeat_report 事件（防工单贬值）。返回 (ticket_id, merged)。"""
+    未关闭隐患单不重复建，合并 repeat_report 事件（防工单贬值）。返回 (ticket_id, merged)。
+    mandate（SM-20，可选）：auto 档 HIGH+ 自动建单的不可变授权快照，随工单行同事务落库；
+    合并路径（repeat_report）只写时间线、不触碰既有工单快照（§4.2 覆盖矩阵）。"""
     dup = audit.find_open_hazard_duplicate(user_id, brief.get("entities") or {})
     if dup is not None:
         audit.record_ticket_event(
@@ -959,7 +1025,7 @@ def _create_hazard_ticket(audit, decision: Dict[str, Any], brief: Dict[str, Any]
     title = params.pop("title")
     tid = audit.create_ticket(
         title, type_="hazard", source_request_id=request_id, brief=brief, actor=actor,
-        user_id=user_id, **params)
+        user_id=user_id, mandate=mandate, **params)
     return tid, False
 
 
@@ -989,6 +1055,28 @@ def _enqueue_ticket_notification(ticket_id: int, request_id: str, text: str,
     except Exception as ex:                                    # 入队失败只告警，不阻断对话
         logger.warning(f"工单通知入队失败（ticket #{ticket_id}）: {ex}")
         return 0
+
+
+def _record_shadow(request_id: str, *, user_id: str = "", conv_id: str = "",
+                   would_accept: bool, decision: str, reason: str,
+                   action_proposed: str = "", severity: str = "", category: str = "",
+                   basis: str = "", dept: str = "", deadline_hours=None,
+                   current_action: str = "", current_ticket_id=None) -> None:
+    """影子裁决落库（SM-20 §3，observe 档唯一增量；auto 档差异行）。
+    旁路语义：hazard_observations 与业务事务分离，本写入任何失败只告警，
+    绝不影响业务建单/通知/建议（仓库降级铁律）；off 档零调用（零影子）。"""
+    if _audit is None:
+        return
+    try:
+        _audit.record_hazard_observation(
+            request_id=request_id, user_id=user_id, conv_id=conv_id,
+            policy_version=admission.policy_version(),
+            would_accept=would_accept, decision=decision, reason=reason,
+            action_proposed=action_proposed, severity=severity, category=category,
+            basis=basis, dept=dept, deadline_hours=deadline_hours,
+            current_action=current_action, current_ticket_id=current_ticket_id)
+    except Exception as ex:
+        logger.warning(f"影子裁决落库失败（request_id={request_id}）: {ex}")
 
 
 def _on_outbox_sent(row: Dict[str, Any], payload: Dict[str, Any]) -> None:
@@ -1252,16 +1340,23 @@ class FeedbackRequest(BaseModel):
 
 
 @app.post("/feedback", tags=["Skills"])
-async def submit_feedback(fb: FeedbackRequest):
+async def submit_feedback(fb: FeedbackRequest,
+                          x_user_token: str = Header(default="", alias="X-User-Token")):
     """记录用户反馈；负反馈/评语触发后台候选抽取（不阻塞响应，SAFETYMIND_SKILL_EVOLUTION=0 关闭）。"""
     if _skill_evolution is None:
         raise HTTPException(503, "Skill 自进化未初始化")
     if fb.rating not in ("up", "down"):
         raise HTTPException(422, "rating 必须是 up/down")
+    # SM-30：隔离形态下作者主体由服务端绑定（X-User-Token），客户端自报 user_id
+    # 不作为授权依据——候选作者与发布审批者的双人比对在服务端完成。
+    _fb_author_subject = ""
+    if subject_auth.isolation_enforced():
+        _fb_author_subject = _subject_for(x_user_token, "").subject_id
     rec = _skill_evolution.record_feedback(
         request_id=fb.request_id, rating=fb.rating, comment=fb.comment,
         user_id=fb.user_id, conv_id=fb.conv_id,
-        message_head=fb.message_head, answer_head=fb.answer_head)
+        message_head=fb.message_head, answer_head=fb.answer_head,
+        author_subject=_fb_author_subject)
     # 偏好卡片沉淀（OCTO 式资产沉淀，挂在反馈信号上）：规则抽取 + SQLite 极快写入，
     # 内部全量 try/except 降级，失败只告警绝不阻断反馈响应。
     if _memory is not None:
@@ -1314,6 +1409,235 @@ async def reject_skill_candidate(cand_id: str, _: None = Depends(require_admin))
     if not result.get("ok"):
         raise HTTPException(404, "候选不存在或已处理")
     return {"ok": True}
+
+
+# ── SM-30：SOP 修订登记、双人审核、发布门禁、发布指针与请求回溯 ──────────────
+# 治理链：候选 → 预览（固定修订）→ 审批（签名绑定内容摘要）→ 发布（门禁+指针）→
+# 回退（只移指针）。作者与发布审批者必须是不同受信主体：隔离形态由服务端主体
+# 比对（客户端字段忽略）；本地形态（共享管理员凭据无法证明身份）要求显式字段，
+# 语义即"先在隔离环境验证"。
+
+class SkillCandidateInput(BaseModel):
+    """人工提案候选（作者侧登记）。隔离形态 author/author_subject 由服务端绑定。"""
+    title: str
+    instruction: str
+    when_to_use: str = ""
+    keywords: List[str] = []
+    action: str = "add"
+    similarity: float = 0.1
+    author: str = ""
+
+
+class SkillPreviewInput(BaseModel):
+    author: str = ""
+
+
+class SkillApproveInput(BaseModel):
+    approver: str = ""
+    author: str = ""
+
+
+class SkillPublishInput(BaseModel):
+    base_revision: str = ""
+    approver: str = ""
+    author: str = ""
+
+
+class SkillRollbackInput(BaseModel):
+    to_revision: str
+    approver: str = ""
+
+
+def _gate_status(code: str) -> int:
+    """发布门禁拒绝码 → HTTP 状态（revision_mismatch 404；并发/篡改 409；其余 403）。"""
+    if code == "revision_mismatch":
+        return 404
+    if code in ("tampered", "stale_base", "unknown_revision", "already_at_revision"):
+        return 409
+    return 403
+
+
+def _gate_response(r: Dict[str, Any]):
+    """core 门禁结果 → 统一 JSON 响应（拒绝时 code/error 机器可读）。"""
+    if r.get("ok"):
+        return r
+    return JSONResponse(status_code=_gate_status(str(r.get("code", ""))),
+                        content={"ok": False, "code": r.get("code", "rejected"),
+                                 "error": r.get("error", "拒绝")})
+
+
+@app.post("/skills/candidates", tags=["Skills"])
+async def create_skill_candidate(body: SkillCandidateInput,
+                                 _: None = Depends(require_admin),
+                                 x_user_token: str = Header(default="", alias="X-User-Token")):
+    """人工提案候选（作者侧登记，落 pending）。隔离形态作者由服务端主体绑定。"""
+    if _skill_evolution is None:
+        raise HTTPException(503, "Skill 自进化未初始化")
+    cand = {"title": body.title, "instruction": body.instruction,
+            "when_to_use": body.when_to_use, "keywords": body.keywords,
+            "action": body.action, "similarity": body.similarity, "provenance": "manual"}
+    if body.author:
+        cand["author"] = body.author
+    if subject_auth.isolation_enforced():
+        subj = _subject_for(x_user_token, "")
+        if not subj.roles:
+            raise HTTPException(401, "未识别的主体：X-User-Token 无效")
+        cand["author"], cand["author_subject"] = subj.subject_id, subj.subject_id
+    return _skill_evolution.append_candidate(cand)
+
+
+@app.post("/skills/candidates/{cand_id}/preview", tags=["Skills"])
+async def preview_skill_candidate(cand_id: str, body: SkillPreviewInput,
+                                  _: None = Depends(require_admin),
+                                  x_user_token: str = Header(default="", alias="X-User-Token")):
+    """预览并固定修订（SM-30）：以当前指针全集为底应用候选，返回 diff 摘要与固定
+    revision_id（由内容摘要派生）。内容变 → id 变，发布必须引用同一修订。"""
+    if _skill_evolution is None or _skill_ledger is None:
+        raise HTTPException(503, "Skill 发布治理未初始化")
+    cand = next((c for c in _skill_evolution.list_candidates() if c.get("id") == cand_id), None)
+    if cand is None:
+        raise HTTPException(404, "候选不存在")
+    if subject_auth.isolation_enforced():
+        subj = _subject_for(x_user_token, "")
+        cand = dict(cand, author=subj.subject_id, author_subject=subj.subject_id)
+    elif body.author and not cand.get("author"):
+        cand = dict(cand, author=body.author)
+    rev = _skill_ledger.propose_from_candidate(cand)
+    if rev.get("ok") is False:
+        raise HTTPException(409, rev.get("error", "预览失败"))
+    return {"revision_id": rev["revision_id"], "content_sha256": rev["content_sha256"],
+            "changed": rev["changed"], "diff_summary": rev.get("diff_summary") or [],
+            "base_revision": rev.get("base_revision"), "author": rev.get("author"),
+            "validation_verdict": rev.get("validation_verdict")}
+
+
+@app.post("/skills/revisions/{rid}/approve", tags=["Skills"])
+async def approve_skill_revision(rid: str, body: SkillApproveInput,
+                                 _: None = Depends(require_admin),
+                                 x_user_token: str = Header(default="", alias="X-User-Token")):
+    """双人审核第一闸（SM-30）：审批签名绑定当时内容摘要；作者本人审批（自审）与
+    无权主体一律 403。隔离形态审批者取服务端主体（X-User-Token），角色随主体校验。"""
+    if _skill_ledger is None:
+        raise HTTPException(503, "Skill 发布治理未初始化")
+    if subject_auth.isolation_enforced():
+        subj = _subject_for(x_user_token, "")
+        if not subj.roles:
+            raise HTTPException(401, "未识别的主体：X-User-Token 无效")
+        r = _skill_ledger.approve_revision(rid, approver=subj.subject_id,
+                                           approver_subject=subj.subject_id,
+                                           approver_roles=frozenset(subj.roles))
+    else:
+        if not body.approver.strip():
+            raise HTTPException(422, "本地形态必须显式提供 approver"
+                                     "（共享凭据无法证明身份时先在隔离环境验证）")
+        r = _skill_ledger.approve_revision(rid, approver=body.approver, author=body.author)
+    return _gate_response(r)
+
+
+@app.post("/skills/revisions/{rid}/validation", tags=["Skills"])
+async def register_skill_validation(rid: str, body: Dict[str, Any],
+                                    _: None = Depends(require_admin),
+                                    x_user_token: str = Header(default="", alias="X-User-Token")):
+    """登记效果验证证据（SM-30"固定修订的验证"）：如实存储 verdict，不推断不伪造；
+    unvalidated/regressed 照登（发布门禁会拒）。live 验证（真实模型）在隔离环境执行
+    core/skill_effect_validation.py 后登记其产物 JSON。"""
+    if _skill_ledger is None:
+        raise HTTPException(503, "Skill 发布治理未初始化")
+    registered_by = body.pop("_registered_by", "") or ""
+    if subject_auth.isolation_enforced():
+        registered_by = _subject_for(x_user_token, "").subject_id
+    r = _skill_ledger.register_validation(rid, body, registered_by=registered_by)
+    if not r.get("ok"):
+        return JSONResponse(status_code=_gate_status(str(r.get("code", ""))),
+                            content={"ok": False, "code": r.get("code", "rejected"),
+                                     "error": r.get("error", "拒绝")})
+    return r
+
+
+@app.post("/skills/revisions/{rid}/publish", tags=["Skills"])
+async def publish_skill_revision(rid: str, body: SkillPublishInput,
+                                 _: None = Depends(require_admin),
+                                 x_user_token: str = Header(default="", alias="X-User-Token")):
+    """发布门禁（SM-30）：无证据/自审/无权/旧 base/审核后篡改/版本不匹配一律拒绝。
+    全过后移动发布指针并把批准修订覆盖进生效视图，返回发布回执。"""
+    if _skill_ledger is None:
+        raise HTTPException(503, "Skill 发布治理未初始化")
+    if subject_auth.isolation_enforced():
+        subj = _subject_for(x_user_token, "")
+        if not subj.roles:
+            raise HTTPException(401, "未识别的主体：X-User-Token 无效")
+        r = _skill_ledger.publish_revision(rid, base_revision=body.base_revision,
+                                           approver=subj.subject_id,
+                                           approver_subject=subj.subject_id)
+    else:
+        if not body.approver.strip():
+            raise HTTPException(422, "本地形态必须显式提供 approver"
+                                     "（共享凭据无法证明身份时先在隔离环境验证）")
+        r = _skill_ledger.publish_revision(rid, base_revision=body.base_revision,
+                                           approver=body.approver, author=body.author)
+    if r.get("ok") and _skill_manager is not None:
+        _skill_ledger.sync_manager(_skill_manager)   # 生效视图立即切换到新修订
+    return _gate_response(r)
+
+
+@app.post("/skills/publish/rollback", tags=["Skills"])
+async def rollback_skill_publish(body: SkillRollbackInput,
+                                 _: None = Depends(require_admin),
+                                 x_user_token: str = Header(default="", alias="X-User-Token")):
+    """回退（SM-30）：只移动发布指针到历史已发布修订并覆盖生效视图；发布审计一律保留。"""
+    if _skill_ledger is None:
+        raise HTTPException(503, "Skill 发布治理未初始化")
+    if subject_auth.isolation_enforced():
+        subj = _subject_for(x_user_token, "")
+        if not subj.roles:
+            raise HTTPException(401, "未识别的主体：X-User-Token 无效")
+        r = _skill_ledger.rollback(body.to_revision, approver=subj.subject_id,
+                                   approver_subject=subj.subject_id)
+    else:
+        r = _skill_ledger.rollback(body.to_revision, approver=body.approver)
+    if r.get("ok") and _skill_manager is not None:
+        _skill_ledger.sync_manager(_skill_manager)   # 生效视图回到回退修订
+    return _gate_response(r)
+
+
+@app.get("/skills/publish/pointer", tags=["Skills"])
+async def skill_publish_pointer(_: None = Depends(require_admin)):
+    """当前发布指针（修订 id + 序号）。启动/重启后由 jsonl 重放得出，可复现。"""
+    if _skill_ledger is None:
+        raise HTTPException(503, "Skill 发布治理未初始化")
+    return _skill_ledger.pointer()
+
+
+@app.get("/skills/replay/{request_id}", tags=["Skills"])
+async def skill_replay(request_id: str, _: None = Depends(require_admin),
+                       x_user_token: str = Header(default="", alias="X-User-Token")):
+    """请求级版本回放（SM-30）：定位该请求当时实际注入的 SOP 修订与片段摘要，
+    正文按不可变修订库取回。无冻结记录/修订缺失 → version="unknown"（不编造）。"""
+    if _skill_ledger is None:
+        raise HTTPException(503, "Skill 发布治理未初始化")
+    if subject_auth.isolation_enforced():
+        subj = _subject_for(x_user_token, "")
+        if not subj.has_role("admin"):
+            raise HTTPException(403, "回放查询需要管理员角色")
+    return _skill_ledger.replay(request_id)
+
+
+@app.get("/skills/debug", tags=["Skills"])
+async def skills_debug(_: None = Depends(require_admin),
+                       x_user_token: str = Header(default="", alias="X-User-Token")):
+    """只读调试字段（SM-30，独立管理权限）：修订库/发布指针/请求快照规模/生效视图。"""
+    if _skill_manager is None or _skill_ledger is None:
+        raise HTTPException(503, "Skill 发布治理未初始化")
+    if subject_auth.isolation_enforced():
+        subj = _subject_for(x_user_token, "")
+        if not subj.has_role("admin"):
+            raise HTTPException(403, "调试字段需要管理员角色")
+    state = _skill_ledger.debug_state()
+    state["skill_manager"] = {
+        "published_revision": _skill_manager.published_revision,
+        "count": len(_skill_manager.skills),
+    }
+    return state
 
 
 @app.post("/chat", response_model=ChatResponse)
@@ -1593,6 +1917,23 @@ async def _chat_core(req, conv_id: str, OrcReq, MsgRole, t_start: float):
         except Exception as ex:
             logger.warning(f"会话历史写入失败: {ex}")
 
+    # SM-30：请求级 SOP 版本冻结落盘（回放事实源）。有注入行为（orchestrator 生成路径）
+    # 才有记录；缓存命中/确定性直出/紧急模板等无注入路径不记录，回放按 unknown 标注。
+    # 记录自身失败仅告警，绝不阻断响应（与上方会话历史同款降级原则）。
+    try:
+        _sv = getattr(result, "skill_versions", None)
+        if _skill_ledger is not None and _sv:
+            _skill_ledger.record_injection(
+                result.request_id, str(_sv[0].get("revision_id") or ""),
+                list(_sv[0].get("fragments") or []))
+    except Exception as ex:
+        logger.warning(f"Skill 版本回放记录失败（不影响响应）: {ex}")
+
+    # SM-20 准入三档（逐请求读，纯函数零副作用；存储未启用时也先取值供闸门条件引用）：
+    # off=现行为逐字节不变；observe=现行写入照旧+影子；auto=建单条件只认确定性依据
+    # （escalation_basis 语义不变，摘出只在建单副作用层）。
+    _mode_now = admission.admission_mode()
+    _basis_now = str(getattr(result, "escalation_basis", "") or "")
     if _audit is not None:
         try:
             degraded = bool(getattr(intent_result, "degraded", False))
@@ -1601,9 +1942,28 @@ async def _chat_core(req, conv_id: str, OrcReq, MsgRole, t_start: float):
                                  intent_result.urgency.value if intent_result.urgency else "low",
                                  result.escalated, result.latency_ms,
                                  degraded=degraded, knowledge_used=knowledge_used)
-            if result.escalated:
+            if result.escalated and _mode_now == "auto" \
+                    and not admission.deterministic_basis(_basis_now):
+                # auto 档 model_hint（随机升级提示）不进授权链：不建应急单、不入 outbox、
+                # 不抑制隐患闸门（下方闸门条件同步放行）；升级事件仍留痕（可观测），
+                # escalated/escalation_basis 字段照回（分类不弱化，人工入口不动），
+                # 影子记录 would_accept=0 差异供 SM-21 放行评测。
+                _audit.add_upgrade(result.request_id, req.user_id, conv_id,
+                                   req.message, intent_result.intent.value or "other")
+                _record_shadow(result.request_id, user_id=req.user_id, conv_id=conv_id,
+                               would_accept=False, decision="reject",
+                               reason="model_hint_random", action_proposed="none",
+                               current_action="none")
+            elif result.escalated:
                 upgrade_id = _audit.add_upgrade(result.request_id, req.user_id, conv_id,
                                                 req.message, intent_result.intent.value or "other")
+                if _mode_now == "observe":
+                    # 影子对照（§3）：现行照旧建应急单，另记"新规则下会不会建"
+                    _adm_r = admission.adjudicate(mode="observe", basis=_basis_now)
+                    _record_shadow(result.request_id, user_id=req.user_id, conv_id=conv_id,
+                                   would_accept=_adm_r["would_accept"],
+                                   decision=_adm_r["decision"], reason=_adm_r["reason"],
+                                   action_proposed="auto_ticket", current_action="emergency_ticket")
                 # 需求简报（五阶段回路 brief 阶段）：升级现场一次性落库，
                 # intent/urgency/实体/消息摘要/routing_reason/request_id 齐备，
                 # 后续研讨/执行/反馈/验收都在此简报之上展开。
@@ -1621,6 +1981,20 @@ async def _chat_core(req, conv_id: str, OrcReq, MsgRole, t_start: float):
                 ticket_id = _audit.create_ticket(
                     f"应急升级: {msg_digest[:60]}", type_="emergency", priority="critical",
                     source_request_id=result.request_id, brief=brief,
+                    # SM-20 §4.1（auto 档）：确定性升级依据建单同事务写不可变授权快照；
+                    # off/observe 不写（默认行为不变）。off 档走本分支时 mandate=None。
+                    mandate=(admission.mandate_snapshot(
+                        source_type=f"emergency_{_basis_now}"
+                        if _basis_now in ("urgency", "intent", "safety_net")
+                        else "emergency_urgency",
+                        strength="explicit", subject_id=str(req.user_id or ""), scopes=[],
+                        rule_id={"urgency": "urgency.critical",
+                                 "intent": "intent.escalation",
+                                 "safety_net": "safety_net"}.get(_basis_now, "urgency.critical"),
+                        basis=_basis_now or "urgency", proposal_id=result.request_id,
+                        evidence_ids=[f"audit:{result.request_id}",
+                                      f"upgrade:{upgrade_id}"])
+                        if _mode_now == "auto" else None),
                     # 值班通知入 outbox：与建单同事务落库（进程退出后 worker 仍会投递）；
                     # 原"建单时临时任务直发 webhook"由后台 worker 取代，语义等价且更可靠。
                     # "已实收"时间线只由 _on_outbox_sent 在 sent 后补写（未配置渠道不写）。
@@ -1643,10 +2017,16 @@ async def _chat_core(req, conv_id: str, OrcReq, MsgRole, t_start: float):
             logger.warning(f"审计/升级记录失败: {ex}")
 
     # 7. 隐患工单闸门（分层触发：隐患类意图 × HIGH+ 自动建单 / × MEDIUM 确认卡建议）。
-    #    应急升级（escalated）已在上面建 emergency 工单，闸门直接跳过防重复。
+    #    应急升级（escalated）已在上面建 emergency 工单，闸门直接跳过防重复；
+    #    SM-20 例外：auto 档下 model_hint 升级未建单，闸门放行（随机判断不再抑制闸门）。
+    #    SM-20 三档（决策 §7 冲突裁决 1：开关置于业务准入层，hazard_gate.decide 保持纯候选）：
+    #    off=现行为逐字节不变；observe=现行写入照旧 + hazard_observations 只增裁决数据；
+    #    auto=HIGH+ 自动建单需主体在 AUTO_SUBJECTS（收窄→降级建议卡），建单带 mandate 快照。
     #    独立 try/except 降级——闸门任何失败只告警，绝不阻塞对话（仓库降级铁律）。
     hazard_action, hazard_ticket_id, hazard_suggestion = "none", 0, None
-    if _audit is not None and not result.escalated:
+    _hint_unblocked = (_mode_now == "auto" and result.escalated
+                       and not admission.deterministic_basis(_basis_now))
+    if _audit is not None and (not result.escalated or _hint_unblocked):
         try:
             from core import hazard_gate
             decision = hazard_gate.decide(
@@ -1668,20 +2048,73 @@ async def _chat_core(req, conv_id: str, OrcReq, MsgRole, t_start: float):
                     "basis": decision.get("basis", ""),
                     "dept": decision.get("dept", ""),
                 }
+                _adm_r = admission.adjudicate(
+                    mode=_mode_now,
+                    basis="hazard_gate_auto" if decision["action"] == "auto"
+                    else "hazard_gate_suggest",
+                    gate_decision=decision, subject_id=str(req.user_id or ""))
                 if decision["action"] == "auto":
-                    hazard_ticket_id, merged_hz = _create_hazard_ticket(
-                        _audit, decision, brief_hz, result.request_id,
-                        req.user_id, actor="system")
-                    hazard_action = "merged" if merged_hz else "auto_ticket"
-                    _enqueue_ticket_notification(
-                        hazard_ticket_id, result.request_id,
-                        f"【SafetyMind 隐患工单】编号 {result.request_id}\n"
-                        f"{decision.get('summary', '')}\n"
-                        f"级别: {'重大' if decision.get('severity') == 'major' else '一般'}"
-                        f" · 派发: {decision.get('dept', '安环部')}"
-                        f" · 限期: {decision.get('deadline_hours', '')} 小时\n"
-                        f"时间: {time.strftime('%m-%d %H:%M:%S')}\n"
-                        f"高危隐患自动建单，请责任部门限期整改。")
+                    if _mode_now == "auto" and not _adm_r["would_accept"]:
+                        # auto 档主体范围收窄（§2 真值表）：降级为建议卡，零自动单零通知；
+                        # 影子记录拒绝原因（subject_not_approved）供放行评测。
+                        _audit.save_hazard_suggestion(
+                            result.request_id, req.user_id, conv_id,
+                            {"decision": decision, "brief": brief_hz})
+                        hazard_action = "suggested"
+                        hazard_suggestion = {
+                            "summary": decision.get("summary", ""),
+                            "severity": decision.get("severity", "general"),
+                            "dept": decision.get("dept", ""),
+                            "deadline_hours": decision.get("deadline_hours", 0),
+                            "basis": decision.get("basis", ""),
+                        }
+                        _record_shadow(result.request_id, user_id=req.user_id, conv_id=conv_id,
+                                       would_accept=False, decision=_adm_r["decision"],
+                                       reason=_adm_r["reason"], action_proposed="suggest",
+                                       severity=decision.get("severity", ""),
+                                       category=decision.get("category", ""),
+                                       basis=decision.get("basis", ""),
+                                       dept=decision.get("dept", ""),
+                                       deadline_hours=decision.get("deadline_hours"),
+                                       current_action="none")
+                    else:
+                        hazard_ticket_id, merged_hz = _create_hazard_ticket(
+                            _audit, decision, brief_hz, result.request_id,
+                            req.user_id, actor="system",
+                            # auto 档：HIGH+ 自动建单快照（inferred 依据=闸门确定性规则命中）
+                            mandate=(admission.mandate_snapshot(
+                                source_type="hazard_gate_auto", strength="inferred",
+                                subject_id=str(req.user_id or ""), scopes=[],
+                                rule_id=f"hazard_gate.auto:"
+                                        f"{str(getattr(intent_result.urgency, 'name', 'HIGH') or 'HIGH').upper()}"
+                                        f"@{_adm_r['policy_version']}",
+                                basis="hazard_gate_auto", proposal_id=result.request_id,
+                                evidence_ids=[f"audit:{result.request_id}"])
+                                if _mode_now == "auto" else None))
+                        hazard_action = "merged" if merged_hz else "auto_ticket"
+                        _enqueue_ticket_notification(
+                            hazard_ticket_id, result.request_id,
+                            f"【SafetyMind 隐患工单】编号 {result.request_id}\n"
+                            f"{decision.get('summary', '')}\n"
+                            f"级别: {'重大' if decision.get('severity') == 'major' else '一般'}"
+                            f" · 派发: {decision.get('dept', '安环部')}"
+                            f" · 限期: {decision.get('deadline_hours', '')} 小时\n"
+                            f"时间: {time.strftime('%m-%d %H:%M:%S')}\n"
+                            f"高危隐患自动建单，请责任部门限期整改。")
+                        if _mode_now == "observe":
+                            # 影子对照（§3）：现行实际动作（auto_ticket/merged）并排记录
+                            _record_shadow(result.request_id, user_id=req.user_id,
+                                           conv_id=conv_id, would_accept=True,
+                                           decision=_adm_r["decision"],
+                                           reason=_adm_r["reason"],
+                                           action_proposed="auto_ticket",
+                                           severity=decision.get("severity", ""),
+                                           category=decision.get("category", ""),
+                                           basis=decision.get("basis", ""),
+                                           dept=decision.get("dept", ""),
+                                           deadline_hours=decision.get("deadline_hours"),
+                                           current_action=hazard_action,
+                                           current_ticket_id=hazard_ticket_id)
                 else:  # suggest：暂存建议，用户点确认卡才建单（24h 内有效）
                     _audit.save_hazard_suggestion(
                         result.request_id, req.user_id, conv_id,
@@ -1694,6 +2127,17 @@ async def _chat_core(req, conv_id: str, OrcReq, MsgRole, t_start: float):
                         "deadline_hours": decision.get("deadline_hours", 0),
                         "basis": decision.get("basis", ""),
                     }
+                    if _mode_now == "observe":
+                        # 影子对照：建议卡不自动建单（would_accept=0），现行动作=suggested
+                        _record_shadow(result.request_id, user_id=req.user_id, conv_id=conv_id,
+                                       would_accept=False, decision=_adm_r["decision"],
+                                       reason=_adm_r["reason"], action_proposed="suggest",
+                                       severity=decision.get("severity", ""),
+                                       category=decision.get("category", ""),
+                                       basis=decision.get("basis", ""),
+                                       dept=decision.get("dept", ""),
+                                       deadline_hours=decision.get("deadline_hours"),
+                                       current_action="suggested")
         except Exception as ex:
             logger.warning(f"隐患工单闸门失败（不影响对话）: {ex}")
 

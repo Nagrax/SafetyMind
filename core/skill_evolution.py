@@ -62,10 +62,14 @@ class SkillEvolution:
     # ── 反馈 ──────────────────────────────────────────────
     def record_feedback(self, *, request_id: str, rating: str, comment: str = "",
                         user_id: str = "", conv_id: str = "",
-                        message_head: str = "", answer_head: str = "") -> Dict[str, Any]:
+                        message_head: str = "", answer_head: str = "",
+                        author_subject: str = "") -> Dict[str, Any]:
+        """记录反馈。`author_subject`（SM-30）：隔离形态下由服务端绑定的提案主体
+        （客户端自报 user_id 不作数），随候选透传，供发布门禁做双人审核比对。"""
         rec = {"ts": time.time(), "request_id": request_id, "rating": rating,
                "comment": comment[:500], "user_id": user_id, "conv_id": conv_id,
-               "message_head": message_head[:200], "answer_head": answer_head[:300]}
+               "message_head": message_head[:200], "answer_head": answer_head[:300],
+               "author_subject": author_subject}
         with open(self.feedback_path, "a", encoding="utf-8") as f:
             f.write(json.dumps(rec, ensure_ascii=False) + "\n")
         return rec
@@ -240,7 +244,9 @@ async def extract_candidate_async(evo: "SkillEvolution", feedback: Dict[str, Any
                 "instruction": str(parsed.get("instruction", ""))[:1200],
                 "when_to_use": str(parsed.get("when_to_use", ""))[:300],
                 "keywords": [str(k)[:20] for k in (parsed.get("keywords") or [])][:8],
-                "provenance": f"feedback:{feedback.get('request_id')} {time.strftime('%m-%d')}"}
+                "provenance": f"feedback:{feedback.get('request_id')} {time.strftime('%m-%d')}",
+                # SM-30：隔离形态下由服务端绑定的作者主体随候选传递（本地形态为空）
+                "author_subject": str(feedback.get("author_subject") or "")}
         if not cand["instruction"]:
             raise ValueError("抽取 instruction 为空")
         cand = evo.decide_against_skills(cand, skills_meta)

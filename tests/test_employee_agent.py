@@ -353,7 +353,12 @@ def t11_contract_fields():
                 "escalation_basis",
                 "latency_ms", "agent_types", "primary_agent", "supporting_agents",
                 "routing_reason", "routing_confidence",
-                "tool_trace"]  # P0-A：末尾追加的工具调用轨迹（additive，默认空列表）
+                "tool_trace",  # P0-A：末尾追加的工具调用轨迹（additive，默认空列表）
+                # 契约同步（2026-11-08）：SM-30 末尾 additive 新增 `skill_versions`
+                #（请求级 SOP 版本与注入片段摘要，默认空列表；无注入路径为 []，
+                # 回放按 unknown 标注；语义与行为不变性由 tests/test_skill_publication.py
+                # 专门回归承担）。理由记录：scratch/sm-loop/handoff/SM-30/run-wf/decision.md。
+                "skill_versions"]
     record("OrchestratorResult 契约字段原样保留", names == expected, f"got={names}")
 
 

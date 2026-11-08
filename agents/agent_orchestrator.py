@@ -109,6 +109,7 @@ class AgentResponse:
     latency_ms:  float = 0.0
     escalate:    bool  = False   # 是否需要升级
     tool_trace:  List[Any] = field(default_factory=list)  # P0-A：本次使用的工具调用轨迹
+    skill_fragments: List[Dict[str, Any]] = field(default_factory=list)  # SM-30：注入摘要
 
 
 @dataclass
@@ -129,6 +130,9 @@ class Request:
     memory_context: Optional["MemoryContext"] = None
     # RAG 知识块（api 层检索结果），同样交由员工层统一拼装进任务包。
     knowledge:   str = ""
+    # SM-30：请求级 SOP 版本快照（门面 run() 入口冻结一次，全部并行专家共享——
+    # 并发热加载不再撕裂同一请求的注入内容；回放据此定位当时生效版本）。
+    skill_snapshot: Optional[Dict[str, Any]] = None
 
 
 @dataclass
@@ -143,6 +147,9 @@ class ExpertTask:
     context:    str = ""
     entities:   Dict[str, List[str]] = field(default_factory=dict)
     messages:   List[Dict[str, str]] = field(default_factory=list)
+    # SM-30：请求冻结的版本快照（从 Request 原样传递）；专家注入摘要回写至此。
+    skill_snapshot: Optional[Dict[str, Any]] = None
+    skill_fragments: List[Dict[str, Any]] = field(default_factory=list)
 
 
 @dataclass
@@ -160,6 +167,10 @@ class OrchestratorResult:
     routing_reason: str = ""
     routing_confidence: float = 0.0
     tool_trace:  List[Any] = field(default_factory=list)  # P0-A：本次请求的工具调用轨迹
+    # SM-30：本次请求实际注入的 SOP 版本与片段摘要
+    # [{revision_id, fragments:[{skill_name, revision_id, content_sha256, chars, truncated}]}]。
+    # 紧急模板/缓存命中/确定性直出等无注入路径为空列表（回放按 unknown 标注）。
+    skill_versions: List[Dict[str, Any]] = field(default_factory=list)
 
 
 @dataclass
@@ -180,6 +191,21 @@ class RoutingDecision:
 
 
 # ── 专家层（无状态执行者）─────────────────────────────────────────────────────
+
+def skill_versions_of(req: "Request", responses: List["AgentResponse"]) -> List[Dict[str, Any]]:
+    """SM-30：从请求冻结快照与各专家回写的注入摘要汇总请求级版本记录。
+
+    无注入（fragments 全空）返回 []——紧急模板/缓存/直出等路径诚实缺席，
+    回放端点按 unknown 标注，不编造版本。
+    """
+    snap = getattr(req, "skill_snapshot", None) or {}
+    fragments: List[Dict[str, Any]] = []
+    for r in responses:
+        fragments.extend(getattr(r, "skill_fragments", None) or [])
+    if not fragments:
+        return []
+    return [{"revision_id": str(snap.get("revision_id") or ""), "fragments": fragments}]
+
 
 def escalation_basis(urgency: "UrgencyLevel", intent: "IntentCategory",
                      model_hint: bool) -> str:
@@ -247,18 +273,22 @@ class BaseAgent:
                 latency_ms=ms,
                 escalate=escalate,
                 tool_trace=list(self._last_tool_trace),
+                skill_fragments=list(getattr(task, "skill_fragments", None) or []),
             )
         except Exception as ex:
             ms = (time.monotonic() - t0) * 1000
             self.stats.failed += 1
             self.stats.total_ms += ms
             logger.error(f"{self.agent_type.value} 处理失败: {ex}")
+            # 失败路径同样带出 fragments：system prompt 已按冻结快照构建，
+            # 回放需要能看到"即使失败，当时注入的仍是哪个版本"（SM-30 调用失败路径）。
             return AgentResponse(
                 agent_type=self.agent_type,
                 content="抱歉，处理您的请求时出现问题，请稍后重试。",
                 success=False,
                 latency_ms=ms,
                 tool_trace=list(self._last_tool_trace),
+                skill_fragments=list(getattr(task, "skill_fragments", None) or []),
             )
 
     async def _call_llm(self, task: ExpertTask) -> str:
@@ -277,7 +307,7 @@ class BaseAgent:
             resp = await self._client.messages.create(
                 model=self._model,
                 max_tokens=_max_tokens,
-                system=self._build_system_prompt(task.message),
+                system=self._build_system_prompt(task),
                 messages=task.messages,
                 **_extra,
             )
@@ -287,7 +317,7 @@ class BaseAgent:
         # ToolExecutor 统一边界内完成；本层只取最终文本并记下轨迹。
         self._last_tool_trace = []
         result = await self._tool_executor.run(
-            system=self._build_system_prompt(task.message),
+            system=self._build_system_prompt(task),
             messages=task.messages,
         )
         self._last_tool_trace = list(result.tool_trace)
@@ -308,8 +338,12 @@ class BaseAgent:
             text = "抱歉，本次未能取得可用回答，请稍后重试。"
         return text
 
-    def _build_system_prompt(self, message: str) -> str:
+    def _build_system_prompt(self, task: "ExpertTask") -> str:
         """把动态加载的 Skills 拼入 system prompt，让业务规则随请求生效。
+
+        SM-30：task 携带请求级冻结快照时从快照渲染（同一请求的所有专家注入一致，
+        并发热加载不撕裂），注入摘要（revision_id + 片段 sha）回写 task.skill_fragments
+        供请求回放；无快照（旧调用方/评测直构 task）时退回实时视图，行为不变。
 
         末尾再追加可选的"作答风格"约束（`SAFETYMIND_ANSWER_STYLE=brief`）：
         延迟瓶颈在生成侧，缩短输出是唯一不换模型的杠杆，但要由 A/B 定价（见
@@ -318,7 +352,13 @@ class BaseAgent:
         from core.llm_params import answer_style_suffix
         base = self.system_prompt
         if self._skill_manager is not None:
-            skill_prompt = self._skill_manager.prompt_for(message, self.agent_type.value)
+            snap = getattr(task, "skill_snapshot", None)
+            if snap is not None and hasattr(self._skill_manager, "prompt_for_frozen"):
+                skill_prompt, fragments = self._skill_manager.prompt_for_frozen(
+                    snap, task.message, self.agent_type.value)
+                task.skill_fragments = list(fragments)
+            else:
+                skill_prompt = self._skill_manager.prompt_for(task.message, self.agent_type.value)
             if skill_prompt:
                 base = f"{base}\n\n[动态 Skills]\n{skill_prompt}"
         return base + answer_style_suffix()
@@ -434,6 +474,7 @@ class EmployeeAgent:
             context=context,
             entities=dict(req.entities or {}),
             messages=messages,
+            skill_snapshot=getattr(req, "skill_snapshot", None),
         )
 
     # ── 主入口 ────────────────────────────────────────────────────────────────
@@ -522,6 +563,7 @@ class EmployeeAgent:
             context=context,
             entities=dict(req.entities or {}),
             messages=messages,
+            skill_snapshot=getattr(req, "skill_snapshot", None),
         )
 
     # CRITICAL 紧急事态的模板化应急响应（零 LLM 依赖）：
@@ -666,6 +708,7 @@ class EmployeeAgent:
             routing_reason=decision.reason,
             routing_confidence=decision.confidence,
             tool_trace=list(response.tool_trace),
+            skill_versions=skill_versions_of(req, [response]),
         )
 
     async def run_parallel(self, req: Request, decision: RoutingDecision) -> OrchestratorResult:
@@ -718,6 +761,8 @@ class EmployeeAgent:
             routing_reason=decision.reason,
             routing_confidence=decision.confidence,
             tool_trace=tool_trace,
+            skill_versions=skill_versions_of(req, [r for r in responses
+                                                   if isinstance(r, AgentResponse)]),
         )
 
     # ── 路由逻辑 ──────────────────────────────────────────────────────────────
@@ -1129,6 +1174,14 @@ class AgentOrchestrator:
             req.intent_group = intent_result.intent_group
             req.urgency = intent_result.urgency
             req.intent_confidence = intent_result.confidence
+
+        # SM-30：请求开始冻结一次 SOP 版本快照——同一请求的全部（并行）专家
+        # 共享同一份；并发热加载/回退不再撕裂正在处理的请求。快照失败不阻塞对话。
+        if getattr(req, "skill_snapshot", None) is None and self._skill_manager is not None:
+            try:
+                req.skill_snapshot = self._skill_manager.snapshot_for_request()
+            except Exception as ex:
+                logger.warning(f"Skill 版本快照冻结失败（按无快照处理）: {ex}")
 
         # t0 传入员工层：latency_ms 口径不变（含意图识别耗时）
         return await self._employee.handle(req, t0=t0)

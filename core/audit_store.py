@@ -104,8 +104,30 @@ CREATE TABLE IF NOT EXISTS tickets (
     routing_reason TEXT DEFAULT '',
     severity TEXT DEFAULT '',
     responsible_dept TEXT DEFAULT '',
-    user_id TEXT DEFAULT ''
+    user_id TEXT DEFAULT '',
+    mandate_json TEXT DEFAULT '',
+    policy_version TEXT DEFAULT ''
 );
+CREATE TABLE IF NOT EXISTS hazard_observations (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    created_ts REAL NOT NULL,
+    request_id TEXT NOT NULL UNIQUE,          -- 幂等：同上报编号一条（INSERT OR IGNORE）
+    user_id TEXT DEFAULT '',                  -- 服务端绑定主体（S-05）
+    conv_id TEXT DEFAULT '',
+    policy_version TEXT DEFAULT '',           -- 影子裁决用的策略版本
+    would_accept INTEGER NOT NULL DEFAULT 0,  -- 新准入规则下是否自动建单（1/0）
+    decision TEXT DEFAULT '',                 -- accept | reject | observe | passthrough
+    reason TEXT DEFAULT '',                   -- 依据条款（admission.adjudicate().reason）
+    action_proposed TEXT DEFAULT '',          -- auto_ticket | suggest | none
+    severity TEXT DEFAULT '',                 -- major | general（定级）
+    category TEXT DEFAULT '',                 -- 命中台账大类
+    basis TEXT DEFAULT '',                    -- 依据条款引用（hazard_gate.basis）
+    dept TEXT DEFAULT '',                     -- 派发部门
+    deadline_hours REAL,                      -- 限期
+    current_action TEXT DEFAULT '',           -- 现行路径实际动作（影子对照列）
+    current_ticket_id INTEGER                 -- 现行单号（可空）
+);
+CREATE INDEX IF NOT EXISTS idx_hzobs_request ON hazard_observations(request_id);
 CREATE TABLE IF NOT EXISTS hazard_suggestions (
     request_id TEXT PRIMARY KEY,
     created_ts REAL NOT NULL,
@@ -243,6 +265,10 @@ class AuditStore:
                 ("severity", "TEXT DEFAULT ''"),
                 ("responsible_dept", "TEXT DEFAULT ''"),
                 ("user_id", "TEXT DEFAULT ''"),
+                # SM-20 不可变授权快照（§4.1）：非破坏加列，旧库重跑幂等零回填——
+                # 历史行 mandate_json 保持空串 = legacy 标记（_ticket_dict 派生 mandate_status）。
+                ("mandate_json", "TEXT DEFAULT ''"),
+                ("policy_version", "TEXT DEFAULT ''"),
             ):
                 if col not in cols:
                     self._con.execute(f"ALTER TABLE tickets ADD COLUMN {col} {ddl}")
@@ -298,6 +324,9 @@ class AuditStore:
         d = dict(row)
         d["stage"] = self._norm_stage(d.get("stage", ""), d.get("status", ""))
         d["stage_label"] = STAGE_LABELS.get(d["stage"], d["stage"])
+        # SM-20 授权快照状态派生（只读，不改写数据）："bound"=有快照 / "legacy"=空（旧单标记，
+        # 管理端据此辨识补授权对象）。禁止伪造历史依据：legacy 永远靠补授权时间线救，不改本行。
+        d["mandate_status"] = "bound" if (d.get("mandate_json") or "").strip() else "legacy"
         try:
             d["entities"] = json.loads(d["entities"]) if d.get("entities") else {}
         except (ValueError, TypeError):
@@ -676,7 +705,8 @@ class AuditStore:
                       brief: Optional[Dict[str, Any]] = None,
                       actor: str = "system", user_id: str = "",
                       severity: str = "", responsible_dept: str = "",
-                      notification: Optional[Dict[str, Any]] = None) -> int:
+                      notification: Optional[Dict[str, Any]] = None,
+                      mandate: Optional[Dict[str, Any]] = None) -> int:
         """建单并落入需求简报（brief）阶段。brief 缺省时（管理端手动建单）
         以标题生成最小简报；request_id 经 source_request_id 落库。
         简报字段：intent / urgency / entities(实体) / message_digest(消息摘要) /
@@ -687,29 +717,40 @@ class AuditStore:
         {"idempotency_key","channel","payload","request_id","ticket_id?","upgrade_id?","kind?"}，
         与本行在**同一次持锁、同一次 commit** 内插入 notification_outbox——
         "工单变化与待发送记录同事务落库"，进程退出后通知仍可恢复投递。
-        kind 缺省 'notify'；应急路径传 'escalate'（SM-11 §2.2 事件分类）。"""
+        kind 缺省 'notify'；应急路径传 'escalate'（SM-11 §2.2 事件分类）。
+        mandate（可选，SM-20 §4.1）：不可变授权快照（admission.mandate_snapshot 构造），
+        mandate_json 与 policy_version 两列**在既有同一次持锁/commit 内**与工单行一起写入
+        （故障注入下随事务整体回滚，零半提交）；不传 = 不写快照（旧单 legacy 标记），
+        该列此后只能被读取，任何改判/合并/回退路径都改写不了它。"""
         if brief is None:
             brief = {"intent": "", "urgency": "", "entities": {},
                      "message_digest": _preview(title, 80),
                      "routing_reason": "管理员手动建单", "request_id": source_request_id}
-        # payload 序列化在持锁之前完成：不可序列化直接抛错，不留半成品行。
+        # payload / mandate 序列化在持锁之前完成：不可序列化直接抛错，不留半成品行。
         notification_text = None
         if notification:
             notification_text = self._dumps_payload(notification.get("payload", {}),
                                                     notification.get("idempotency_key", ""))
+        mandate_text = ""
+        mandate_pv = ""
+        if isinstance(mandate, dict) and mandate:
+            mandate_text = json.dumps(mandate, ensure_ascii=False, sort_keys=True)
+            mandate_pv = str(mandate.get("policy_version", "") or "")
         with self._lock:
             cur = self._con.execute(
                 "INSERT INTO tickets (created_ts, title, type, priority, assignee,"
                 " source_request_id, due_ts, stage, intent, urgency, entities,"
-                " message_digest, routing_reason, severity, responsible_dept, user_id)"
-                " VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+                " message_digest, routing_reason, severity, responsible_dept, user_id,"
+                " mandate_json, policy_version)"
+                " VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
                 (time.time(), _preview(title, 120), type_, priority, assignee,
                  source_request_id, due_ts, "brief",
                  str(brief.get("intent", "")), str(brief.get("urgency", "")),
                  json.dumps(brief.get("entities") or {}, ensure_ascii=False),
                  _preview(str(brief.get("message_digest", "")), 120),
                  _preview(str(brief.get("routing_reason", "")), 120),
-                 str(severity or ""), str(responsible_dept or ""), str(user_id or "")))
+                 str(severity or ""), str(responsible_dept or ""), str(user_id or ""),
+                 mandate_text, mandate_pv))
             tid = cur.lastrowid
             brief_store = dict(brief)
             brief_store["request_id"] = brief_store.get("request_id") or source_request_id
@@ -775,10 +816,21 @@ class AuditStore:
 
     def transition_ticket(self, ticket_id: int, to_stage: str,
                           actor: str = "", note: str = "",
-                          detail: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
+                          detail: Optional[Dict[str, Any]] = None,
+                          operator_subject: str = "",
+                          operator_is_admin: bool = False,
+                          subject_check: Optional[Callable[[str], bool]] = None) -> Dict[str, Any]:
         """五阶段流转：白名单校验（顺序前进 + accept/reject 回退 feedback），
         非法跳转/未知阶段/重复同阶段一律拒绝；成功则更新 stage 与派生 status，
-        并把 操作者/批注/时间戳 写入 ticket_timeline。持同一把线程锁保证原子。"""
+        并把 操作者/批注/时间戳 写入 ticket_timeline。持同一把线程锁保证原子。
+
+        SM-20 §5 续期校验：两个终态回退（accept→feedback 验收后追加反馈轮、
+        reject→feedback 驳回重做）前校验授权快照仍成立（mandate_revalidate）——
+        不成立拒绝流转并留痕 mandate_reauth_required（不静默复活）；存在未过期的
+        mandate_reauth 补授权事件则放行（reason=reauthorized，不改写快照）。
+        向前流转与中间阶段推进不校验（首建已绑快照，终态才谈"复活"）。
+        operator_subject/operator_is_admin/subject_check 由调用方注入（api 端传
+        服务端主体；store 级测试缺省 = 不做跨主体校验、撤权接 core/auth 目录）。"""
         with self._lock:
             row = self._ticket_row_locked(ticket_id)
             if row is None:
@@ -796,6 +848,23 @@ class AuditStore:
                         "error": f"非法流转: {STAGE_LABELS.get(from_stage, from_stage)}"
                                  f" → {STAGE_LABELS.get(to_stage, to_stage)}"}
             now = time.time()
+            if from_stage in ("accept", "reject") and to_stage == "feedback":
+                gate = self._mandate_gate_locked(
+                    row, now, operator_subject=operator_subject,
+                    operator_is_admin=operator_is_admin, subject_check=subject_check)
+                if not gate["ok"]:
+                    self._con.execute(
+                        "INSERT INTO ticket_timeline (ticket_id, ts, action, from_stage,"
+                        " to_stage, actor, note, detail) VALUES (?,?,?,?,?,?,?,?)",
+                        (ticket_id, now, "mandate_reauth_required", from_stage, "",
+                         actor or "system", gate["error"],
+                         json.dumps({"reason": gate["reason"], "kind": gate["kind"],
+                                     "policy_version": gate["policy_version"],
+                                     "operator_subject": str(operator_subject or "")},
+                                    ensure_ascii=False)))
+                    self._commit()
+                    return {"ok": False, "kind": gate["kind"], "reason": gate["reason"],
+                            "from_stage": from_stage, "error": gate["error"]}
             closing = to_stage in ("accept", "reject")
             # 条件更新（SM-10 §2.3.4）："读 stage → 校验 → UPDATE"的 check-then-act 在
             # 并发下有两个赢者——WHERE stage=? 兜底，败者 rowcount=0 落结构化冲突 + 审计行。
@@ -837,6 +906,124 @@ class AuditStore:
             new_row = self._ticket_row_locked(ticket_id)
             return {"ok": True, "from_stage": from_stage, "to_stage": to_stage,
                     "ticket": self._ticket_dict(new_row)}
+
+    def _mandate_gate_locked(self, row: sqlite3.Row, now: float, *,
+                             operator_subject: str = "",
+                             operator_is_admin: bool = False,
+                             subject_check: Optional[Callable[[str], bool]] = None) -> Dict[str, Any]:
+        """终态回退前的快照续期闸门（SM-20 §5，持锁内调用，**只读**快照绝不写）。
+
+        裁决 = core.admission.mandate_revalidate（§5.2 原因集）+ 补授权救回：
+        裁决不通过但存在未过期 mandate_reauth 时间线事件 → 放行（reason=reauthorized，
+        补授权事件同样受有效期约束，过期需重新补授权）。快照缺失（legacy）→ 拒绝，
+        kind=mandate_legacy；其余不成立 → kind=mandate_stale。"""
+        from core import admission as _admission
+        pv_now = _admission.policy_version()
+        raw = ""
+        try:
+            raw = (row["mandate_json"] or "").strip()
+        except (IndexError, KeyError):
+            raw = ""
+        if not raw:
+            verdict = {"ok": False, "reason": "legacy"}
+        else:
+            try:
+                mandate = json.loads(raw)
+            except (ValueError, TypeError):
+                mandate = None
+            if not isinstance(mandate, dict):
+                verdict = {"ok": False, "reason": "bad_schema"}   # JSON 不可解析 = 依据不可信
+            else:
+                verdict = _admission.mandate_revalidate(
+                    mandate, current_policy=pv_now,
+                    operator_subject=operator_subject,
+                    operator_is_admin=operator_is_admin,
+                    subject_check=subject_check, now=now)
+        if verdict.get("ok"):
+            return {"ok": True, "reason": str(verdict.get("reason") or "ok"),
+                    "kind": "", "policy_version": pv_now}
+        # 补授权救回（§5.3）：只追加过的 mandate_reauth 事件有效且未过期才放行
+        reauth = self._con.execute(
+            "SELECT ts FROM ticket_timeline WHERE ticket_id=? AND action='mandate_reauth'"
+            " ORDER BY id DESC LIMIT 1", (row["id"],)).fetchone()
+        if reauth is not None:
+            try:
+                reauth_ts = float(reauth["ts"] or 0)
+            except (TypeError, ValueError):
+                reauth_ts = 0.0
+            if reauth_ts > 0 and now - reauth_ts <= _admission.mandate_max_age_hours() * 3600:
+                return {"ok": True, "reason": "reauthorized", "kind": "",
+                        "policy_version": pv_now}
+        reason = str(verdict.get("reason") or "legacy")
+        kind = "mandate_legacy" if reason == "legacy" else "mandate_stale"
+        hint = ("旧工单无授权快照，请管理员补授权后重试（POST /tickets/{id}/reauth）"
+                if kind == "mandate_legacy" else
+                f"授权快照已失效（{reason}），请管理员补授权后重试（POST /tickets/{{id}}/reauth）")
+        return {"ok": False, "reason": reason, "kind": kind,
+                "policy_version": pv_now, "error": hint}
+
+    def record_mandate_reauth(self, ticket_id: int, actor: str, note: str = "",
+                              policy_version: str = "") -> bool:
+        """补授权（SM-20 §5.3）：追加 mandate_reauth 时间线事件（admin/policy 版本/
+        时间/批注全落 detail），**不改写 mandate_json、不改历史时间线**——禁止伪造
+        历史依据，补授权以新事件留痕且受有效期约束。工单不存在返回 False。"""
+        from core import admission as _admission
+        with self._lock:
+            row = self._ticket_row_locked(ticket_id)
+            if row is None:
+                return False
+            pv = str(policy_version or "").strip() or _admission.policy_version()
+            now = time.time()
+            self._con.execute(
+                "INSERT INTO ticket_timeline (ticket_id, ts, action, from_stage,"
+                " to_stage, actor, note, detail) VALUES (?,?,?,?,?,?,?,?)",
+                (ticket_id, now, "mandate_reauth", self._norm_stage(row["stage"], row["status"]),
+                 "", actor or "admin", note or "人工补授权",
+                 json.dumps({"policy_version": pv, "reauth_ts": now, "admin": actor or "admin"},
+                            ensure_ascii=False)))
+            self._commit()
+        return True
+
+    # ── SM-20 影子裁决（hazard_observations，observe 档旁路写入）──────────────
+    def record_hazard_observation(self, *, request_id: str, user_id: str = "",
+                                  conv_id: str = "", policy_version: str = "",
+                                  would_accept: bool = False, decision: str = "",
+                                  reason: str = "", action_proposed: str = "",
+                                  severity: str = "", category: str = "",
+                                  basis: str = "", dept: str = "",
+                                  deadline_hours: Optional[float] = None,
+                                  current_action: str = "",
+                                  current_ticket_id: Optional[int] = None) -> int:
+        """旁路影子写入（observe 档唯一增量）：同上报编号一条（INSERT OR IGNORE 幂等）。
+        独立于业务事务（旁路语义：业务写入照旧，本行只增裁决数据，写失败只告警由
+        调用方兜底）。返回观测行 id（已存在返回 0）。"""
+        with self._lock:
+            cur = self._con.execute(
+                "INSERT OR IGNORE INTO hazard_observations (created_ts, request_id, user_id,"
+                " conv_id, policy_version, would_accept, decision, reason, action_proposed,"
+                " severity, category, basis, dept, deadline_hours, current_action,"
+                " current_ticket_id) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+                (time.time(), request_id, str(user_id or ""), str(conv_id or ""),
+                 str(policy_version or ""), int(bool(would_accept)), str(decision or ""),
+                 str(reason or ""), str(action_proposed or ""), str(severity or ""),
+                 str(category or ""), str(basis or ""), str(dept or ""),
+                 deadline_hours, str(current_action or ""), current_ticket_id))
+            self._commit()
+            return int(cur.lastrowid or 0)
+
+    def list_hazard_observations(self, request_id: Optional[str] = None,
+                                 limit: int = 100) -> List[Dict[str, Any]]:
+        """影子观测查询（管理端/评测用）：按编号过滤或取最近 limit 条（新→旧）。"""
+        with self._lock:
+            if request_id:
+                rows = self._con.execute(
+                    "SELECT * FROM hazard_observations WHERE request_id=? ORDER BY id DESC"
+                    " LIMIT ?", (request_id, limit)).fetchall()
+            else:
+                rows = self._con.execute(
+                    "SELECT * FROM hazard_observations ORDER BY id DESC LIMIT ?",
+                    (limit,)).fetchall()
+        return [dict(r) for r in rows]
 
     def record_ticket_event(self, ticket_id: int, action: str, actor: str = "",
                             note: str = "", from_stage: str = "", to_stage: str = "",
@@ -1150,9 +1337,17 @@ class AuditStore:
                 else:
                     p = dict(new_ticket_fn(decision, brief) if new_ticket_fn else {})
                     title = p.pop("title", "")
+                    # SM-20 §4.1：确认卡是用户显式动作（explicit），快照主体绑定上报人，
+                    # 与工单行同事务写入（本方法整体一个 BEGIN IMMEDIATE，零半提交）。
+                    from core import admission as _admission
+                    mandate = _admission.mandate_snapshot(
+                        source_type="hazard_confirm", strength="explicit",
+                        subject_id=str(user_id or ""), scopes=[],
+                        rule_id="manual.confirm", basis="confirm",
+                        proposal_id=request_id, evidence_ids=[f"audit:{request_id}"])
                     tid = self.create_ticket(
                         title, type_="hazard", source_request_id=request_id,
-                        brief=brief, actor=actor, user_id=user_id, **p)
+                        brief=brief, actor=actor, user_id=user_id, mandate=mandate, **p)
                     merged = False
                 # 步骤 3：建议状态迁移（self.mark_hazard_suggestion 为测试注入点；
                 # RLock 重入 + _in_tx 期间不提前 commit）
@@ -1215,9 +1410,18 @@ class AuditStore:
                     self._con.commit()   # 冲突痕/重放收口：快速分流不抛出，仍重放既有单
                     return {"kind": "replayed", "ticket_id": int(receipt.get("ticket_id") or 0)}
                 upgrade_id = self.add_upgrade(target, user_id, conv_id, message, intent_value)
+                # SM-20 §4.1：快速分流是确定性零 LLM 依据（emergency.precheck），建单同事务
+                # 写不可变授权快照（三档都写——本方法即授权链的权威入口，红灯 T3 钉死）。
+                from core import admission as _admission
+                mandate = _admission.mandate_snapshot(
+                    source_type="emergency_fastpath", strength="explicit",
+                    subject_id=str(user_id or ""), scopes=[],
+                    rule_id="emergency.precheck", basis="urgency",
+                    proposal_id=target,
+                    evidence_ids=[f"audit:{target}", f"upgrade:{upgrade_id}"])
                 ticket_id = self.create_ticket(
                     title, type_="emergency", priority="critical",
-                    source_request_id=target, brief=brief,
+                    source_request_id=target, brief=brief, mandate=mandate,
                     notification={"idempotency_key": idem_key, "channel": channel,
                                   "payload": payload, "request_id": target,
                                   "upgrade_id": upgrade_id, "kind": "escalate"})
@@ -1333,11 +1537,21 @@ class AuditStore:
         "due_ts": lambda v: float(v),
     }
 
+    # SM-20 §4.2 不可变快照：任何路径都不得经本方法触碰授权快照列
+    # （白名单本就不含，显式拒绝防将来误加； mandate_status 是只读派生亦不可写）。
+    _IMMUTABLE_TICKET_FIELDS = frozenset({"mandate_json", "policy_version", "mandate_status"})
+
     def update_ticket_fields(self, ticket_id: int, fields: Dict[str, Any],
                              actor: str = "admin", note: str = "") -> Dict[str, Any]:
         """白名单字段修改 + patch 时间线留痕（改动前后值都落 detail）。
-        返回 {"ok", kind?, ticket?}；not_found / no_field 与流转端点错误口径一致。"""
+        返回 {"ok", kind?, ticket?}；not_found / no_field 与流转端点错误口径一致。
+        SM-20 §4.2：授权快照列（mandate_json/policy_version/mandate_status）不可变，
+        显式请求直接拒绝（immutable），改判/改派任何路径都改写不了快照。"""
         with self._lock:
+            for key in fields:
+                if str(key) in self._IMMUTABLE_TICKET_FIELDS:
+                    return {"ok": False, "kind": "immutable",
+                            "error": f"字段 {key} 不可修改（授权快照不可变，补授权走 /tickets/{ticket_id}/reauth）"}
             row = self._ticket_row_locked(ticket_id)
             if row is None:
                 return {"ok": False, "kind": "not_found", "error": f"工单不存在: {ticket_id}"}

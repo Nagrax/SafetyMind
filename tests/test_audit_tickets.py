@@ -74,13 +74,20 @@ def main():
     record("闭环时长计算", closed["status"] == "closed" and closed["closure_hours"] >= 0)
 
     # 3.5) 五阶段回路（OCTO Loop）：需求简报落库 + 顺序流转 + 回退 + 非法跳转拒绝 + 时间线
+    # SM-20 契约（2026-11-08 实施）：终态回退（accept/reject→feedback）前校验授权快照，
+    # 本回环单按 CRITICAL 应急路径带 mandate 快照建单（create_ticket 新参数），回退链路全通。
     loop_tid = store.create_ticket(
         "反应釜超温应急整改", type_="emergency", priority="critical", source_request_id="r3",
         brief={"intent": "emergency_response", "urgency": "critical",
                "entities": {"area": ["一车间"], "chemical": []},
                "message_digest": "反应釜超温 联锁动作",
                "routing_reason": "CRITICAL 紧急事态，模板化应急响应（零 LLM 依赖）",
-               "request_id": "r3"})
+               "request_id": "r3"},
+        mandate={"schema_version": 1, "policy_version": "adm-1",
+                 "source_type": "emergency_urgency", "strength": "explicit",
+                 "subject_id": "u1", "scopes": [], "rule_id": "urgency.critical",
+                 "basis": "urgency", "proposal_id": "r3", "decided_ts": time.time(),
+                 "evidence_ids": ["audit:r3"]})
     tk = store.get_ticket(loop_tid)
     record("建单落需求简报", tk["stage"] == "brief" and tk["stage_label"] == "需求简报"
            and tk["intent"] == "emergency_response" and tk["urgency"] == "critical"
@@ -206,8 +213,21 @@ def main():
     record("旧数据迁移留痕", bool(tl_old) and tl_old[0]["action"] == "legacy_stage")
     record("旧在办工单可继续流转", store_lg.transition_ticket(old_ids[0], "feedback", actor="admin", note="旧单续转")["ok"]
            and store_lg.get_ticket(old_ids[0])["stage"] == "feedback")
-    record("旧闭环工单可回退重做", store_lg.transition_ticket(old_ids[1], "feedback", actor="admin", note="重做")["ok"]
-           and store_lg.get_ticket(old_ids[1])["status"] == "open")
+    # SM-20 契约（2026-11-08 实施）：旧闭环单无授权快照（legacy），终态回退必须先补授权
+    # ——拒绝留痕（mandate_reauth_required）→ 补授权（只追加时间线，不改写快照）→ 放行重做。
+    _r_legacy = store_lg.transition_ticket(old_ids[1], "feedback", actor="admin", note="重做")
+    record("旧闭环工单无快照回退被拒（kind=mandate_legacy，不静默复活）",
+           _r_legacy.get("ok") is False and _r_legacy.get("kind") == "mandate_legacy"
+           and store_lg.get_ticket(old_ids[1])["status"] == "closed"
+           and any(e["action"] == "mandate_reauth_required"
+                   for e in (store_lg.get_ticket_timeline(old_ids[1]) or [])),
+           f"got={_r_legacy}")
+    record("旧闭环工单补授权后可回退重做",
+           store_lg.record_mandate_reauth(old_ids[1], actor="admin", note="旧单人工补授权",
+                                          policy_version="adm-1")
+           and store_lg.transition_ticket(old_ids[1], "feedback", actor="admin", note="重做")["ok"]
+           and store_lg.get_ticket(old_ids[1])["status"] == "open"
+           and store_lg.get_ticket(old_ids[1])["mandate_status"] == "legacy")
     record("旧库列表/报表可用", all("stage" in t and "overdue" in t
                                    for t in store_lg.list_tickets())
            and store_lg.stats()["tickets_open"] >= 1)
