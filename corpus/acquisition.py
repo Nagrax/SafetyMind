@@ -1,7 +1,7 @@
 # -*- coding: utf-8 -*-
 """K04 外链唯一获取路线：下载 → 校验 → 内容寻址落盘 → 台阶推进。
 
-设计依据：docs/资料库建设决策与Agent实施方案_2026-10-19.md
+设计依据：内部设计文档（私有，不随仓库分发）
   §2.3 台阶纪律：link_exported → share_accessible → file_downloaded_verified → body_parsed
        「链接可取」不等于「文件已取得」；只有实际落盘并校验通过才可记 file_downloaded_verified。
   §4.1 导出目录 → 分批取原件 → 校验大小/格式/完整 SHA-256 → 登记资产；同一分享只遍历一次。

@@ -40,6 +40,9 @@ docker-compose(1).yml
 面经.md
 wiki/
 
+# 内部维护文档（台账/交接 SOP/事故复盘/内部设计历史，放仓库外私有目录）
+docs/internal/
+
 # Node
 frontend/node_modules/
 

@@ -194,5 +194,5 @@ python benchmarks/intent/eval_baselines.py    # pattern / laya / LLM 基线
 
 见 `benchmarks/prod_readiness.py`：十条可执行门禁（启动/冷启动时限/端点可用/并发/
 压测后存活/主链路非空/持久化重启读回/安全边界/可观测/优雅关闭），
-2026-10-26 实测 **11/11 全绿**，证据 `scratch/sm-loop/runs/prod_readiness_v5.json`。
+2026-10-26 实测 **11/11 全绿**，证据为本地门禁产物（未入库）。
 

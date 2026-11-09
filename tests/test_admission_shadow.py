@@ -3,7 +3,7 @@
 # python tests/test_admission_shadow.py（由 runner heavy 组执行）
 #
 # 契约源（先于实现定死）：scratch/sm-loop/handoff/SM-20/decision.md
-# 机制参考：SafetyMind/docs/对标笔记_dsh-superagent_2026-11-06.md P0-A1/P0-A2（dsh 原型
+# 机制参考：内部对标笔记（私有，不随仓库分发） P0-A1/P0-A2（dsh 原型
 #   off/observe/auto 三档 + mandate 快照，按本仓库主体与 SQLite 独立实现）；
 #   SafetyMind-落地交接-20261107/行动指南.md §2（旁路影子对照=现行写入继续+只增裁决数据）
 #   与 §5 影子对照表（CRITICAL/显式转人工三档全部按现行路径处理）。

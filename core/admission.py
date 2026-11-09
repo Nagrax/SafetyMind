@@ -8,7 +8,7 @@ HIGH+ 自动建单与 model_hint 参与建单在现状是**不可观测的隐式
   - 终态回退（accept/reject→feedback）零校验：策略换了、规则停了、单子关了都能静默复活。
 
 契约源：scratch/sm-loop/handoff/SM-20/decision.md §8.1（签名先于实现定死，红灯测试
-tests/test_admission_shadow.py 逐字钉死）。机制参考 docs/对标笔记_dsh-superagent_2026-11-06.md
+tests/test_admission_shadow.py 逐字钉死）。机制参考 内部对标笔记（私有，不随仓库分发）
 P0-A1/P0-A2（按本仓库主体与 SQLite 独立实现，不照搬 TS 原型）。
 
 ## 三档开关（SAFETYMIND_ADMISSION_MODE，逐请求读取）

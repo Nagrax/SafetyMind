@@ -11,12 +11,12 @@
 [![Web-FastAPI](https://img.shields.io/badge/Web-FastAPI-009688?logo=fastapi&logoColor=white)](https://fastapi.tiangolo.com/)
 [![Frontend-Vue3](https://img.shields.io/badge/Frontend-Vue%203-42b883?logo=vuedotjs&logoColor=white)](https://vuejs.org/)
 [![Docker](https://img.shields.io/badge/Deploy-Docker-2496ED?logo=docker&logoColor=white)](https://www.docker.com/)
-[![Gate-104/104](https://img.shields.io/badge/Gate-104%2F104-2ea44f)](docs/闭环接手手册.md)
+[![Gate-104/104](https://img.shields.io/badge/Gate-104%2F104-2ea44f)](#工程质量与闭环)
 [![LLM-Anthropic%20%2F%20OpenAI](https://img.shields.io/badge/LLM-Anthropic%20%7C%20OpenAI--compatible-8A2BE2)](core/llm_protocol.py)
 
 > **当前状态（2026-11-09）**：19 轮无人值守闭环，93 条发现已修复 91、外部阻塞 2、待办 0；发布门禁 **104/104 全绿**；`main` 与远端同步。状态可随时用 `node scripts/loop-status.mjs` 复核。
 
-> **要接手持续迭代？先读 [docs/闭环接手手册.md](docs/闭环接手手册.md)**：状态源在哪、一轮怎么做、门禁怎么跑、评测纪律与踩过的坑。进门一条命令：`node scripts/loop-status.mjs`。
+> **当前 `docs/` 只保留用户/贡献者文档；维护者文档（闭环台账、交接 SOP、事故复盘、内部设计历史）在私有目录维护。** 当前状态可随时用 `node scripts/loop-status.mjs` 复核。
 
 <details>
 <summary><b>目录</b></summary>
@@ -335,7 +335,7 @@ SafetyMind/
 ├── benchmarks/intent/              # 2453 条意图基准 + 复现脚本 + 盲测工具包
 ├── benchmarks/                     # 失败率/事实稳定/流式一致性/闸门 A/B/模型对照等评测脚本
 ├── tests/                          # 102 个测试模块（单元/对抗/契约/浏览器接线）
-├── docs/                           # 基准、部署、决策、接手手册、安全事件报告
+├── docs/                           # 公开文档：基准、部署、决策取舍、评测方法
 ├── config/ · deploy/               # Nginx / Prometheus；systemd unit + Caddyfile
 └── docker-compose.yml              # 生产编排
 ```
@@ -356,7 +356,7 @@ SafetyMind/
 - **门禁不是「跑过就算」**：门禁 v2 runner 绑定仓库、提交 SHA、解释器版本与隔离目录，未知分组、空清单、清单外脚本、非预期 SHA、脏树未声明、旧产物复用一律在执行前非零拒绝；exit 0 但无统计行按失败处理。
 - **不许改测试凑绿**：测试失败只能改产品代码；禁止删测试、弱化断言、放宽容差。意图基准基线 dev 97.71 / test 96.42 / test2 94.88，容差 ±0.3pp，退化必须回滚。
 - **评测纪律**：A/B 必须控温 `SAFETYMIND_TEMPERATURE=0`；批量判分退避 + 节奏；多臂实验每臂独立进程，禁止 `importlib.reload(api.main)` 切臂。
-- **阻断不是完成**：外部条件不具备的任务标 `blocked` 并写明依赖，不伪装成已完成；两条阻塞项在交接手册中单列，需仓库所有者侧处理。
+- **阻断不是完成**：外部条件不具备的任务标 `blocked` 并写明依赖，不伪装成已完成；两条阻塞项记录在维护者台账中（不随公开仓库分发），需仓库所有者侧处理。
 - **安全是硬约束**：凭据只从 `.env` 读取（唯一入口 `benchmarks/_creds.py`），代码里禁止写死密钥；提交前跑 `node scripts/git-round.mjs --check`，扫全部已跟踪文件与候选文件。
 
 ## 设计取舍
@@ -383,12 +383,12 @@ SafetyMind/
 
 | 文档 | 内容 |
 | --- | --- |
-| [docs/闭环接手手册.md](docs/闭环接手手册.md) | 状态源、每轮 SOP、门禁、评测纪律、坑清单、当前快照 |
 | [docs/BENCHMARK.md](docs/BENCHMARK.md) | 意图基准完整方法、负结果、强模型对照与复现步骤 |
 | [docs/DEPLOY.md](docs/DEPLOY.md) | Ubuntu + systemd + Caddy 部署、swap、验收与备份 |
 | [docs/PERF_AND_RAG_DECISIONS.md](docs/PERF_AND_RAG_DECISIONS.md) | 性能与 RAG 的取舍记录 |
 | [docs/评测工业化改造报告.md](docs/评测工业化改造报告.md) | 评测漏斗、归因与发布门禁的工程化过程 |
-| [docs/RESOURCE_LIBRARY.md](docs/RESOURCE_LIBRARY.md) | 资源库（MSDS / 资料目录 / 台账支撑文件）设计与集成 |
+
+> 闭环台账、交接 SOP、事故复盘与内部设计历史属于维护者文档，保留在私有目录；公开仓库的 `docs/` 只放用户/贡献者文档。
 
 ## 边界声明
 

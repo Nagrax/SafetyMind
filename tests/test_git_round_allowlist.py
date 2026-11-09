@@ -65,7 +65,7 @@ def main():
         if git(clone, "diff", "--cached", "--name-only"):
             git(clone, "commit", "-m", "test: 同步被测脚本", "--no-gpg-sign")
         head0 = git(clone, "rev-parse", "HEAD")
-        doc_probe = clone / "docs" / "闭环接手手册.md"
+        doc_probe = clone / "docs" / "评测工业化改造报告.md"
         record("探针：克隆后中文文档存在", doc_probe.exists(),
                "docs 实际内容: " + ", ".join(sorted(p.name for p in (clone / "docs").iterdir()))[:200])
 
@@ -115,7 +115,7 @@ def main():
 
         # ── 5. 中文路径回归：porcelain 首行是未暂存的中文文件名时不得削首字符 ──
         # （git() 帮助函数 trim 整个输出会吃掉首行前导空格，slice(3) 曾把 'd' 砍成 'ocs/'）
-        doc = clone / "docs" / "闭环接手手册.md"
+        doc = clone / "docs" / "评测工业化改造报告.md"
         orig = doc.read_text(encoding="utf-8")
         try:
             doc.write_text(orig + "\n<!-- allowlist 测试追加行 -->\n", encoding="utf-8")
@@ -123,11 +123,11 @@ def main():
             first_status = git(clone, "status", "--porcelain", "-uall").splitlines()[0]
             record("中文文档成为 porcelain 首行", first_status.lstrip().startswith("M "), first_status[:60])
             record("未列入清单的中文名改动被拒且路径完整（exit 8）",
-                   p.returncode == 8 and "docs/闭环接手手册.md" in p.stderr
-                   and "ocs/闭环接手手册.md" not in p.stderr.replace("docs/闭环接手手册.md", ""),
+                   p.returncode == 8 and "docs/评测工业化改造报告.md" in p.stderr
+                   and "ocs/评测工业化改造报告.md" not in p.stderr.replace("docs/评测工业化改造报告.md", ""),
                    f"exit={p.returncode} stderr={p.stderr[:160]}")
             manifest_doc = tmp / "allow_doc.txt"
-            manifest_doc.write_text("sub/\ndocs/闭环接手手册.md\n", encoding="utf-8")
+            manifest_doc.write_text("sub/\ndocs/评测工业化改造报告.md\n", encoding="utf-8")
             p = run_gr(clone, ["--allow", str(manifest_doc), "--check"])
             record("UTF-8 原名清单可匹配中文名路径", p.returncode == 0, f"exit={p.returncode} {p.stderr[:160]}")
         finally:
