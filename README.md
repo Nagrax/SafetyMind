@@ -14,9 +14,7 @@
 [![Gate-104/104](https://img.shields.io/badge/Gate-104%2F104-2ea44f)](#工程质量与闭环)
 [![LLM-Anthropic%20%2F%20OpenAI](https://img.shields.io/badge/LLM-Anthropic%20%7C%20OpenAI--compatible-8A2BE2)](core/llm_protocol.py)
 
-> **当前状态（2026-11-09）**：19 轮无人值守闭环，93 条发现已修复 91、外部阻塞 2、待办 0；发布门禁 **104/104 全绿**；`main` 与远端同步。状态可随时用 `node scripts/loop-status.mjs` 复核。
-
-> **当前 `docs/` 只保留用户/贡献者文档；维护者文档（闭环台账、交接 SOP、事故复盘、内部设计历史）在私有目录维护。** 当前状态可随时用 `node scripts/loop-status.mjs` 复核。
+> **当前状态（2026-11-09）**：19 轮无人值守闭环，93 条发现已修复 91、外部阻塞 2、待办 0；发布门禁 **104/104 全绿**；`main` 与远端同步。`docs/` 只保留用户/贡献者文档，维护者文档（闭环台账、交接 SOP、事故复盘、内部设计历史）在私有目录维护，不入公开仓库。状态可随时用 `node scripts/loop-status.mjs` 复核。
 
 <details>
 <summary><b>目录</b></summary>
